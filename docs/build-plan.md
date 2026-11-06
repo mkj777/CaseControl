@@ -38,3 +38,13 @@ Gate: `cargo fmt`, `clippy -D warnings`, `nextest` green; orchestrator review of
 ## Owner decisions
 
 All answered, see ADR 0001 #14 to #17. The remaining gate is the owner's go.
+
+## Status
+
+- Phase 0: done 2026-11-06 (repo `mkj777/CaseControl`, workspace skeleton, Tauri crate).
+- Phase 1: built 2026-11-06 by five Opus workers (workflow run `wf_c805e6ed-a57`), reviewed per crate, minor findings fixed
+  in two follow-up passes, cc-conflicts re-reviewed in depth. Gate: 130 tests, fmt, clippy `-D warnings`, rustdoc
+  `-D warnings`, cargo-deny all clean. Read-only hardware probes run on the development machine: `list_hid` finds
+  Mystic Light, Wooting and both Logitech devices; `scan` reports 9 findings; `dump_illum` reads the RTX 5080 FE
+  (3 single-color zones, brightness only). Manual window/tray check still pending (a full-screen game was running).
+- Phase 2: waits for the owner's go.

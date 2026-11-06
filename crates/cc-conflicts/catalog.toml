@@ -1,0 +1,483 @@
+# Conflicting-software catalog for CaseControl.
+#
+# Source: docs/research/03-conflicting-software-catalog.md (section 1, cross-checked with sections 2-4) and the
+# local inventory in docs/research/00-overview-and-local-inventory.md.
+#
+# Field reference (see src/catalog.rs for the authoritative schema):
+#   processes          exe names, case-insensitive, '*' wildcard allowed
+#   services           Win32 service names (matched against service name and display name), '*' wildcard allowed
+#   drivers            kernel driver service names (same matching as services, driver services only)
+#   uninstall_names    case-insensitive substring of an Uninstall key DisplayName
+#   install_paths      directories checked for existence after %VAR% expansion
+#   lighting_providers case-insensitive prefix of a Windows Dynamic Lighting provider name
+#   access             hid | smbus | superio | kernel_driver | lamparray | gpu_i2c
+#   affects            cc_core::family ids or "all"; empty when the software only fights over devices CaseControl
+#                      does not drive
+#   verified           false when research 03 marked any listed process/service/driver name UNVERIFIED
+#
+# Orchestrator decisions (Phase 1 review):
+#   - asus_armoury_crate and gigabyte_rgb_fusion list "nvidia_illumination" in `affects`, consistent with the other
+#     vendor tools that drive GPU RGB over I2C (they can drive the RGB of partner NVIDIA cards).
+#   - openrgb `OpenRGB` service, logitech_g_hub `logi_lamparray` driver and the steelseries_gg service name were
+#     confirmed on the development machine.
+
+# -----------------------------------------------------------------------------------------------------------------
+# RGB suites that drive many vendors' devices
+# -----------------------------------------------------------------------------------------------------------------
+
+[[entry]]
+id = "signalrgb"
+name = "SignalRGB"
+vendor = "WhirlwindFX"
+category = "rgb_suite"
+processes = ["SignalRgb.exe", "SignalRgbLauncher.exe", "SignalRgbService.exe"]
+services = ["SignalRgb.Service"]
+drivers = ["SignalRgbDriver"]
+uninstall_names = ["SignalRgb"]
+install_paths = ["%LOCALAPPDATA%\\VortxEngine"]
+lighting_providers = ["SignalRGB"]
+access = ["hid", "kernel_driver", "lamparray"]
+affects = ["msi_mystic_light", "wooting", "logitech", "nvidia_illumination"]
+severity = "high"
+verified = true
+note = "Kernel driver auto-starts even when the app is closed; registers as a Windows Dynamic Lighting provider. Its Conflicts setting can force-close other RGB apps."
+
+[[entry]]
+id = "openrgb"
+name = "OpenRGB"
+vendor = "OpenRGB project"
+category = "rgb_suite"
+processes = ["OpenRGB.exe"]
+services = ["OpenRGB"]
+uninstall_names = ["OpenRGB"]
+access = ["hid", "smbus", "superio", "kernel_driver", "gpu_i2c"]
+affects = ["all"]
+severity = "high"
+verified = true
+note = "Opens every device it detects. Optional SDK server on TCP 127.0.0.1:6742 (detected only when the port check is enabled). Uses PawnIO for SMBus since 1.0. 1.x installs an auto-start service `OpenRGB`."
+
+# -----------------------------------------------------------------------------------------------------------------
+# Vendor RGB software
+# -----------------------------------------------------------------------------------------------------------------
+
+[[entry]]
+id = "corsair_icue"
+name = "Corsair iCUE"
+vendor = "Corsair"
+category = "vendor_rgb"
+processes = ["iCUE.exe", "Corsair.Service.exe", "CueLLAccessService.exe"]
+services = ["CorsairLLAService", "CorsairService", "Corsair Service", "Corsair Device Control Service"]
+drivers = ["CorsairLLAccess*"]
+uninstall_names = ["CORSAIR iCUE"]
+install_paths = ["%ProgramFiles%\\Corsair\\CORSAIR iCUE 5 Software"]
+access = ["hid", "smbus", "superio", "kernel_driver"]
+affects = []
+severity = "high"
+verified = true
+note = "Holds Corsair peripherals, RAM and hubs; ships the CorsairLLAccess kernel driver (CVE-2020-8808) and keeps services alive after the window closes."
+
+[[entry]]
+id = "asus_armoury_crate"
+name = "ASUS Armoury Crate / Aura Sync"
+vendor = "ASUS"
+category = "vendor_rgb"
+processes = ["LightingService.exe", "ArmourySocketServer.exe", "asus_framework.exe", "ArmourySwAgent.exe", "AsusCertService.exe", "AsSysCtrlService.exe", "Aac*Hal_x86.exe"]
+services = ["LightingService", "ArmouryCrateControlInterface", "AsusCertService", "AsusROGLSLService", "AsusAppService", "GameSDK Service", "AsusFanControlService", "AsSysCtrlService", "asComSvc", "asus", "asusm"]
+drivers = ["asusgio2", "asusgio3", "IOMap"]
+uninstall_names = ["Armoury Crate", "AURA Service"]
+install_paths = ["%ProgramFiles(x86)%\\LightingService", "%ProgramFiles%\\ASUS\\Armoury Crate Service"]
+access = ["hid", "smbus", "superio", "kernel_driver", "gpu_i2c"]
+affects = ["nvidia_illumination"]
+severity = "high"
+verified = true
+note = "Background services and the AsIO kernel drivers (CVE-2025-9336/9337) stay active after the UI closes. The UI itself is a Store package."
+
+[[entry]]
+id = "msi_center"
+name = "MSI Center / Mystic Light / Dragon Center"
+vendor = "MSI"
+category = "vendor_rgb"
+processes = ["MSI_Central_Service.exe", "LEDKeeper2.exe", "LightKeeperService.exe", "Mystic_Light_Service.exe"]
+services = ["MSI_Central_Service", "Mystic Light*"]
+drivers = ["NTIOLib*"]
+uninstall_names = ["MSI Center", "Mystic Light", "Dragon Center"]
+install_paths = ["%ProgramFiles(x86)%\\MSI\\MSI Center\\Mystic Light"]
+access = ["hid", "smbus", "superio", "kernel_driver"]
+affects = ["msi_mystic_light", "nvidia_illumination"]
+severity = "high"
+verified = false
+note = "Drives the same Mystic Light controller CaseControl uses. Process and service names come from file catalogs only; NTIOLib_X64.sys has several CVEs."
+
+[[entry]]
+id = "gigabyte_rgb_fusion"
+name = "Gigabyte RGB Fusion 2.0 / Control Center"
+vendor = "Gigabyte"
+category = "vendor_rgb"
+processes = ["RGBFusion.exe", "GvLedServices.exe", "RunLed.exe"]
+drivers = ["gdrv*"]
+uninstall_names = ["RGB Fusion", "GIGABYTE Control Center"]
+install_paths = ["%ProgramFiles(x86)%\\GIGABYTE\\RGBFusion"]
+access = ["smbus", "superio", "gpu_i2c", "kernel_driver"]
+affects = ["nvidia_illumination"]
+severity = "medium"
+verified = false
+note = "Fights over the SMBus and RGB RAM; the link to the gdrv.sys driver (CVE-2018-19320) and all Control Center names are unverified."
+
+[[entry]]
+id = "asrock_polychrome"
+name = "ASRock Polychrome Sync / RGB Sync"
+vendor = "ASRock"
+category = "vendor_rgb"
+processes = ["ASRRGBLED.exe"]
+uninstall_names = ["ASRock Polychrome", "ASRRGBLED", "Polychrome RGB"]
+access = ["smbus", "superio"]
+affects = []
+severity = "medium"
+verified = false
+note = "Runs an unnamed background service; the process name is taken from a shortcut and unverified."
+
+[[entry]]
+id = "nzxt_cam"
+name = "NZXT CAM"
+vendor = "NZXT"
+category = "vendor_rgb"
+processes = ["NZXT CAM.exe", "cam_helper.exe"]
+uninstall_names = ["NZXT CAM"]
+install_paths = ["%LOCALAPPDATA%\\NZXT\\CAM"]
+access = ["hid", "superio", "kernel_driver"]
+affects = []
+severity = "medium"
+verified = true
+note = "Needs exclusive access to NZXT controllers (vendor statement); older versions shipped WinRing0."
+
+[[entry]]
+id = "lian_li_l_connect"
+name = "Lian Li L-Connect 3"
+vendor = "Lian Li"
+category = "vendor_rgb"
+uninstall_names = ["L-Connect 3", "L-Connect3"]
+access = ["hid"]
+affects = []
+severity = "medium"
+verified = false
+note = "Has its own background service and a built-in conflicting-process prompt; process and service names are unverified."
+
+[[entry]]
+id = "razer_synapse"
+name = "Razer Synapse 3 / 4"
+vendor = "Razer"
+category = "vendor_rgb"
+processes = ["Razer Synapse 3.exe", "Razer Synapse Service.exe", "Razer Synapse Service Process.exe", "RazerCentralService.exe", "Razer Central.exe", "GameManagerService.exe", "RazerAppEngine.exe", "GameManagerService3.exe", "RzEngineMon.exe"]
+services = ["Razer Central Service", "Razer Synapse Service", "Razer Game Manager Service*", "RzActionSvc"]
+uninstall_names = ["Razer Synapse"]
+install_paths = ["%ProgramFiles%\\Razer\\RazerAppEngine"]
+access = ["hid"]
+affects = []
+severity = "medium"
+verified = true
+note = "Holds all Razer devices; Chroma SDK games drive the device through these services."
+
+[[entry]]
+id = "logitech_g_hub"
+name = "Logitech G HUB / Logitech Gaming Software"
+vendor = "Logitech"
+category = "vendor_rgb"
+processes = ["lghub.exe", "lghub_agent.exe", "lghub_updater.exe", "logi_crashpad_handler.exe", "logi_lamparray_service*.exe", "LCore.exe"]
+services = ["LGHUBUpdaterService", "logi_lamparray_service", "Logitech_Lamparray_Service"]
+drivers = ["logi_lamparray"]
+uninstall_names = ["Logitech G HUB", "Logitech Gaming Software"]
+install_paths = ["%ProgramFiles%\\LGHUB"]
+access = ["hid", "lamparray"]
+affects = ["logitech"]
+severity = "high"
+verified = true
+note = "Talks to Logitech G devices over HID; the LampArray service bridges them into Windows Dynamic Lighting. Both stay active without the G HUB window, as does the `logi_lamparray` kernel driver (Logitech LampArray Device Driver, confirmed on the development machine)."
+
+[[entry]]
+id = "steelseries_gg"
+name = "SteelSeries GG / Engine"
+vendor = "SteelSeries"
+category = "vendor_rgb"
+processes = ["SteelSeriesGG.exe", "SteelSeriesGGClient.exe", "SteelSeriesGGUpdateService.exe", "SteelSeriesSvcLauncher.exe", "SteelSeriesEngine.exe"]
+services = ["SteelSeriesGGUpdateService*"]
+uninstall_names = ["SteelSeries GG", "SteelSeries Engine"]
+access = ["hid"]
+affects = []
+severity = "medium"
+verified = true
+note = "Its background service may need a manual stop before another app can drive SteelSeries devices. The service name `SteelSeriesGGUpdateServiceProxy` was confirmed on the development machine."
+
+[[entry]]
+id = "hyperx_ngenuity"
+name = "HyperX NGENUITY"
+vendor = "HP / HyperX"
+category = "vendor_rgb"
+uninstall_names = ["NGENUITY"]
+access = ["hid"]
+affects = []
+severity = "low"
+verified = false
+note = "Distributed as a Microsoft Store app (9P1TBXR6QDCX), which has no Uninstall key; detection here only catches the legacy desktop build."
+
+[[entry]]
+id = "coolermaster_masterplus"
+name = "Cooler Master MasterPlus+"
+vendor = "Cooler Master"
+category = "vendor_rgb"
+processes = ["MasterPlus(PER. Only).exe", "cm-blackhawk.exe", "CMService.exe"]
+uninstall_names = ["MasterPlus"]
+access = ["hid"]
+affects = []
+severity = "medium"
+verified = true
+note = "Listed names are from the legacy build; the current MasterPlus+ executable name is unverified."
+
+[[entry]]
+id = "thermaltake_tt_rgb_plus"
+name = "Thermaltake TT RGB PLUS"
+vendor = "Thermaltake"
+category = "vendor_rgb"
+processes = ["TT RGB Plus.exe", "ThermaltakeUpdate.exe"]
+uninstall_names = ["TT RGB Plus"]
+install_paths = ["%ProgramFiles%\\Tt\\TT RGB Plus"]
+access = ["hid"]
+affects = []
+severity = "medium"
+verified = true
+note = "Holds Thermaltake controllers, fans and AIOs."
+
+[[entry]]
+id = "evga_precision_x1"
+name = "EVGA Precision X1"
+vendor = "EVGA"
+category = "vendor_rgb"
+processes = ["PrecisionX_x64.exe"]
+uninstall_names = ["Precision X1"]
+access = ["gpu_i2c", "kernel_driver"]
+affects = ["nvidia_illumination"]
+severity = "high"
+verified = false
+note = "Writes GPU RGB over the GPU I2C bus and ships WinRing0 (CVE-2020-14979); process name unverified."
+
+[[entry]]
+id = "gigabyte_aorus_engine"
+name = "Gigabyte AORUS Engine"
+vendor = "Gigabyte"
+category = "vendor_rgb"
+drivers = ["gdrv*"]
+uninstall_names = ["AORUS ENGINE"]
+access = ["gpu_i2c", "kernel_driver"]
+affects = ["nvidia_illumination"]
+severity = "medium"
+verified = false
+note = "GPU RGB over I2C; gdrv.sys family (CVE-2018-19320). Process names unverified."
+
+[[entry]]
+id = "zotac_firestorm"
+name = "ZOTAC FireStorm"
+vendor = "ZOTAC"
+category = "vendor_rgb"
+uninstall_names = ["FireStorm"]
+access = ["gpu_i2c"]
+affects = ["nvidia_illumination"]
+severity = "medium"
+verified = false
+note = "GPU RGB over I2C on ZOTAC GeForce cards; process names unverified."
+
+[[entry]]
+id = "sapphire_trixx"
+name = "Sapphire TriXX / PowerColor DevilZone"
+vendor = "Sapphire / PowerColor"
+category = "vendor_rgb"
+uninstall_names = ["TriXX", "PowerColor"]
+access = ["gpu_i2c"]
+affects = []
+severity = "low"
+verified = false
+note = "AMD GPU RGB tools; they do not touch NVIDIA cards. Process names unverified."
+
+# -----------------------------------------------------------------------------------------------------------------
+# Hardware monitors (SMBus / Super I/O readers, most honour the shared Global\Access_* mutexes)
+# -----------------------------------------------------------------------------------------------------------------
+
+[[entry]]
+id = "msi_afterburner"
+name = "MSI Afterburner / RTSS"
+vendor = "MSI / Guru3D"
+category = "hardware_monitor"
+processes = ["MSIAfterburner.exe", "RTSS.exe"]
+drivers = ["RTCore64", "RTCore32"]
+uninstall_names = ["MSI Afterburner"]
+access = ["gpu_i2c", "kernel_driver"]
+affects = ["nvidia_illumination"]
+severity = "medium"
+verified = false
+note = "Polls the GPU I2C bus; RTCore64.sys (CVE-2019-16098) is believed to load on demand. Names unverified."
+
+[[entry]]
+id = "hwinfo"
+name = "HWiNFO"
+vendor = "REALiX"
+category = "hardware_monitor"
+processes = ["HWiNFO64.exe", "HWiNFO32.exe"]
+drivers = ["HWiNFO*"]
+uninstall_names = ["HWiNFO"]
+access = ["smbus", "superio", "kernel_driver"]
+affects = []
+severity = "low"
+verified = true
+note = "Honours the shared bus mutexes; a collision on SMBus can leave RAM RGB unresponsive until reboot."
+
+[[entry]]
+id = "aida64"
+name = "AIDA64"
+vendor = "FinalWire"
+category = "hardware_monitor"
+processes = ["aida64.exe"]
+uninstall_names = ["AIDA64"]
+access = ["smbus", "superio", "kernel_driver"]
+affects = []
+severity = "low"
+verified = true
+note = "Loads its kerneld driver dynamically (no registered service); honours the shared bus mutexes."
+
+[[entry]]
+id = "cpuz"
+name = "CPU-Z"
+vendor = "CPUID"
+category = "hardware_monitor"
+processes = ["cpuz.exe", "cpuz_x64.exe", "cpuz_x32.exe"]
+drivers = ["cpuz1*"]
+uninstall_names = ["CPU-Z"]
+access = ["smbus", "superio", "kernel_driver"]
+affects = []
+severity = "low"
+verified = false
+note = "Reads SPD over SMBus through a per-version cpuzNNN driver; the driver service name is unverified."
+
+[[entry]]
+id = "hwmonitor"
+name = "HWMonitor"
+vendor = "CPUID"
+category = "hardware_monitor"
+processes = ["HWMonitor.exe", "HWMonitor_x64.exe"]
+drivers = ["cpuz1*"]
+uninstall_names = ["HWMonitor"]
+access = ["smbus", "superio", "kernel_driver"]
+affects = []
+severity = "low"
+verified = false
+note = "Shares the CPU-Z driver; the driver service name is unverified."
+
+[[entry]]
+id = "librehardwaremonitor"
+name = "LibreHardwareMonitor / OpenHardwareMonitor"
+vendor = "LibreHardwareMonitor project"
+category = "hardware_monitor"
+processes = ["LibreHardwareMonitor.exe", "OpenHardwareMonitor.exe"]
+access = ["smbus", "superio", "kernel_driver"]
+affects = []
+severity = "low"
+verified = true
+note = "Uses PawnIO since 0.9.5 (WinRing0 before) and honours the Global\\Access_* mutexes."
+
+# -----------------------------------------------------------------------------------------------------------------
+# Fan control
+# -----------------------------------------------------------------------------------------------------------------
+
+[[entry]]
+id = "fancontrol"
+name = "FanControl"
+vendor = "Rem0o"
+category = "fan_control"
+processes = ["FanControl.exe"]
+services = ["FanControl.Service"]
+uninstall_names = ["FanControl"]
+access = ["smbus", "superio"]
+affects = []
+severity = "info"
+verified = true
+note = "Cooperates: uses PawnIO and the shared mutexes. Overlap only through its device plugins."
+
+[[entry]]
+id = "argus_monitor"
+name = "Argus Monitor"
+vendor = "Argotronic"
+category = "fan_control"
+processes = ["ArgusMonitor.exe"]
+uninstall_names = ["Argus Monitor"]
+access = ["smbus", "superio"]
+affects = []
+severity = "low"
+verified = false
+note = "Super I/O fan control; process name unverified."
+
+[[entry]]
+id = "speedfan"
+name = "SpeedFan"
+vendor = "Almico"
+category = "fan_control"
+processes = ["speedfan.exe"]
+drivers = ["speedfan"]
+uninstall_names = ["SpeedFan"]
+access = ["smbus", "superio", "kernel_driver"]
+affects = []
+severity = "low"
+verified = true
+note = "Legacy fan control with its own speedfan.sys driver."
+
+# -----------------------------------------------------------------------------------------------------------------
+# Kernel drivers that stay loaded independently of any app
+# -----------------------------------------------------------------------------------------------------------------
+
+[[entry]]
+id = "inpoutx64"
+name = "InpOut32 / InpOutx64 port I/O driver"
+vendor = "Highrez / Red Fox UK"
+category = "driver"
+drivers = ["inpoutx64", "inpout32"]
+access = ["superio", "kernel_driver"]
+affects = []
+severity = "high"
+verified = true
+note = "Gives any process raw port I/O. OpenRGB documentation says to remove it. Often left behind by RGB or hardware tools."
+
+[[entry]]
+id = "winring0"
+name = "WinRing0"
+vendor = "OpenLibSys"
+category = "driver"
+drivers = ["WinRing0x64", "WinRing0_1_2_0"]
+access = ["smbus", "superio", "kernel_driver"]
+affects = []
+severity = "high"
+verified = true
+note = "Vulnerable ring-0 driver (CVE-2020-14979 family), flagged by Microsoft Defender. Shipped by older OpenRGB, FanControl, NZXT CAM and EVGA tools."
+
+[[entry]]
+id = "pawnio"
+name = "PawnIO"
+vendor = "namazso"
+category = "driver"
+drivers = ["PawnIO"]
+uninstall_names = ["PawnIO"]
+access = ["smbus", "superio", "kernel_driver"]
+affects = []
+severity = "info"
+verified = true
+note = "Microsoft-signed, used by FanControl and OpenRGB; cooperative. Not a conflict by itself."
+
+# -----------------------------------------------------------------------------------------------------------------
+# Operating system features
+# -----------------------------------------------------------------------------------------------------------------
+
+[[entry]]
+id = "windows_dynamic_lighting"
+name = "Windows Dynamic Lighting"
+vendor = "Microsoft"
+category = "os_feature"
+access = ["lamparray"]
+affects = ["logitech"]
+severity = "medium"
+verified = true
+note = "Controls every HID LampArray device. Detected from HKCU\\Software\\Microsoft\\Lighting; the provider list shows which apps hold background control."

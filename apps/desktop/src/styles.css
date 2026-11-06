@@ -1,0 +1,78 @@
+/* Neutral first-pass theme (ADR 0001 #15): dark only, spacious, system fonts, no component library.
+   Colors and spacing live in custom properties so the visual direction can change in one place. */
+:root {
+  --color-bg: #121316;
+  --color-surface: #17181c;
+  --color-surface-raised: #1f2126;
+  --color-border: #2a2c32;
+  --color-text: #e6e7ea;
+  --color-text-muted: #9a9ca3;
+  --color-accent: #8ab4f8;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 40px;
+
+  --radius: 8px;
+  --sidebar-width: 220px;
+
+  --font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-size: 15px;
+  --font-size-lg: 18px;
+  --font-size-xl: 28px;
+
+  color-scheme: dark;
+  font-family: var(--font-family);
+  font-size: var(--font-size);
+  line-height: 1.5;
+  color: var(--color-text);
+  background: var(--color-bg);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+h1 {
+  margin: 0 0 var(--space-3);
+  font-size: var(--font-size-xl);
+  font-weight: 600;
+}
+
+p {
+  margin: 0;
+}
+
+.page-description {
+  max-width: 60ch;
+  color: var(--color-text-muted);
+}
+
+button {
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  font: inherit;
+  color: var(--color-text);
+  background: var(--color-surface-raised);
+  cursor: pointer;
+}
+
+button:hover {
+  border-color: var(--color-accent);
+}
+
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
