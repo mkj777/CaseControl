@@ -1,0 +1,48 @@
+# cargo-deny configuration (https://embarkstudios.github.io/cargo-deny/). Run with `cargo deny check`.
+
+[graph]
+# CaseControl ships for Windows x64 only. Restricting the graph keeps mobile/Linux/macOS-only crates
+# (e.g. Tauri's reqwest dependency on Android/iOS, GTK on Linux) out of every check.
+targets = ["x86_64-pc-windows-msvc"]
+all-features = false
+
+[advisories]
+# Vulnerabilities always fail the check. Unmaintained crates fail only when we depend on them directly;
+# transitive ones are surfaced by the Dependabot/advisory review instead of blocking CI.
+unmaintained = "workspace"
+yanked = "warn"
+ignore = []
+
+[licenses]
+# Our own crates are GPL-2.0-or-later (ADR 0001 #4); everything else must be permissive or weak copyleft.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+    "GPL-2.0-or-later",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+# No network access (ADR 0001 #13): HTTP client crates must never enter the Windows build.
+deny = [
+    { crate = "reqwest", reason = "no network access (ADR 0001 #13)" },
+    { crate = "ureq", reason = "no network access (ADR 0001 #13)" },
+    { crate = "curl", reason = "no network access (ADR 0001 #13)" },
+    { crate = "isahc", reason = "no network access (ADR 0001 #13)" },
+    { crate = "attohttpc", reason = "no network access (ADR 0001 #13)" },
+    { crate = "surf", reason = "no network access (ADR 0001 #13)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

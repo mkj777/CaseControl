@@ -37,14 +37,17 @@ Mirrors OpenRGB's RGBController semantics (one flat color buffer, zones index in
 pub struct Rgb { pub r: u8, pub g: u8, pub b: u8 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct DeviceId(String);          // stable across runs and USB ports: "<bus>:<vid>:<pid>[:<serial>]";
+pub struct DeviceId(String);          // stable across runs and USB ports: "hid:<vid>:<pid>[:<serial>]" for HID,
+                                      // "nvapi:<vendor>:<device>:<subvendor>:<subdevice>" for GPUs (lower-case 4-digit hex);
                                       // never a path hash (HID paths change with the port). If two identical
                                       // devices have no serial, append an ordinal ":#0", ":#1" in enumeration order.
+                                      // Empty, whitespace-only and all-zero serials ("00000000", as the G560 reports) count as absent.
 
 pub enum Bus { Hid, NvApi, Smbus /* reserved for the later tier */ }
 
 pub enum DeviceKind { Motherboard, Dram, Gpu, Cooler, LedStrip, Keyboard, Mouse, Mousemat, Headset, HeadsetStand,
-                      Gamepad, Light, Speaker, Virtual, Storage, Case, Microphone, Accessory, Keypad, Monitor, Unknown }
+                      Gamepad, Light, Speaker, Virtual, Storage, Case, Microphone, Accessory, Keypad, Laptop, Monitor, Unknown }
+                      // 22 variants in the order of OpenRGB's device_type enum
 
 pub struct DeviceInfo { pub id: DeviceId, pub name: String, pub vendor: String, pub kind: DeviceKind,
                         pub bus: Bus, pub location: String, pub serial: Option<String>, pub firmware: Option<String> }
