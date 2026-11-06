@@ -1,0 +1,77 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cc-core",
+    "crates/cc-hid",
+    "crates/cc-nvapi",
+    "crates/cc-drivers",
+    "crates/cc-conflicts",
+    "crates/cc-config",
+    "crates/cc-engine",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "GPL-2.0-or-later"
+publish = false
+repository = "https://github.com/mkj777/CaseControl"
+
+[workspace.dependencies]
+# internal crates
+cc-core = { path = "crates/cc-core" }
+cc-hid = { path = "crates/cc-hid" }
+cc-nvapi = { path = "crates/cc-nvapi" }
+cc-drivers = { path = "crates/cc-drivers" }
+cc-conflicts = { path = "crates/cc-conflicts" }
+cc-config = { path = "crates/cc-config" }
+cc-engine = { path = "crates/cc-engine" }
+
+# model / serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+bitflags = { version = "2", features = ["serde"] }
+
+# errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+
+# concurrency
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# platform
+hidapi = { version = "2", default-features = false, features = ["windows-native"] }
+windows = "0.62"
+windows-sys = "0.61"
+directories = "6"
+
+# tauri
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-build = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

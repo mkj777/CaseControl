@@ -1,0 +1,26 @@
+[package]
+name = "cc-drivers"
+description = "CaseControl device drivers: MSI Mystic Light, Wooting, Logitech, NVIDIA Illumination"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+cc-core = { workspace = true }
+cc-hid = { workspace = true }
+cc-nvapi = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = ["msi_mystic_light", "wooting", "logitech", "nvidia_illumination"]
+msi_mystic_light = []
+wooting = []
+logitech = []
+nvidia_illumination = []
+
+[lints]
+workspace = true

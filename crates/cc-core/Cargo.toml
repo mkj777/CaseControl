@@ -1,0 +1,19 @@
+[package]
+name = "cc-core"
+description = "CaseControl device model: ids, zones, modes, controller and backend traits, events"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+bitflags = { workspace = true }
+thiserror = { workspace = true }
+
+
+[lints]
+workspace = true

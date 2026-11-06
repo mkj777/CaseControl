@@ -1,0 +1,22 @@
+[package]
+name = "cc-hid"
+description = "CaseControl HID transport: hidapi backend, fake transport for tests, Windows hot-plug, named mutex guard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+cc-core = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+hidapi = { workspace = true }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_HumanInterfaceDevice", "Win32_System_Threading", "Win32_Security"] }
+
+[lints]
+workspace = true
