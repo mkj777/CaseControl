@@ -1,0 +1,23 @@
+[package]
+name = "cc-engine"
+description = "CaseControl runtime: detection, per-device worker threads, frame scheduler, profiles, event bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+cc-core = { workspace = true }
+cc-hid = { workspace = true }
+cc-drivers = { workspace = true }
+cc-config = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+
+[lints]
+workspace = true

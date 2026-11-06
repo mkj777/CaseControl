@@ -1,0 +1,19 @@
+[package]
+name = "cc-nvapi"
+description = "CaseControl NvAPI binding: dynamic nvapi64.dll loading and the GPU illumination API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+[lints]
+workspace = true
