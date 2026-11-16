@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { RouterLink, RouterView } from 'vue-router'
+import { onMounted } from 'vue'
+import { RouterLink, RouterView, useRoute } from 'vue-router'
+import { listenForDeviceEvents, refreshDevices } from './stores/devices'
 
 const nav = [
   { to: '/devices', label: 'Devices' },
@@ -7,6 +9,14 @@ const nav = [
   { to: '/conflicts', label: 'Conflicts' },
   { to: '/settings', label: 'Settings' },
 ]
+
+const route = useRoute()
+const isActive = (to: string) => route.path === to || route.path.startsWith(`${to}/`)
+
+onMounted(() => {
+  listenForDeviceEvents()
+  void refreshDevices()
+})
 </script>
 
 <template>
@@ -14,7 +24,14 @@ const nav = [
     <aside class="sidebar">
       <div class="brand">CaseControl</div>
       <nav class="nav">
-        <RouterLink v-for="item in nav" :key="item.to" :to="item.to" class="nav-link">
+        <RouterLink
+          v-for="item in nav"
+          :key="item.to"
+          :to="item.to"
+          class="nav-link"
+          :class="{ active: isActive(item.to) }"
+          :aria-current="isActive(item.to) ? 'page' : undefined"
+        >
           {{ item.label }}
         </RouterLink>
       </nav>
@@ -58,16 +75,19 @@ const nav = [
   border-radius: var(--radius);
   color: var(--color-text-muted);
   text-decoration: none;
+  transition:
+    color var(--transition),
+    background var(--transition);
 }
 
 .nav-link:hover,
-.nav-link.router-link-active {
+.nav-link.active {
   color: var(--color-text);
   background: var(--color-surface-raised);
 }
 
 .content {
   overflow-y: auto;
-  padding: var(--space-8);
+  padding: var(--space-8) var(--space-10);
 }
 </style>
