@@ -1,0 +1,192 @@
+/*
+ * CaseControl design tokens. Decided by the owner in ADR 0001 #30; see docs/design-system.md, "Decisions".
+ *
+ * Meant to replace the :root block at the top of apps/desktop/src/styles.css. Import it first
+ * (`import './tokens.css'` before `import './styles.css'` in main.ts), then delete the old :root variables.
+ *
+ * Three layers, read top to bottom:
+ *   1. Palette   raw values. Nothing outside this file uses them.
+ *   2. Roles     what a value is for (--bg, --text-muted, --field-border ...). Components use only these.
+ *   3. Scales and sizes   spacing, type, radius, motion, z-index, and the few component/layout sizes.
+ * A legacy block at the end maps the current names to the new ones so adoption can go file by file.
+ *
+ * Contrast ratios (WCAG 2.x) are noted next to every text and boundary colour, measured against --bg / --surface
+ * / --surface-raised.
+ */
+
+:root {
+  /* ---- 1. Palette ------------------------------------------------------------------------------------------- */
+  /* One neutral grey ramp (R = G = B, no tint), darkest to lightest. */
+  --grey-1: #0b0b0b;
+  --grey-2: #141414;
+  --grey-3: #1a1a1a;
+  --grey-4: #222222;
+  --grey-5: #2a2a2a;
+  --grey-6: #2f2f2f;
+  --grey-7: #3d3d3d;
+  --grey-8: #6e6e6e;
+  --grey-9: #8a8a8a;
+  --grey-10: #a0a0a0;
+  --grey-11: #e8e8e8;
+  --grey-12: #ffffff;
+
+  /* The only non-grey UI colours (ADR #30, amends #23). Text and 1 px lines only, never fills or large areas. */
+  --red: #f07178;
+  --amber: #d4a54a;
+
+  /* ---- 2. Roles --------------------------------------------------------------------------------------------- */
+  /* Surfaces: depth comes from one step lighter per level, never from shadows or gradients. */
+  --bg: var(--grey-2); /* window, content area */
+  --surface: var(--grey-3); /* sidebar, cards, tiles, dialogs, menus, preview stage */
+  --surface-raised: var(--grey-4); /* secondary buttons, selected nav item, tile hover */
+  --surface-hover: var(--grey-5); /* hover on raised things, menu item hover */
+  --surface-pressed: var(--grey-6); /* :active */
+
+  /* Lines */
+  --border: var(--grey-6); /* card and list dividers (1.38 / 1.30 : 1, decorative only) */
+  --border-strong: var(--grey-7); /* hover borders, dialog edge, pills (1.70 / 1.60 : 1) */
+
+  /* Fields (ADR #30): subtle border plus a lighter fill. Accepted below the WCAG 3:1 control-edge target
+     (1.70 / 1.60 : 1); the focus state carries the visibility instead. */
+  --field-bg: var(--grey-4);
+  --field-border: var(--grey-7);
+  --field-border-hover: var(--grey-8);
+  --field-border-focus: var(--grey-11); /* plus the focus ring (12.98 : 1 against --field-bg) */
+
+  /* Text */
+  --text: var(--grey-11); /* body and headings (15.04 / 14.20 / 12.98 : 1) */
+  --text-muted: var(--grey-10); /* descriptions, labels, hints (7.04 / 6.66 / 6.08 : 1) */
+  --text-faint: var(--grey-9); /* placeholders, tertiary metadata (5.34 / 5.04 / 4.61 : 1) */
+  --text-disabled: var(--grey-8); /* disabled controls only, never content (3.61 : 1, exempt) */
+
+  /* Neutral accent (ADR #23): the primary button, switches that are on, the selected segment. */
+  --accent: var(--grey-11);
+  --accent-hover: var(--grey-12);
+  --accent-text: var(--grey-2); /* text on --accent (15.04 : 1) */
+
+  /* Focus and selection share the neutral accent; the 2 px offset gap of --bg keeps them visible on any colour. */
+  --focus: var(--grey-11);
+  --selection: var(--grey-11); /* outline around selected LEDs, swatches, current colour chip */
+
+  /* Status and danger (ADR #30). Red: Faulted, errors, danger actions (6.44 / 6.08 / 5.56 : 1).
+     Amber: warnings, e.g. a running conflict (8.14 / 7.69 / 7.03 : 1). */
+  --danger: var(--red);
+  --status-faulted: var(--red);
+  --error: var(--red);
+  --warning: var(--amber);
+
+  /* LED preview */
+  --led-off: var(--grey-1); /* what an LED at #000000 is drawn as */
+  --led-border: var(--grey-7); /* 1 px ring so dark LEDs stay visible */
+
+  /* Overlays */
+  --backdrop: rgb(0 0 0 / 0.6);
+  --shadow-overlay: 0 8px 24px rgb(0 0 0 / 0.45); /* menus and dialogs only, for separation, not glow */
+
+  /* ---- 3. Scales -------------------------------------------------------------------------------------------- */
+  /* Spacing: the index is the multiple of 4 px (space-10 = 40 px). Large steps are for page rhythm. */
+  --space-0: 0;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-14: 56px;
+  --space-16: 64px;
+
+  /* Type: system font, two weights, four sizes. */
+  --font-sans: 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'Cascadia Mono', Consolas, ui-monospace, monospace;
+  --font-icon: 'Segoe Fluent Icons', 'Segoe MDL2 Assets'; /* functional glyphs only (window buttons, back, close) */
+
+  --text-sm: 13px; /* hints, metadata, badges */
+  --text-md: 15px; /* body, controls */
+  --text-lg: 18px; /* section titles (h2), tile and list item names, dialog titles */
+  --text-xl: 28px; /* page title (h1) */
+  --leading-tight: 1.25; /* headings, single-line controls */
+  --leading: 1.5; /* body text */
+  --weight-regular: 400;
+  --weight-strong: 600;
+  --measure: 60ch; /* longest line of running text */
+
+  /* Radius */
+  --radius-sm: 6px; /* LED keys, small colour swatches */
+  --radius-md: 10px; /* controls, menus, notices */
+  --radius-lg: 18px; /* cards, tiles, preview stage, dialogs */
+  --radius-full: 999px; /* pills, dots, switch track */
+
+  /* Motion: colour, border and background only; nothing slides or scales. */
+  --duration: 120ms;
+  --ease: ease-out;
+  --transition: var(--duration) var(--ease); /* kept as a shorthand, the current code uses it */
+
+  /* Stacking */
+  --z-titlebar: 10;
+  --z-menu: 20;
+  --z-dialog: 30;
+  --z-dialog-menu: 40; /* a menu opened from inside a dialog */
+
+  /* ---- Component and layout sizes ------------------------------------------------------------------------- */
+  --control-height: 36px; /* buttons, text fields, selects, segmented control */
+  --control-height-sm: 28px; /* buttons inside list rows, menu items */
+  --icon-button-size: 32px;
+  --switch-width: 40px;
+  --switch-height: 22px;
+
+  --titlebar-height: 32px;
+  --window-button-width: 46px;
+  --sidebar-width: 220px;
+
+  --page-pad-x: var(--space-14); /* 32 px below 1100 px window width, see the media query below */
+  --page-pad-top: var(--space-10);
+  --page-max-text: 760px; /* Profiles, Conflicts, Settings */
+  --page-max-wide: 1440px; /* Devices overview and device view (fluid, ADR #28) */
+  --tile-min: 260px; /* two tile columns at the 860 px minimum window */
+  --dialog-width: 480px;
+  --menu-min-width: 180px;
+
+  color-scheme: dark;
+}
+
+/* One breakpoint, by window width. Custom properties cannot be used inside media queries, so the 1100 px lives
+   here and in docs/design-system.md only. */
+@media (max-width: 1099px) {
+  :root {
+    --page-pad-x: var(--space-8);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration: 0ms;
+  }
+}
+
+/* ---- Legacy names (remove once nothing uses them) ------------------------------------------------------------ */
+/* Current styles.css names mapped to the new roles. Note --space-8 and --space-10 change meaning: the old
+   --space-8 (40 px) is the new --space-10, the old --space-10 (56 px) is the new --space-14. Rename those two
+   uses first (see the migration list) before importing this file, or spacing shrinks. */
+:root {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-hover: var(--surface-hover);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-text: var(--text);
+  --color-text-muted: var(--text-muted);
+  --color-text-faint: var(--text-disabled);
+  --color-accent: var(--accent);
+  --color-accent-text: var(--accent-text);
+  --color-led-off: var(--led-off);
+  --radius: var(--radius-md);
+  --content-width: var(--page-max-wide);
+  --font-family: var(--font-sans);
+  --font-size-sm: var(--text-sm);
+  --font-size: var(--text-md);
+  --font-size-lg: var(--text-lg);
+  --font-size-xl: var(--text-xl);
+}
