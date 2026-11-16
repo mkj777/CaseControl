@@ -8,8 +8,9 @@
 //!
 //! On start it loads settings and profiles (`cc-config`), starts the device engine (`cc-engine`) with every
 //! compiled-in driver (`cc-drivers`) and re-applies the last applied profile. Every exit path (tray Quit, the
-//! `quit` command, `RunEvent::ExitRequested`/`Exit`, which also covers Windows session end) releases the devices
-//! through [`AppState::shutdown_engine`] exactly once.
+//! `quit` command, a second instance started with `--quit`, `RunEvent::ExitRequested`/`Exit`, which also covers
+//! Windows session end) releases the devices through [`AppState::shutdown_engine`] exactly once. A `--quit`
+//! process itself never starts the engine (see [`run`]).
 //!
 //! After the start (also a hidden one) a background thread scans for conflicting software; if RGB suites affect a
 //! visible device, the window is shown and `startup-conflicts` carries the start dialog model (ADR 0001 #31, see
@@ -46,17 +47,38 @@ pub const MAIN_WINDOW: &str = "main";
 /// Command-line flag that starts the app with the window hidden (used by autostart).
 pub const HIDDEN_FLAG: &str = "--hidden";
 
-/// Whether the given command line (including the program name) asks for a hidden start.
-///
-/// Takes OS strings so a non-Unicode argument is simply not the flag instead of a startup panic.
-pub fn starts_hidden<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    args.into_iter()
-        .skip(1)
-        .any(|arg| arg.as_ref() == OsStr::new(HIDDEN_FLAG))
+/// Command-line flag that asks a running instance to shut down (releasing every device) and starts nothing itself.
+pub const QUIT_FLAG: &str = "--quit";
+
+/// What a command line asks the desktop app to do. `--elevated-actions` is not parsed here: `main` handles it
+/// before anything else (see [`elevated::helper_main`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaunchArgs {
+    /// `--hidden`: start with the window hidden.
+    pub hidden: bool,
+    /// `--quit`: make the running instance shut down; never start one.
+    pub quit: bool,
+}
+
+impl LaunchArgs {
+    /// Parses a command line including the program name, which is skipped. Flags match exactly; unknown
+    /// arguments are ignored. Takes OS strings so a non-Unicode argument is simply not a flag instead of a panic.
+    pub fn parse<I, S>(args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut parsed = Self::default();
+        for arg in args.into_iter().skip(1) {
+            let arg = arg.as_ref();
+            if arg == OsStr::new(HIDDEN_FLAG) {
+                parsed.hidden = true;
+            } else if arg == OsStr::new(QUIT_FLAG) {
+                parsed.quit = true;
+            }
+        }
+        parsed
+    }
 }
 
 /// Shows, unminimizes and focuses the main window.
@@ -126,19 +148,32 @@ fn spawn_startup_check<R: Runtime>(app: AppHandle<R>) {
     }
 }
 
-/// Builds and runs the Tauri application. Returns only on startup failure; a normal exit ends the process.
+/// Builds and runs the Tauri application. Returns only when started with `--quit` and no instance was running; a
+/// normal exit ends the process.
+///
+/// `--quit`: the single-instance plugin decides inside `Builder::build`, before the window, the tray, the engine or
+/// device detection exist (those start in the setup hook, which runs only in `App::run`). If an instance is running,
+/// this process forwards its arguments there and exits inside `build`; the running instance's callback calls
+/// [`shutdown`] before the forward returns. If none is running, `build` returns here and the process leaves without
+/// running the app.
 pub fn run() {
     logging::init();
-    let hidden = starts_hidden(std::env::args_os());
+    let launch = LaunchArgs::parse(std::env::args_os());
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        hidden,
+        hidden = launch.hidden,
+        quit = launch.quit,
         "CaseControl starting"
     );
 
     let app = tauri::Builder::default()
         // Must be the first plugin so a second instance exits before anything else initializes.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if LaunchArgs::parse(&args).quit {
+                tracing::info!(?args, "second instance asked to quit");
+                shutdown(app);
+                return;
+            }
             tracing::info!(?args, "second instance started; focusing the main window");
             if let Err(err) = show_main_window(app) {
                 tracing::error!(%err, "cannot show main window");
@@ -209,7 +244,7 @@ pub fn run() {
             app.manage(state);
             tray::create(app.handle(), &profiles)?;
             // The window is declared with `visible: false` so a hidden start never flashes it.
-            if !hidden && !start_minimized {
+            if !launch.hidden && !start_minimized {
                 show_main_window(app.handle())?;
             }
             spawn_startup_check(app.handle().clone());
@@ -224,6 +259,13 @@ pub fn run() {
             panic!("error while running CaseControl: {err}");
         }
     };
+    if launch.quit {
+        // A running instance would have made this process exit inside `build`, so none is running. The setup hook
+        // (engine, tray, window) never runs; release the single-instance lock and leave.
+        tracing::info!("--quit: no running instance; exiting");
+        app.handle().cleanup_before_exit();
+        return;
+    }
     app.run(|app, event| {
         // `Exit` also arrives on Windows session end (WM_ENDSESSION), where the process ends right after.
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit)
@@ -238,13 +280,48 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    fn parse(args: &[&str]) -> LaunchArgs {
+        LaunchArgs::parse(args)
+    }
+
     #[test]
     fn hidden_flag_is_detected_after_program_name() {
-        assert!(starts_hidden(["casecontrol.exe", "--hidden"]));
-        assert!(starts_hidden(["casecontrol.exe", "--other", "--hidden"]));
-        assert!(!starts_hidden(["casecontrol.exe"]));
-        assert!(!starts_hidden(["--hidden"]));
-        assert!(!starts_hidden(["casecontrol.exe", "--hidden=false"]));
+        assert!(parse(&["casecontrol.exe", "--hidden"]).hidden);
+        assert!(parse(&["casecontrol.exe", "--other", "--hidden"]).hidden);
+        assert!(!parse(&["casecontrol.exe"]).hidden);
+        assert!(!parse(&["--hidden"]).hidden);
+        assert!(!parse(&["casecontrol.exe", "--hidden=false"]).hidden);
+    }
+
+    #[test]
+    fn quit_flag_is_detected_after_program_name() {
+        assert_eq!(
+            parse(&["casecontrol.exe", "--quit"]),
+            LaunchArgs {
+                hidden: false,
+                quit: true
+            }
+        );
+        assert_eq!(
+            parse(&["casecontrol.exe", "--hidden", "--quit"]),
+            LaunchArgs {
+                hidden: true,
+                quit: true
+            }
+        );
+        assert!(!parse(&["--quit"]).quit);
+        assert!(!parse(&["casecontrol.exe"]).quit);
+        assert!(!parse(&["casecontrol.exe", "--quit=true"]).quit);
+        assert!(!parse(&["casecontrol.exe", "--QUIT"]).quit);
+        assert!(!parse(&["casecontrol.exe", "quit"]).quit);
+        assert_eq!(parse(&[]), LaunchArgs::default());
+    }
+
+    #[test]
+    fn forwarded_second_instance_args_parse() {
+        // The single-instance callback receives the second instance's argv as `Vec<String>`.
+        let args = vec![r"C:\Apps\casecontrol.exe".to_owned(), "--quit".to_owned()];
+        assert!(LaunchArgs::parse(&args).quit);
     }
 
     #[cfg(windows)]
@@ -254,14 +331,16 @@ mod tests {
         use std::os::windows::ffi::OsStringExt;
 
         let lone_surrogate = OsString::from_wide(&[0xD800]);
-        assert!(!starts_hidden([
-            OsString::from("casecontrol.exe"),
-            lone_surrogate.clone()
-        ]));
-        assert!(starts_hidden([
+        assert_eq!(
+            LaunchArgs::parse([OsString::from("casecontrol.exe"), lone_surrogate.clone()]),
+            LaunchArgs::default()
+        );
+        let parsed = LaunchArgs::parse([
             OsString::from("casecontrol.exe"),
             lone_surrogate,
             OsString::from("--hidden"),
-        ]));
+            OsString::from("--quit"),
+        ]);
+        assert!(parsed.hidden && parsed.quit);
     }
 }
