@@ -1,7 +1,9 @@
 <script setup lang="ts">
-// Conflicts: other software that may hold the same devices, with opt-in actions behind a confirmation
-// (ADR 0001 #12). Nothing here changes how that software starts.
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+// Conflicts: other software that may hold the same devices (ADR 0001 #12, #31). Per finding: what was found, how
+// it starts with Windows with Turn off / Re-enable, End process / Stop service behind a confirmation, and for RGB
+// suites "Don't ask again" for the start dialog. Every action that needs administrator rights runs behind at most
+// one Windows permission prompt; nothing changes without a click.
+import { computed, onMounted, ref } from 'vue'
 import {
   Button,
   Card,
@@ -11,21 +13,41 @@ import {
   Notice,
   PageHeader,
   StatusBadge,
+  Switch,
 } from '../components/ui'
-import { errorText, on, scanConflicts, stopService, terminateProcess, type ConflictScan, type Finding } from '../ipc'
-import { SEVERITY_LABEL, actionsOf, evidenceText, groupBySeverity, type FindingAction } from '../lib/conflicts'
+import {
+  closeProgram,
+  errorText,
+  scanConflicts,
+  setAutostart,
+  setDontAsk,
+  type ActionReport,
+  type CloseTarget,
+  type Finding,
+} from '../ipc'
+import {
+  SEVERITY_LABEL,
+  actionText,
+  autostartText,
+  closeTargetKey,
+  closeTargetLabel,
+  evidenceText,
+  groupBySeverity,
+} from '../lib/conflicts'
 import { familyLabel } from '../lib/device'
+import { conflictState, takeScan } from '../stores/conflicts'
 
-const scan = ref<ConflictScan | null>(null)
+const scan = computed(() => conflictState.scan)
 const scanning = ref(false)
 const error = ref<string | null>(null)
-const message = ref<string | null>(null)
+/** Outcome of the last action: lines and whether everything worked, or some steps are not confirmed yet. */
+const outcome = ref<{ state: 'ok' | 'unknown' | 'failed'; lines: string[] } | null>(null)
 
 async function runScan() {
   scanning.value = true
   error.value = null
   try {
-    scan.value = await scanConflicts()
+    takeScan(await scanConflicts())
   } catch (e) {
     error.value = errorText(e)
   } finally {
@@ -33,41 +55,59 @@ async function runScan() {
   }
 }
 
-let unlisten: (() => void) | null = null
-onMounted(async () => {
-  unlisten = await on('conflicts-updated', (s) => (scan.value = s))
-  await runScan()
-})
-onBeforeUnmount(() => unlisten?.())
+onMounted(runScan)
 
 const affectsText = (f: Finding) =>
   f.affects.includes('all') ? 'All device families' : f.affects.map(familyLabel).join(', ')
 
 // ---- actions -----------------------------------------------------------------------------------------------------
 
-const pending = ref<{ finding: Finding; action: FindingAction } | null>(null)
 const acting = ref(false)
 
-async function onConfirm() {
-  const p = pending.value
-  if (!p) return
+function show(report: ActionReport) {
+  takeScan(report.scan)
+  const lines = [...report.results.map(actionText), ...report.refused.map((r) => r.reason)]
+  const failed = report.results.some((r) => !r.ok && !r.unknown) || report.refused.length > 0
+  const unknown = report.results.some((r) => r.unknown)
+  outcome.value = {
+    state: failed ? 'failed' : unknown ? 'unknown' : 'ok',
+    lines: lines.length > 0 ? lines : ['Nothing needed to change.'],
+  }
+}
+
+async function act(run: () => Promise<ActionReport>) {
   acting.value = true
   error.value = null
-  message.value = null
+  outcome.value = null
   try {
-    if (p.action.kind === 'process') {
-      await terminateProcess(p.action.pid, p.finding.entry_id)
-      message.value = `${p.action.name} was ended.`
-      await runScan()
-    } else {
-      await stopService(p.action.name, p.finding.entry_id)
-      message.value = `Windows was asked to stop ${p.action.name}. Scan again once you have answered the prompt.`
-    }
+    show(await run())
   } catch (e) {
     error.value = errorText(e)
   } finally {
     acting.value = false
-    pending.value = null
+  }
+}
+
+const pending = ref<{ finding: Finding; target: CloseTarget } | null>(null)
+
+async function onConfirmClose() {
+  const p = pending.value
+  if (!p) return
+  await act(() => closeProgram(p.finding.entry_id, [p.target]))
+  pending.value = null
+}
+
+const toggleAutostart = (f: Finding, enabled: boolean) => act(() => setAutostart(f.entry_id, enabled))
+
+const needsAdmin = (f: Finding, enabled: boolean) =>
+  f.autostart.some((i) => i.toggleable && i.enabled !== enabled && i.needs_admin)
+
+async function onDontAsk(f: Finding, value: boolean) {
+  error.value = null
+  try {
+    takeScan(await setDontAsk(f.entry_id, value))
+  } catch (e) {
+    error.value = errorText(e)
   }
 }
 </script>
@@ -76,7 +116,7 @@ async function onConfirm() {
   <section class="page">
     <PageHeader
       title="Conflicts"
-      description="Other software that can control the same devices. When two programs drive a device, colours flicker or fall back. CaseControl never changes how this software starts."
+      description="Other software that can control the same devices. When two programs drive a device, colours flicker or fall back. You can close these programs and stop them from starting with Windows; autostart can be turned back on here."
     >
       <template #actions>
         <Button :disabled="scanning" @click="runScan">{{ scanning ? 'Scanning…' : 'Scan' }}</Button>
@@ -84,11 +124,22 @@ async function onConfirm() {
     </PageHeader>
 
     <Notice v-if="error" variant="error">{{ error }}</Notice>
-    <Notice v-if="message">{{ message }}</Notice>
+    <Notice v-if="outcome" :variant="outcome.state === 'failed' ? 'error' : outcome.state === 'unknown' ? 'warning' : 'info'">
+      {{
+        outcome.state === 'failed'
+          ? 'Some steps did not work.'
+          : outcome.state === 'unknown'
+            ? 'Some steps are not confirmed yet. Scan again in a moment.'
+            : 'Done.'
+      }}
+      <template #details>
+        <p v-for="(line, i) in outcome.lines" :key="i" class="selectable">{{ line }}</p>
+      </template>
+    </Notice>
     <Notice v-if="scan && scan.errors.length > 0" variant="warning">
       Parts of the scan failed, so the list may be incomplete:
       <template #details>
-        <p v-for="(e, i) in scan.errors" :key="i">{{ e }}</p>
+        <p v-for="(e, i) in scan.errors" :key="i" class="selectable">{{ e }}</p>
       </template>
     </Notice>
 
@@ -123,22 +174,50 @@ async function onConfirm() {
             <dt>Found</dt>
             <dd>
               <ul>
-                <li v-for="(e, i) in f.evidence" :key="i">{{ evidenceText(e) }}</li>
+                <li v-for="(e, i) in f.evidence" :key="i" class="selectable">{{ evidenceText(e) }}</li>
               </ul>
             </dd>
+            <template v-if="f.autostart.length > 0">
+              <dt>Starts with Windows</dt>
+              <dd>
+                <ul>
+                  <li v-for="(item, i) in f.autostart" :key="i" class="selectable">
+                    {{ autostartText(item) }}
+                    <span v-if="item.command" class="command">{{ item.command }}</span>
+                  </li>
+                </ul>
+              </dd>
+            </template>
           </KeyValueList>
 
-          <div v-if="actionsOf(f).length > 0" class="row">
+          <div v-if="f.close_targets.length > 0 || f.autostart_on || f.can_reenable" class="row">
             <Button
-              v-for="a in actionsOf(f)"
-              :key="a.kind === 'process' ? `p${a.pid}` : `s${a.name}`"
+              v-for="t in f.close_targets"
+              :key="closeTargetKey(t)"
               variant="danger"
               :disabled="acting"
-              @click="pending = { finding: f, action: a }"
+              @click="pending = { finding: f, target: t }"
             >
-              {{ a.kind === 'process' ? `End process ${a.name}` : `Stop ${a.driver ? 'driver' : 'service'} ${a.name}` }}
+              {{ closeTargetLabel(t) }}
+            </Button>
+            <Button v-if="f.autostart_on" :disabled="acting" @click="toggleAutostart(f, false)">
+              Turn off autostart
+            </Button>
+            <Button v-if="f.can_reenable" variant="ghost" :disabled="acting" @click="toggleAutostart(f, true)">
+              Re-enable autostart
             </Button>
           </div>
+          <p v-if="(f.autostart_on && needsAdmin(f, false)) || (f.can_reenable && needsAdmin(f, true))" class="muted small">
+            Changing autostart here shows a Windows permission prompt.
+          </p>
+
+          <Switch
+            v-if="f.class === 'suite'"
+            :model-value="f.dont_ask"
+            label="Don't ask again at start"
+            hint="CaseControl no longer offers to close this program when it starts."
+            @update:model-value="(v: boolean) => onDontAsk(f, v)"
+          />
         </Card>
       </div>
     </template>
@@ -146,26 +225,26 @@ async function onConfirm() {
 
     <ConfirmDialog
       :open="pending !== null"
-      :title="pending?.action.kind === 'process' ? 'End process?' : 'Stop service?'"
-      :confirm-label="pending?.action.kind === 'process' ? 'End process' : 'Stop'"
+      :title="pending?.target.kind === 'process' ? 'End process?' : 'Stop service?'"
+      :confirm-label="pending?.target.kind === 'process' ? 'End process' : 'Stop service'"
       danger
       :busy="acting"
-      @confirm="onConfirm"
+      @confirm="onConfirmClose"
       @cancel="pending = null"
     >
-      <template v-if="pending?.action.kind === 'process'">
+      <template v-if="pending?.target.kind === 'process'">
         <p>
-          CaseControl will end {{ pending.action.name }} (process {{ pending.action.pid }}) of {{ pending.finding.name }}.
-          Unsaved work in it is lost.
+          CaseControl will end {{ pending.target.name }} (process {{ pending.target.pid }}) of {{ pending.finding.name }}.
+          Unsaved work in it is lost. If Windows does not allow it, a permission prompt appears.
         </p>
-        <p>It may start again the next time you sign in; its startup setting is not changed.</p>
+        <p>It may start again the next time you sign in unless you turn off its autostart.</p>
       </template>
-      <template v-else-if="pending?.action.kind === 'service'">
+      <template v-else-if="pending?.target.kind === 'service'">
         <p>
-          Windows will ask for administrator permission, then stop the {{ pending.action.driver ? 'driver' : 'service' }}
-          {{ pending.action.name }} of {{ pending.finding.name }}.
+          Windows will ask for administrator permission, then CaseControl stops the service {{ pending.target.name }} of
+          {{ pending.finding.name }}.
         </p>
-        <p>It starts again with the next restart; its startup setting is not changed.</p>
+        <p>It starts again with the next restart unless you turn off its autostart.</p>
       </template>
     </ConfirmDialog>
   </section>
@@ -192,5 +271,12 @@ async function onConfirm() {
 .note {
   max-width: var(--measure);
   color: var(--text-muted);
+}
+
+.command {
+  display: block;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 </style>

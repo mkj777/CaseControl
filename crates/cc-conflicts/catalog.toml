@@ -6,6 +6,8 @@
 # Field reference (see src/catalog.rs for the authoritative schema):
 #   processes          exe names, case-insensitive, '*' wildcard allowed; also matched against the executable of
 #                      autostart entries (Run / RunOnce values, Startup folder items)
+#   generic_processes  names from `processes` too generic on their own; they match only when the full executable
+#                      path contains one of `path_hints` (case-insensitive substrings), never when it is unknown
 #   services           Win32 service names (matched against service name and display name), '*' wildcard allowed
 #   drivers            kernel driver service names (same matching as services, driver services only)
 #   uninstall_names    case-insensitive substring of an Uninstall key DisplayName
@@ -18,13 +20,22 @@
 #                      does not drive
 #   verified           false when research 03 marked any listed process/service/driver name UNVERIFIED
 #
-# Orchestrator decisions (Phase 1 review):
+# How the app uses an entry (ADR 0001 #12, #31):
+#   - Every finding is listed on the Conflicts page. A finding "affects" our devices only through `affects`.
+#   - Only `class = "suite"` entries can appear in the start dialog, and only when they affect a detected, non-hidden
+#     device and have something to close (a process or running service) or an autostart item that is on.
+#   - On a click CaseControl may: end the entry's processes, stop its running Win32 services, turn its autostart off
+#     (StartupApproved value "disabled" for Run / Startup folder items, services to Manual) or back on. It never
+#     touches `drivers`, never deletes Run values, services or files, and never acts on anything a fresh scan does not
+#     tie to the entry. Admin work runs in one elevated helper run (one UAC prompt).
+#
+# Orchestrator decisions:
 #   - asus_armoury_crate and gigabyte_rgb_fusion list "nvidia_illumination" in `affects`, consistent with the other
 #     vendor tools that drive GPU RGB over I2C (they can drive the RGB of partner NVIDIA cards).
-#   - class (ADR 0001 #31, phase 3 brief 03): suites are SignalRGB, OpenRGB, iCUE, Armoury Crate / Aura, ASRock
-#     Polychrome and Gigabyte RGB Fusion; every other entry is a vendor tool (incl. MSI Center and G HUB).
+#   - class (phase 3 brief 03, ADR 0001 #32): suites are SignalRGB, OpenRGB, iCUE, Armoury Crate / Aura, ASRock
+#     Polychrome, Gigabyte RGB Fusion and MSI Center / Dragon Center; every other entry is a vendor tool (incl. G HUB).
 #   - openrgb `OpenRGB` service, logitech_g_hub `logi_lamparray` driver and the steelseries_gg service name were
-#     confirmed on the development machine.
+#     confirmed on the development machine; G HUB's Run value starts `lghub_system_tray.exe`.
 
 # -----------------------------------------------------------------------------------------------------------------
 # RGB suites that drive many vendors' devices
@@ -91,6 +102,8 @@ vendor = "ASUS"
 category = "vendor_rgb"
 class = "suite"
 processes = ["LightingService.exe", "ArmourySocketServer.exe", "asus_framework.exe", "ArmourySwAgent.exe", "AsusCertService.exe", "AsSysCtrlService.exe", "Aac*Hal_x86.exe"]
+generic_processes = ["LightingService.exe"]
+path_hints = ["\\ASUS\\", "\\LightingService\\", "Armoury"]
 services = ["LightingService", "ArmouryCrateControlInterface", "AsusCertService", "AsusROGLSLService", "AsusAppService", "GameSDK Service", "AsusFanControlService", "AsSysCtrlService", "asComSvc", "asus", "asusm"]
 drivers = ["asusgio2", "asusgio3", "IOMap"]
 uninstall_names = ["Armoury Crate", "AURA Service"]
@@ -106,7 +119,7 @@ id = "msi_center"
 name = "MSI Center / Mystic Light / Dragon Center"
 vendor = "MSI"
 category = "vendor_rgb"
-class = "vendor_tool"
+class = "suite"
 processes = ["MSI_Central_Service.exe", "LEDKeeper2.exe", "LightKeeperService.exe", "Mystic_Light_Service.exe"]
 services = ["MSI_Central_Service", "Mystic Light*"]
 drivers = ["NTIOLib*"]
@@ -125,6 +138,8 @@ vendor = "Gigabyte"
 category = "vendor_rgb"
 class = "suite"
 processes = ["RGBFusion.exe", "GvLedServices.exe", "RunLed.exe"]
+generic_processes = ["RunLed.exe"]
+path_hints = ["GIGABYTE", "RGBFusion"]
 drivers = ["gdrv*"]
 uninstall_names = ["RGB Fusion", "GIGABYTE Control Center"]
 install_paths = ["%ProgramFiles(x86)%\\GIGABYTE\\RGBFusion"]
@@ -155,6 +170,8 @@ vendor = "NZXT"
 category = "vendor_rgb"
 class = "vendor_tool"
 processes = ["NZXT CAM.exe", "cam_helper.exe"]
+generic_processes = ["cam_helper.exe"]
+path_hints = ["NZXT"]
 uninstall_names = ["NZXT CAM"]
 install_paths = ["%LOCALAPPDATA%\\NZXT\\CAM"]
 access = ["hid", "superio", "kernel_driver"]
@@ -183,6 +200,8 @@ vendor = "Razer"
 category = "vendor_rgb"
 class = "vendor_tool"
 processes = ["Razer Synapse 3.exe", "Razer Synapse Service.exe", "Razer Synapse Service Process.exe", "RazerCentralService.exe", "Razer Central.exe", "GameManagerService.exe", "RazerAppEngine.exe", "GameManagerService3.exe", "RzEngineMon.exe"]
+generic_processes = ["GameManagerService.exe", "GameManagerService3.exe"]
+path_hints = ["Razer"]
 services = ["Razer Central Service", "Razer Synapse Service", "Razer Game Manager Service*", "RzActionSvc"]
 uninstall_names = ["Razer Synapse"]
 install_paths = ["%ProgramFiles%\\Razer\\RazerAppEngine"]
@@ -199,6 +218,8 @@ vendor = "Logitech"
 category = "vendor_rgb"
 class = "vendor_tool"
 processes = ["lghub.exe", "lghub_agent.exe", "lghub_system_tray.exe", "lghub_updater.exe", "logi_crashpad_handler.exe", "logi_lamparray_service*.exe", "LCore.exe"]
+generic_processes = ["LCore.exe"]
+path_hints = ["Logitech", "LGHUB"]
 services = ["LGHUBUpdaterService", "logi_lamparray_service", "Logitech_Lamparray_Service"]
 drivers = ["logi_lamparray"]
 uninstall_names = ["Logitech G HUB", "Logitech Gaming Software"]
@@ -244,6 +265,8 @@ vendor = "Cooler Master"
 category = "vendor_rgb"
 class = "vendor_tool"
 processes = ["MasterPlus(PER. Only).exe", "cm-blackhawk.exe", "CMService.exe"]
+generic_processes = ["CMService.exe"]
+path_hints = ["Cooler Master", "CoolerMaster", "MasterPlus"]
 uninstall_names = ["MasterPlus"]
 access = ["hid"]
 affects = []

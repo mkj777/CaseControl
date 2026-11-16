@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // Page-level notice (docs/design-system.md, "Notice and inline error"). The default slot is the first line in
 // --text; the `details` slot is smaller muted text below. `warning` and `error` add a coloured 3 px left edge; the
-// text itself stays neutral. Success messages use `info`.
+// text itself stays neutral. Success messages use `info`. Error notices are selectable so the message can be copied
+// (ADR 0001 #32).
 withDefaults(defineProps<{ variant?: 'info' | 'warning' | 'error' }>(), { variant: 'info' })
 </script>
 
@@ -37,6 +38,8 @@ withDefaults(defineProps<{ variant?: 'info' | 'warning' | 'error' }>(), { varian
 
 .error {
   border-left: 3px solid var(--error);
+  user-select: text;
+  cursor: text;
 }
 
 .details {

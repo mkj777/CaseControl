@@ -1,7 +1,5 @@
-//! Single opt-in actions of the Conflicts page. Call these only from an explicit user click.
-//!
-//! Neither action changes how software starts; a terminated process or stopped service may come back at the next
-//! logon. Switching autostart off and on is done by the [`Action`](crate::Action)s of the `resolve` module
+//! Checked process termination (the building block of [`Action::TerminateProcess`](crate::Action)) and service
+//! name validation. Call these only for an explicit user click; everything else goes through the `resolve` module
 //! (ADR 0001 #31).
 
 /// Why an action was refused or failed.
@@ -23,9 +21,6 @@ pub enum ActionError {
         /// Name found now.
         actual: String,
     },
-    /// The service name contains characters outside `[A-Za-z0-9_.\- ]`.
-    #[error("invalid service name `{0}`")]
-    InvalidServiceName(String),
     /// Reading the process list failed.
     #[error("process lookup failed: {0}")]
     Lookup(String),
@@ -83,63 +78,12 @@ pub(crate) fn terminate_process_with(
     kill(pid).map_err(ActionError::Failed)
 }
 
-/// Whether `name` is safe to pass to `sc.exe stop "<name>"`: non-empty, only `[A-Za-z0-9_.\- ]`.
+/// Whether `name` is an acceptable service name: non-empty, only `[A-Za-z0-9_.\- ]`.
 pub(crate) fn is_valid_service_name(name: &str) -> bool {
     !name.trim().is_empty()
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ' '))
-}
-
-/// Asks Windows to stop service `name`: runs `%SystemRoot%\System32\sc.exe stop "<name>"` through `ShellExecuteW`
-/// with the `runas` verb, which shows the UAC prompt. Returns as soon as the request was handed to the shell; it
-/// does not wait for UAC or for the service to stop, so the caller should rescan afterwards.
-///
-/// `sc.exe` is started by absolute path, never by bare name, so a planted `sc.exe` in the current directory or on
-/// `PATH` cannot be run elevated. Stopping does not change the start type; the service starts again at the next
-/// boot unless its autostart is turned off separately. `reason` is logged with the name.
-pub fn request_stop_service(name: &str, reason: &str) -> Result<(), ActionError> {
-    let parameters = stop_parameters(name)?;
-    #[cfg(windows)]
-    {
-        let sc = sc_exe_path(std::env::var_os("SystemRoot"))?;
-        tracing::warn!(
-            service = name,
-            reason,
-            sc = %sc.display(),
-            "requesting elevated service stop on user request"
-        );
-        crate::sys::shell_execute_runas(&sc, &parameters).map_err(ActionError::Failed)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (parameters, reason);
-        Err(ActionError::Unsupported)
-    }
-}
-
-/// `<system_root>\System32\sc.exe`; fails when the system root is unknown or not absolute.
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn sc_exe_path(system_root: Option<std::ffi::OsString>) -> Result<std::path::PathBuf, ActionError> {
-    let root = system_root
-        .filter(|r| !r.is_empty())
-        .ok_or_else(|| ActionError::Failed("SystemRoot is not set; cannot locate sc.exe".to_owned()))?;
-    let root = std::path::PathBuf::from(root);
-    if !root.is_absolute() {
-        return Err(ActionError::Failed(format!(
-            "SystemRoot `{}` is not an absolute path; cannot locate sc.exe",
-            root.display()
-        )));
-    }
-    Ok(root.join("System32").join("sc.exe"))
-}
-
-/// Builds the `sc.exe` parameter string after validating `name`.
-fn stop_parameters(name: &str) -> Result<String, ActionError> {
-    if !is_valid_service_name(name) {
-        return Err(ActionError::InvalidServiceName(name.to_owned()));
-    }
-    Ok(format!("stop \"{name}\""))
 }
 
 #[cfg(test)]
@@ -200,46 +144,5 @@ mod tests {
         assert!(!is_valid_service_name("x;y"));
         assert!(!is_valid_service_name("a/b"));
         assert!(!is_valid_service_name("dienst\u{e4}"));
-        assert_eq!(
-            stop_parameters("SignalRgb.Service").as_deref(),
-            Ok("stop \"SignalRgb.Service\"")
-        );
-        assert_eq!(
-            stop_parameters("bad\"name"),
-            Err(ActionError::InvalidServiceName("bad\"name".to_owned()))
-        );
-        assert_eq!(
-            stop_parameters("x\" & del"),
-            Err(ActionError::InvalidServiceName("x\" & del".to_owned()))
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn sc_exe_is_absolute_under_system_root() {
-        let root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
-        let path = sc_exe_path(Some(root.clone())).expect("sc.exe path");
-        assert!(path.is_absolute(), "{}", path.display());
-        assert!(path.starts_with(&root), "{}", path.display());
-        assert!(path.ends_with(r"System32\sc.exe"), "{}", path.display());
-        assert_eq!(path, std::path::Path::new(&root).join(r"System32\sc.exe"));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn sc_exe_path_rejects_missing_or_relative_root() {
-        assert!(matches!(sc_exe_path(None), Err(ActionError::Failed(_))));
-        assert!(matches!(
-            sc_exe_path(Some("".into())),
-            Err(ActionError::Failed(_))
-        ));
-        assert!(matches!(
-            sc_exe_path(Some("Windows".into())),
-            Err(ActionError::Failed(_))
-        ));
-        assert_eq!(
-            sc_exe_path(Some(r"C:\Windows".into())),
-            Ok(std::path::PathBuf::from(r"C:\Windows\System32\sc.exe"))
-        );
     }
 }

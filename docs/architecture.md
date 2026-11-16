@@ -153,40 +153,80 @@ re-plug of the device while the app runs (hot-plug, profile re-association by `D
 ## Conflicts (`cc-conflicts`)
 
 - Catalog `catalog.toml` embedded via `include_str!`, entries from `docs/research/03-conflicting-software-catalog.md`:
-  `name, vendor, processes[], services[], drivers[], uninstall_keys[], paths[], access = [hid|smbus|superio|lamparray],
-  affects = [device family ids], severity, note`. Unverified names are kept but flagged `verified = false`.
-- Scanners (all unelevated): processes (`sysinfo` or Toolhelp), services and driver services
-  (`EnumServicesStatusEx(SERVICE_WIN32 | SERVICE_DRIVER)`), installed apps (Uninstall keys incl. Wow6432Node and HKCU),
-  Dynamic Lighting (`HKCU\Software\Microsoft\Lighting` incl. `Providers`), OpenRGB SDK port (TCP connect 127.0.0.1:6742
-  is the single allowed local socket use and is behind a setting, default off).
-- Output: `Finding { entry, evidence: Vec<Evidence>, running: bool, affects_our_devices: Vec<DeviceId> }`.
-- Actions (opt-in per click): `terminate_process(pid)` (same user, no elevation), `stop_service(name)` via
-  `ShellExecuteW("runas", "sc.exe", "stop <name>")` which shows UAC. Every action is logged with the finding it came from.
-- The first findings on this machine will be: `SignalRgbDriver` (driver running, app closed), `inpoutx64` (port I/O driver
-  running), SignalRGB as Dynamic Lighting provider, G HUB updater, Logitech LampArray service.
+  `name, vendor, category, class, processes[], services[], drivers[], uninstall_names[], install_paths[],
+  lighting_providers[], access = [hid|smbus|superio|lamparray|...], affects = [device family ids], severity, note`.
+  Unverified names are kept but flagged `verified = false`. `class` is `suite` (full RGB suites: SignalRGB, OpenRGB,
+  iCUE, Armoury Crate / Aura, Polychrome, RGB Fusion, MSI Center / Dragon Center) or `vendor_tool` (everything
+  else, e.g. G HUB, Wootility, the LampArray service, monitors, drivers) (ADR 0001 #31, #32).
+- Scanners (all unelevated, read-only): processes (Toolhelp), services and driver services with start type
+  (`EnumServicesStatusEx(SERVICE_WIN32 | SERVICE_DRIVER)`), installed apps (Uninstall keys incl. Wow6432Node and
+  HKCU), Dynamic Lighting (`HKCU\Software\Microsoft\Lighting` incl. `Providers`), autostart (Run / RunOnce in HKCU,
+  HKLM and HKLM WOW6432Node, the per-user and common Startup folders with `.lnk` targets, each with its
+  `Explorer\StartupApproved\{Run,Run32,StartupFolder}` state), OpenRGB SDK port (TCP connect 127.0.0.1:6742 is the
+  single allowed local socket use and is behind a setting, default off).
+- Output: `Finding { entry, class, evidence: Vec<Evidence>, autostart: Vec<AutostartItem>, running, installed }`.
+  Autostart items match a catalog entry when the executable's file name matches its `processes`; a Win32 service of
+  the entry is an autostart item too (enabled = start type Auto). The desktop app adds the affected devices.
+- Actions (only on a user click, ADR 0001 #12 and #31), a fixed enum: terminate process (pid + name re-checked on
+  the open handle), stop Win32 service, set service start type Auto / Manual, set the `StartupApproved` value
+  (`02 ...` on, `03 ...` + FILETIME off, as Task Manager does; Run values are never deleted). "Close" = terminate the
+  entry's processes and stop its running services; drivers are never touched. "Turn off autostart" = StartupApproved
+  off and services to Manual; "Re-enable" restores StartupApproved and the remembered previous start type. Every
+  action is checked against a fresh scan (`check_action`) and logged with its entry.
+- Elevation: HKCU writes and terminations of programs without admin work run in the app first. Everything that
+  needs administrator rights (HKLM StartupApproved, service stop and start type), the terminations of programs that
+  also have admin work (so they run after their services were stopped and set to Manual and nothing restarts them)
+  and terminations refused for lack of rights run afterwards in **one** elevated invocation of the app's own
+  executable (`--elevated-actions <request.json>`, `ShellExecuteExW` with `runas`, owned by the main window), so one
+  click causes at most one UAC prompt. Processes are only ended in the app's own Windows session. `main` enters this
+  helper mode before Tauri, the single-instance guard, the engine or any logging setup. The helper accepts only
+  `...\CaseControl\elevated\request-<n>-<n>.json` with no link or reparse point in its path, reads at most 64 KiB
+  (64 actions), runs a fresh scan, refuses HKCU writes and every action the scan does not tie to the named catalog
+  entry or session, runs the rest through the service control manager and the registry (no shell), and writes the
+  per-action results to a new file next to the request. The app waits for a time sized from the batch (30 s plus
+  12 s per service stop and 2 s per other action); if the helper is still running then, the results are reported as
+  not confirmed yet and its files are left alone. Request files older than an hour are removed at the next start.
+- Matching: catalog `processes` match executable file names; names that are too generic on their own
+  (`generic_processes`, e.g. `CMService.exe`, `RunLed.exe`, `LightingService.exe`) match only when the full path
+  contains one of the entry's `path_hints`.
 
 ## Config (`cc-config`)
 
 `%APPDATA%\CaseControl\config.toml`, `profiles\<name>.toml`, logs in `%LOCALAPPDATA%\CaseControl\logs`.
 Settings: `autostart`, `start_minimized`, `frame_rate`, `detectors.<family> = true|false`, `conflicts.check_openrgb_port`,
-`last_profile`. Profile: per `DeviceId` a `ModeState` or a direct color buffer plus per-zone overrides. Unknown keys preserved.
+`conflicts.dont_ask` (catalog ids the start dialog no longer asks about), `conflicts.previous_start_types` (service name
+-> start type before CaseControl set it to Manual), `last_profile`. Profile: per `DeviceId` a `ModeState` or a direct color buffer plus per-zone overrides. Unknown keys preserved.
 
 ## Desktop app (`apps/desktop`)
 
 - Tauri 2, features `tray-icon`; plugins: `tauri-plugin-autostart` (HKCU Run), `tauri-plugin-single-instance`,
-  `tauri-plugin-log` or `tracing` bridge. CSP strict, no remote URLs, `dangerousRemoteDomainIpcAccess` empty.
+  `tracing` to a rolling log file. CSP strict, no remote URLs, `dangerousRemoteDomainIpcAccess` empty.
 - Close hides to tray; tray menu: Show, Apply profile submenu, Release devices, Quit.
 - Commands: `list_devices`, `set_direct`, `set_zone`, `set_mode`, `resize_zone`, `save_to_hardware`, `release_device`,
-  `list_profiles/save_profile/apply_profile/delete_profile`, `scan_conflicts`, `terminate_process`, `stop_service`,
-  `get_settings/set_settings`, `rescan`. Events: `device-added`, `device-removed`, `device-faulted`, `conflicts-updated`.
+  `release_all`, `rescan`, `set_device_hidden`, `set_zone_hidden`, `list_profiles/save_profile/apply_profile/
+  rename_profile/delete_profile`, `scan_conflicts`, `startup_conflicts`, `resolve_conflicts`, `close_program`,
+  `set_autostart`, `set_dont_ask`, `get_settings/set_settings`. Events: `device-added`, `device-removed`,
+  `device-faulted`, `device-state-changed`, `devices-changed`, `profiles-changed`, `conflicts-updated`,
+  `startup-conflicts`.
+- Conflicts at start (ADR 0001 #31): after setup (also with `--hidden`) a background thread scans; device control is
+  already running. RGB suites that affect a detected, non-hidden device, are not in `conflicts.dont_ask` and have
+  something to close or an autostart item that is on form the start dialog model. If it is not empty the window is
+  shown and `startup-conflicts` sent; the frontend also asks for it with `startup_conflicts` on mount. The dialog
+  offers per program "Close now" and "Turn off autostart" (preselected) and "Don't ask again"; Proceed sends one
+  `resolve_conflicts` (at most one UAC prompt) and shows per-action results. While a dialog program still starts
+  with Windows, the shell shows a warning notice that reopens the dialog. Vendor tools appear only on the Conflicts
+  page, which offers End process / Stop service (`close_program`), Turn off / Re-enable autostart and the
+  "Don't ask again" switch.
 - Frontend: Vue 3 + TS + Vite, pnpm, `@tauri-apps/api`. English UI. Pages: Devices, Profiles, Conflicts, Settings.
-  Visual direction: dark and spacious, few large elements, device preview in focus (ADR 0001 #15).
+  Visual direction: dark and spacious, few large elements, device preview in focus (ADR 0001 #15); components from
+  the design system (`docs/design-system.md`, ADR 0001 #30).
 
 ## Testing
 
 - `cc-core`: model invariants (zone ranges cover the buffer, mode caps vs state validation).
 - `cc-drivers`: packet builders tested byte-exact against transcripts derived from the reference C++ (FakeTransport).
-- `cc-conflicts`: scanners behind traits, tests inject fake process/service lists.
+- `cc-conflicts`: scanners and system actions behind traits; tests inject fake process/service/autostart lists and a
+  fake `SystemOps`, so no test terminates, stops or writes anything.
 - Hardware tests are manual, run on this machine, documented in `docs/testing-hardware.md` as a checklist.
 
 ## CI (GitHub Actions, `windows-latest`)
@@ -197,8 +237,9 @@ Actions pinned by SHA, `permissions: contents: read`, `Swatinem/rust-cache`. Bra
 
 ## Security posture
 
-No kernel driver, no elevation except the user-triggered service stop, no network, no telemetry, no auto-update.
+No kernel driver, no elevation except the one user-triggered elevated helper run per conflict action (ADR 0001 #31),
+no network, no telemetry, no auto-update.
 `cargo-deny` bans HTTP client crates (`reqwest`, `ureq`, `curl`; the exact list is derived from `cargo tree` after the Tauri
 scaffold exists, since Tauri may pull `hyper` transitively) and enforces a license allowlist (GPL-compatible is fine, project is private).
 All `unsafe` is confined to `cc-hid` (hot-plug FFI, named mutex), `cc-nvapi`, and the single `sys` module of
-`cc-conflicts` (Toolhelp, service control manager, process termination, ShellExecute); each block carries a `// SAFETY:` comment.
+`cc-conflicts` (Toolhelp, service control manager, process termination, ShellExecuteEx); each block carries a `// SAFETY:` comment.

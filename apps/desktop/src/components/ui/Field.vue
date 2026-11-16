@@ -99,5 +99,8 @@ const describedBy = computed(
 
 .error {
   color: var(--error);
+  /* Error text can be copied (ADR 0001 #32). */
+  user-select: text;
+  cursor: text;
 }
 </style>

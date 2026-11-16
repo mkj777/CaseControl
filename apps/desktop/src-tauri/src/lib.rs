@@ -97,6 +97,7 @@ fn spawn_startup_check<R: Runtime>(app: AppHandle<R>) {
     let spawned = std::thread::Builder::new()
         .name("cc-startup-conflicts".into())
         .spawn(move || {
+            elevated::sweep_stale_files();
             let Some(state) = app.try_state::<AppState>() else {
                 return;
             };
@@ -173,8 +174,7 @@ pub fn run() {
             commands::resolve_conflicts,
             commands::set_autostart,
             commands::set_dont_ask,
-            commands::terminate_process,
-            commands::stop_service,
+            commands::close_program,
             commands::get_settings,
             commands::set_settings,
         ])

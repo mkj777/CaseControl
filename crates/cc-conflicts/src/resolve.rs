@@ -97,6 +97,10 @@ pub struct ActionOutcome {
     pub ok: bool,
     /// Why it failed or was refused.
     pub error: Option<String>,
+    /// The result is not known yet (the elevated helper was still running at the timeout). `ok` is `false`; a
+    /// rescan shows the real state.
+    #[serde(default)]
+    pub unknown: bool,
     /// A same-user termination failed for lack of rights; the caller may retry it in the elevated batch. Not part
     /// of the wire format.
     #[serde(skip)]
@@ -111,6 +115,7 @@ impl ActionOutcome {
             action: planned.action.clone(),
             ok: true,
             error: None,
+            unknown: false,
             retry_elevated: false,
         }
     }
@@ -122,7 +127,16 @@ impl ActionOutcome {
             action: planned.action.clone(),
             ok: false,
             error: Some(error.into()),
+            unknown: false,
             retry_elevated: false,
+        }
+    }
+
+    /// Not known yet (see [`ActionOutcome::unknown`]).
+    pub fn not_known(planned: &PlannedAction, note: impl Into<String>) -> Self {
+        Self {
+            unknown: true,
+            ..Self::failure(planned, note)
         }
     }
 }
@@ -144,14 +158,19 @@ pub trait SystemOps {
     ) -> Result<(), String>;
 }
 
-/// What "Close now" does for `finding`: terminate each matched process, stop each running Win32 service. Drivers
-/// are never touched.
-pub fn close_actions(finding: &Finding) -> Vec<Action> {
+/// What "Close now" does for `finding`: terminate each matched process (only those in `session` when given), stop
+/// each running Win32 service. Drivers are never touched.
+pub fn close_actions(finding: &Finding, session: Option<u32>) -> Vec<Action> {
     finding
         .evidence
         .iter()
         .filter_map(|e| match e {
-            Evidence::Process { pid, name, .. } => Some(Action::TerminateProcess {
+            Evidence::Process {
+                pid,
+                name,
+                session: s,
+                ..
+            } if session.is_none_or(|own| *s == Some(own)) => Some(Action::TerminateProcess {
                 pid: *pid,
                 name: name.clone(),
             }),
@@ -201,8 +220,13 @@ pub fn autostart_actions(
 }
 
 /// Checks that `planned` targets something `report` (a fresh scan) attributes to its catalogue entry. This is the
-/// whole authorisation model: an action on anything a scan does not tie to the catalogue is refused.
-pub fn check_action(planned: &PlannedAction, report: &ScanReport) -> Result<(), String> {
+/// whole authorisation model: an action on anything a scan does not tie to the catalogue is refused. With
+/// `session`, a process is only ended if the scan saw it in that Windows session (never another user's process).
+pub fn check_action(
+    planned: &PlannedAction,
+    report: &ScanReport,
+    session: Option<u32>,
+) -> Result<(), String> {
     let finding = report
         .findings
         .iter()
@@ -216,9 +240,10 @@ pub fn check_action(planned: &PlannedAction, report: &ScanReport) -> Result<(), 
     };
     match &planned.action {
         Action::TerminateProcess { pid, name } => {
-            let found = finding.evidence.iter().any(
-                |e| matches!(e, Evidence::Process { pid: p, name: n, .. } if p == pid && n.eq_ignore_ascii_case(name)),
-            );
+            let found = finding.evidence.iter().any(|e| {
+                matches!(e, Evidence::Process { pid: p, name: n, session: s, .. }
+                    if p == pid && n.eq_ignore_ascii_case(name) && session.is_none_or(|own| *s == Some(own)))
+            });
             if !found {
                 return Err(format!(
                     "process {name} ({pid}) is not part of {:?}",
@@ -317,14 +342,18 @@ pub struct ElevatedRequest {
     pub version: u32,
     /// The actions, at most [`MAX_ELEVATED_ACTIONS`].
     pub actions: Vec<PlannedAction>,
+    /// The requesting app's Windows session. Processes are only ended in this session; without it the helper ends
+    /// none.
+    pub session_id: Option<u32>,
 }
 
 impl ElevatedRequest {
     /// A request of the current version.
-    pub fn new(actions: Vec<PlannedAction>) -> Self {
+    pub fn new(actions: Vec<PlannedAction>, session_id: Option<u32>) -> Self {
         Self {
             version: ELEVATED_PROTOCOL_VERSION,
             actions,
+            session_id,
         }
     }
 }
@@ -342,8 +371,9 @@ pub struct ElevatedResponse {
 ///
 /// Rules: the version must match and the request may hold at most [`MAX_ELEVATED_ACTIONS`] actions (otherwise
 /// every action is refused); each action must be one that needs administrator rights or a process termination
-/// (HKCU `StartupApproved` writes are refused: in the elevated process HKCU may be another user's hive); and each
-/// action must pass [`check_action`] against `report`. Refused actions are reported, never run.
+/// (HKCU `StartupApproved` writes are refused: in the elevated process HKCU may be another user's hive); a process
+/// is only ended in the request's session (none without one); and each action must pass [`check_action`] against
+/// `report`. Refused actions are reported, never run.
 pub fn run_elevated_request(
     request: &ElevatedRequest,
     report: &ScanReport,
@@ -380,8 +410,11 @@ pub fn run_elevated_request(
     for planned in &request.actions {
         let elevated_kind =
             planned.action.needs_admin() || matches!(planned.action, Action::TerminateProcess { .. });
-        let check = if elevated_kind {
-            check_action(planned, report)
+        let is_termination = matches!(planned.action, Action::TerminateProcess { .. });
+        let check = if is_termination && request.session_id.is_none() {
+            Err("the request names no session, so no process is ended".to_owned())
+        } else if elevated_kind {
+            check_action(planned, report, request.session_id)
         } else {
             Err("this action runs without administrator rights and is refused here".to_owned())
         };
@@ -487,6 +520,13 @@ pub(crate) mod tests {
                     pid: 100,
                     name: "SignalRgb.exe".into(),
                     path: None,
+                    session: Some(1),
+                },
+                Evidence::Process {
+                    pid: 200,
+                    name: "SignalRgb.exe".into(),
+                    path: None,
+                    session: Some(2),
                 },
                 Evidence::Service {
                     name: "SignalRgb.Service".into(),
@@ -555,7 +595,7 @@ pub(crate) mod tests {
     #[test]
     fn close_targets_processes_and_running_services_only() {
         assert_eq!(
-            close_actions(&signalrgb()),
+            close_actions(&signalrgb(), Some(1)),
             [
                 Action::TerminateProcess {
                     pid: 100,
@@ -722,7 +762,7 @@ pub(crate) mod tests {
             },
         ];
         for a in ok {
-            assert_eq!(check_action(&planned(a.clone()), &r), Ok(()), "{a:?}");
+            assert_eq!(check_action(&planned(a.clone()), &r, Some(1)), Ok(()), "{a:?}");
         }
         let refused = [
             // Pid reuse / another process.
@@ -771,7 +811,7 @@ pub(crate) mod tests {
             },
         ];
         for a in refused {
-            assert!(check_action(&planned(a.clone()), &r).is_err(), "{a:?}");
+            assert!(check_action(&planned(a.clone()), &r, Some(1)).is_err(), "{a:?}");
         }
         let other_entry = PlannedAction {
             entry_id: "openrgb".into(),
@@ -779,35 +819,45 @@ pub(crate) mod tests {
                 name: "SignalRgb.Service".into(),
             },
         };
-        assert!(check_action(&other_entry, &r).is_err());
+        assert!(check_action(&other_entry, &r, Some(1)).is_err());
+        // Another user's process: refused with a session, accepted only when no session is given.
+        let other_user = planned(Action::TerminateProcess {
+            pid: 200,
+            name: "SignalRgb.exe".into(),
+        });
+        assert!(check_action(&other_user, &r, Some(1)).is_err());
+        assert!(check_action(&other_user, &r, None).is_ok());
     }
 
     #[test]
     fn elevated_request_runs_only_validated_admin_actions() {
         let ops = FakeOps::default();
-        let request = ElevatedRequest::new(vec![
-            planned(Action::StopService {
-                name: "SignalRgb.Service".into(),
-            }),
-            // HKCU write: refused in the elevated helper.
-            planned(Action::SetStartupApproved {
-                location: AutostartLocation::HkcuRun,
-                name: "SignalRgb".into(),
-                enabled: false,
-            }),
-            planned(Action::StopService {
-                name: "Spooler".into(),
-            }),
-            planned(Action::TerminateProcess {
-                pid: 100,
-                name: "SignalRgb.exe".into(),
-            }),
-            planned(Action::SetStartupApproved {
-                location: AutostartLocation::HklmRun,
-                name: "SignalRgbAll".into(),
-                enabled: true,
-            }),
-        ]);
+        let request = ElevatedRequest::new(
+            vec![
+                planned(Action::StopService {
+                    name: "SignalRgb.Service".into(),
+                }),
+                // HKCU write: refused in the elevated helper.
+                planned(Action::SetStartupApproved {
+                    location: AutostartLocation::HkcuRun,
+                    name: "SignalRgb".into(),
+                    enabled: false,
+                }),
+                planned(Action::StopService {
+                    name: "Spooler".into(),
+                }),
+                planned(Action::TerminateProcess {
+                    pid: 100,
+                    name: "SignalRgb.exe".into(),
+                }),
+                planned(Action::SetStartupApproved {
+                    location: AutostartLocation::HklmRun,
+                    name: "SignalRgbAll".into(),
+                    enabled: true,
+                }),
+            ],
+            Some(1),
+        );
         let response = run_elevated_request(&request, &report(), &ops);
         assert_eq!(response.version, ELEVATED_PROTOCOL_VERSION);
         let ok: Vec<bool> = response.outcomes.iter().map(|o| o.ok).collect();
@@ -826,16 +876,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn elevated_terminations_need_the_requesting_session() {
+        let ops = FakeOps::default();
+        let kill = |pid| {
+            planned(Action::TerminateProcess {
+                pid,
+                name: "SignalRgb.exe".into(),
+            })
+        };
+        let response = run_elevated_request(
+            &ElevatedRequest::new(vec![kill(100), kill(200)], Some(1)),
+            &report(),
+            &ops,
+        );
+        assert_eq!(
+            response.outcomes.iter().map(|o| o.ok).collect::<Vec<_>>(),
+            [true, false]
+        );
+        let response = run_elevated_request(&ElevatedRequest::new(vec![kill(100)], None), &report(), &ops);
+        assert!(!response.outcomes[0].ok);
+        assert_eq!(*ops.calls.borrow(), ["terminate 100 SignalRgb.exe"]);
+    }
+
+    #[test]
     fn elevated_request_with_wrong_version_or_too_many_actions_runs_nothing() {
         let ops = FakeOps::default();
         let action = planned(Action::StopService {
             name: "SignalRgb.Service".into(),
         });
-        let mut request = ElevatedRequest::new(vec![action.clone()]);
+        let mut request = ElevatedRequest::new(vec![action.clone()], Some(1));
         request.version = 99;
         let response = run_elevated_request(&request, &report(), &ops);
         assert!(response.outcomes.iter().all(|o| !o.ok));
-        let request = ElevatedRequest::new(vec![action; MAX_ELEVATED_ACTIONS + 1]);
+        let request = ElevatedRequest::new(vec![action; MAX_ELEVATED_ACTIONS + 1], Some(1));
         let response = run_elevated_request(&request, &report(), &ops);
         assert!(response.outcomes.iter().all(|o| !o.ok));
         assert!(ops.calls.borrow().is_empty());
@@ -844,9 +917,12 @@ pub(crate) mod tests {
     #[test]
     fn elevated_request_against_an_empty_scan_runs_nothing() {
         let ops = FakeOps::default();
-        let request = ElevatedRequest::new(vec![planned(Action::StopService {
-            name: "SignalRgb.Service".into(),
-        })]);
+        let request = ElevatedRequest::new(
+            vec![planned(Action::StopService {
+                name: "SignalRgb.Service".into(),
+            })],
+            Some(1),
+        );
         let response = run_elevated_request(&request, &ScanReport::default(), &ops);
         assert!(!response.outcomes[0].ok);
         assert!(ops.calls.borrow().is_empty());

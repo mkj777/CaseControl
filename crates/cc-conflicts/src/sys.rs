@@ -1,6 +1,6 @@
 //! The only module of this crate that contains `unsafe` code: thin, safe wrappers around the Win32 calls for
 //! process enumeration (Toolhelp), the service control manager (enumeration, stop, start type), process
-//! termination and `ShellExecuteW` / `ShellExecuteExW` (UAC).
+//! termination and `ShellExecuteExW` (the one UAC prompt of the elevated helper).
 //!
 //! Every function here is safe to call. Handles are owned by RAII guards and closed on drop. Buffers that the
 //! system fills with structs are allocated as `Vec<u64>` so they are 8-byte aligned.
@@ -10,19 +10,21 @@ use std::path::Path;
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_CANCELLED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
-    ERROR_NO_MORE_FILES, ERROR_SERVICE_NOT_ACTIVE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_NO_MORE_FILES, ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_NOT_ACTIVE, HANDLE, HWND,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
+use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Services::{
     ChangeServiceConfigW, CloseServiceHandle, ControlService, ENUM_SERVICE_STATUS_PROCESSW,
     ENUM_SERVICE_TYPE, EnumServicesStatusExW, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
     QueryServiceConfigW, QueryServiceStatus, SC_ENUM_PROCESS_INFO, SC_HANDLE, SC_MANAGER_CONNECT,
     SC_MANAGER_ENUMERATE_SERVICE, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_CONTROL_STOP,
     SERVICE_DEMAND_START, SERVICE_DRIVER, SERVICE_ERROR, SERVICE_NO_CHANGE, SERVICE_QUERY_CONFIG,
-    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATE_ALL, SERVICE_STATUS, SERVICE_STOP, SERVICE_STOPPED,
-    SERVICE_WIN32,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATE_ALL, SERVICE_STATUS, SERVICE_STOP,
+    SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_WIN32,
 };
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -30,7 +32,6 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Shell::{
     SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
-    ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
@@ -119,6 +120,14 @@ pub fn process_list() -> Result<Vec<(u32, String)>, ScanError> {
     Ok(out)
 }
 
+/// Windows session of `pid`, `None` if it cannot be determined.
+pub fn process_session(pid: u32) -> Option<u32> {
+    let mut session = 0u32;
+    // SAFETY: plain FFI call; `session` is a writable u32 for the duration of the call.
+    unsafe { ProcessIdToSessionId(pid, &mut session) }.ok()?;
+    Some(session)
+}
+
 /// Full image path of `pid`, `None` if the process cannot be opened (protected, other session, exited).
 pub fn process_image_path(pid: u32) -> Option<String> {
     // SAFETY: plain FFI call; failure is reported through the Result and a success handle is owned below.
@@ -177,26 +186,6 @@ pub fn terminate_checked(pid: u32, expected_name: &str, reason: &str) -> Result<
 /// The file-name component of a Windows path (`C:\dir\tool.exe` -> `tool.exe`).
 fn file_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
-}
-
-/// Starts `file` with `parameters` through `ShellExecuteW` with the `runas` verb (shows UAC). Returns immediately.
-///
-/// `file` should be an absolute path: an unqualified name is resolved through a search path that includes the
-/// current directory.
-pub fn shell_execute_runas(file: &Path, parameters: &str) -> Result<(), String> {
-    let verb = HSTRING::from("runas");
-    let file = HSTRING::from(file);
-    let parameters = HSTRING::from(parameters);
-    // SAFETY: all string arguments are NUL-terminated HSTRINGs that outlive the call; a null directory and no
-    // owner window are allowed by the API.
-    let result = unsafe { ShellExecuteW(None, &verb, &file, &parameters, PCWSTR::null(), SW_HIDE) };
-    // ShellExecuteW returns a value greater than 32 on success, an error code otherwise.
-    let code = result.0 as isize;
-    if code > 32 {
-        Ok(())
-    } else {
-        Err(format!("ShellExecuteW failed with code {code}"))
-    }
 }
 
 /// Allocates an 8-byte aligned buffer of at least `bytes` bytes.
@@ -366,6 +355,16 @@ pub fn stop_service(name: &str, wait: std::time::Duration) -> Result<(), String>
     match unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut status) } {
         Ok(()) => {}
         Err(e) if e.code() == ERROR_SERVICE_NOT_ACTIVE.to_hresult() => return Ok(()),
+        // Already stopping (or busy starting): wait like for an accepted stop if it is on its way down.
+        Err(e) if e.code() == ERROR_SERVICE_CANNOT_ACCEPT_CTRL.to_hresult() => {
+            let state = service_status(&service)?.dwCurrentState;
+            if state != SERVICE_STOP_PENDING && state != SERVICE_STOPPED {
+                return Err(format!(
+                    "service {name} cannot accept a stop request right now (state {})",
+                    state.0
+                ));
+            }
+        }
         Err(e) => return Err(format!("ControlService(stop {name}) failed: {}", e.message())),
     }
     let deadline = std::time::Instant::now() + wait;
@@ -413,11 +412,12 @@ pub fn set_service_start_type(name: &str, auto: bool) -> Result<(), String> {
 }
 
 /// Starts `file` with `parameters` through `ShellExecuteExW` with the `runas` verb (one UAC prompt) and waits up to
-/// `timeout` for it to exit. Returns its exit code.
+/// `timeout` for it to exit. Returns its exit code. `owner` (a window handle) brings the prompt to the front.
 pub fn run_as_admin_and_wait(
     file: &Path,
     parameters: &str,
     timeout: std::time::Duration,
+    owner: Option<isize>,
 ) -> Result<u32, ElevationError> {
     let verb = HSTRING::from("runas");
     let file = HSTRING::from(file);
@@ -425,6 +425,7 @@ pub fn run_as_admin_and_wait(
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        hwnd: HWND(owner.unwrap_or(0) as *mut std::ffi::c_void),
         lpVerb: PCWSTR(verb.as_ptr()),
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(parameters.as_ptr()),
@@ -432,7 +433,8 @@ pub fn run_as_admin_and_wait(
         ..Default::default()
     };
     // SAFETY: `info` is a properly sized SHELLEXECUTEINFOW whose string pointers point to HSTRINGs that outlive the
-    // call; the system writes hProcess into it.
+    // call; `hwnd` is null or a window handle the caller passed (only used as the prompt's owner); the system writes
+    // hProcess into it.
     if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
         return Err(if e.code() == ERROR_CANCELLED.to_hresult() {
             ElevationError::Declined

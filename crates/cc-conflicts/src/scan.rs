@@ -33,6 +33,9 @@ pub enum Evidence {
         name: String,
         /// Full image path if readable.
         path: Option<String>,
+        /// Windows session of the process, `None` when unknown. Actions only end processes of the caller's session.
+        #[serde(default)]
+        session: Option<u32>,
     },
     /// A Win32 service matched `services`.
     Service {
@@ -272,13 +275,14 @@ fn match_entry(entry: &Entry, input: &Input<'_>) -> Option<Finding> {
     let mut autostart = Vec::new();
 
     for p in input.processes {
-        if entry.processes.iter().any(|pat| glob_match(pat, &p.name)) {
+        if entry.matches_executable(&p.name, p.exe_path.as_deref()) {
             push_unique(
                 &mut evidence,
                 Evidence::Process {
                     pid: p.pid,
                     name: p.name.clone(),
                     path: p.exe_path.clone(),
+                    session: p.session_id,
                 },
             );
         }
@@ -351,10 +355,10 @@ fn match_entry(entry: &Entry, input: &Input<'_>) -> Option<Finding> {
         push_unique(&mut evidence, Evidence::OpenRgbPort);
     }
     for item in input.autostart {
-        let matched = item.executable.as_deref().is_some_and(|exe| {
-            let name = file_name(exe);
-            entry.processes.iter().any(|pat| glob_match(pat, name))
-        });
+        let matched = item
+            .executable
+            .as_deref()
+            .is_some_and(|exe| entry.matches_executable(file_name(exe), Some(exe)));
         if matched {
             let item = AutostartItem::from_entry(item);
             if !autostart.contains(&item) {
@@ -520,6 +524,7 @@ mod tests {
             pid,
             name: name.to_owned(),
             exe_path: None,
+            session_id: Some(1),
         }
     }
 
@@ -912,6 +917,55 @@ mod tests {
                 .iter()
                 .all(|f| f.autostart.iter().all(|i| i.name != "Discord"))
         );
+    }
+
+    #[test]
+    fn generic_process_names_need_their_path() {
+        let processes = FakeProcesses(vec![
+            process(1, "CMService.exe"),
+            ProcessInfo {
+                exe_path: Some(r"C:\Program Files\Razer\GameManagerService.exe".into()),
+                ..process(2, "GameManagerService.exe")
+            },
+        ]);
+        let report = Scanner::new(
+            Catalog::embedded(),
+            processes,
+            FakeServices(vec![]),
+            FakeRegistry {
+                apps: vec![],
+                lighting: None,
+            },
+        )
+        .with_paths(NoPaths)
+        .with_autostart(FakeAutostart(vec![run_entry(
+            AutostartLocation::HkcuRun,
+            "Other",
+            r#""C:\Tools\RunLed.exe""#,
+            None,
+        )]))
+        .scan(&ScanOptions::default());
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.entry_id != "coolermaster_masterplus")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.entry_id != "gigabyte_rgb_fusion")
+        );
+        let razer = find(&report, "razer_synapse");
+        assert!(matches!(
+            &razer.evidence[..],
+            [Evidence::Process {
+                pid: 2,
+                session: Some(1),
+                ..
+            }]
+        ));
     }
 
     #[test]

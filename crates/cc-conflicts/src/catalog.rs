@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use cc_core::family;
 
+use crate::scan::glob_match;
+
 /// The catalog text compiled into the binary.
 const EMBEDDED: &str = include_str!("../catalog.toml");
 
@@ -111,6 +113,13 @@ pub struct Entry {
     /// Win32 service names (case-insensitive, `*` wildcard, also matched against the display name).
     #[serde(default)]
     pub services: Vec<String>,
+    /// Names from `processes` that are too generic on their own (`CMService.exe`, `RunLed.exe`, ...): they match
+    /// only when the executable's full path contains one of `path_hints`, and never when the path is unknown.
+    #[serde(default)]
+    pub generic_processes: Vec<String>,
+    /// Case-insensitive substrings of an executable path that confirm a `generic_processes` match.
+    #[serde(default)]
+    pub path_hints: Vec<String>,
     /// Kernel driver service names (same matching as `services`).
     #[serde(default)]
     pub drivers: Vec<String>,
@@ -137,6 +146,21 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// Whether an executable with file name `file` and full path `path` belongs to this entry: it matches
+    /// `processes`, and if it also matches `generic_processes`, `path` contains one of `path_hints`.
+    pub fn matches_executable(&self, file: &str, path: Option<&str>) -> bool {
+        if !self.processes.iter().any(|p| glob_match(p, file)) {
+            return false;
+        }
+        if !self.generic_processes.iter().any(|p| glob_match(p, file)) {
+            return true;
+        }
+        path.is_some_and(|path| {
+            let path = path.to_lowercase();
+            self.path_hints.iter().any(|h| path.contains(&h.to_lowercase()))
+        })
+    }
+
     /// Whether the entry has anything a scanner can match on.
     pub fn has_detection_key(&self) -> bool {
         !(self.processes.is_empty()
@@ -191,6 +215,9 @@ pub enum CatalogError {
     /// A match pattern is empty.
     #[error("entry `{0}` contains an empty pattern")]
     EmptyPattern(String),
+    /// `generic_processes` without `path_hints`, or a generic name that is not in `processes`.
+    #[error("entry `{0}` has generic process names without path hints")]
+    GenericWithoutHint(String),
 }
 
 impl Catalog {
@@ -257,9 +284,20 @@ impl Catalog {
                 .chain(&entry.drivers)
                 .chain(&entry.uninstall_names)
                 .chain(&entry.install_paths)
-                .chain(&entry.lighting_providers);
+                .chain(&entry.lighting_providers)
+                .chain(&entry.generic_processes)
+                .chain(&entry.path_hints);
             if patterns.into_iter().any(|p| p.trim().is_empty()) {
                 return Err(CatalogError::EmptyPattern(entry.id.clone()));
+            }
+            let generic_ok = entry.generic_processes.is_empty()
+                || (!entry.path_hints.is_empty()
+                    && entry
+                        .generic_processes
+                        .iter()
+                        .all(|g| entry.processes.iter().any(|p| p.eq_ignore_ascii_case(g))));
+            if !generic_ok {
+                return Err(CatalogError::GenericWithoutHint(entry.id.clone()));
             }
             if !entry.has_detection_key() {
                 return Err(CatalogError::NoDetectionKey(entry.id.clone()));
@@ -337,12 +375,12 @@ mod tests {
             "asus_armoury_crate",
             "asrock_polychrome",
             "gigabyte_rgb_fusion",
+            "msi_center",
         ] {
             assert_eq!(catalog.get(id).map(|e| e.class), Some(Class::Suite), "{id}");
         }
         for id in [
             "logitech_g_hub",
-            "msi_center",
             "windows_dynamic_lighting",
             "fancontrol",
             "inpoutx64",
@@ -351,6 +389,48 @@ mod tests {
         }
         let ghub = catalog.get("logitech_g_hub").expect("g hub");
         assert!(ghub.processes.iter().any(|p| p == "lghub_system_tray.exe"));
+    }
+
+    #[test]
+    fn generic_names_need_a_path_hint() {
+        let catalog = Catalog::embedded();
+        let cm = catalog.get("coolermaster_masterplus").expect("cooler master");
+        assert!(!cm.matches_executable("CMService.exe", None));
+        assert!(!cm.matches_executable("CMService.exe", Some(r"C:\Tools\Other\CMService.exe")));
+        assert!(cm.matches_executable(
+            "cmservice.exe",
+            Some(r"C:\Program Files (x86)\CoolerMaster\MasterPlus\CMService.exe")
+        ));
+        assert!(
+            cm.matches_executable("cm-blackhawk.exe", None),
+            "specific names need no path"
+        );
+        let asus = catalog.get("asus_armoury_crate").expect("asus");
+        assert!(!asus.matches_executable("LightingService.exe", Some(r"C:\Other\LightingService.exe")));
+        assert!(asus.matches_executable(
+            "LightingService.exe",
+            Some(r"C:\Program Files (x86)\LightingService\LightingService.exe")
+        ));
+        for id in [
+            "gigabyte_rgb_fusion",
+            "razer_synapse",
+            "nzxt_cam",
+            "logitech_g_hub",
+        ] {
+            let e = catalog.get(id).expect(id);
+            assert!(
+                !e.generic_processes.is_empty() && !e.path_hints.is_empty(),
+                "{id}"
+            );
+        }
+        let text = with_required(&minimal("a").replace(
+            "drivers = [\"x\"]",
+            "processes = [\"svc.exe\"]\ngeneric_processes = [\"svc.exe\"]",
+        ));
+        assert!(matches!(
+            Catalog::parse(&text),
+            Err(CatalogError::GenericWithoutHint(_))
+        ));
     }
 
     #[test]

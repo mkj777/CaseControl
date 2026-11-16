@@ -113,7 +113,7 @@ async function toggleHidden(id: string, hidden: boolean) {
       <h2>Found but not started</h2>
       <ul>
         <ListRow v-for="(f, i) in deviceState.failures" :key="i" :name="familyLabel(f.family)">
-          <span class="muted">{{ deviceErrorText(f.error) }}</span>
+          <span class="muted selectable">{{ deviceErrorText(f.error) }}</span>
         </ListRow>
       </ul>
     </div>
