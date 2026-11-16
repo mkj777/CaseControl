@@ -160,7 +160,7 @@ pub fn start_brightness(last_profile: Option<&Profile>, settings: &Settings) -> 
 
 /// The engine configuration for `settings`: frame rate, disabled families, remembered zone sizes, master
 /// brightness, All off, the per-device brightness changes (the last profile's own map is laid underneath when it is
-/// re-applied), hot-plug on.
+/// re-applied), hot-plug and resume handling on.
 pub fn engine_config(settings: &Settings) -> EngineConfig {
     EngineConfig {
         frame_rate: settings
@@ -174,6 +174,7 @@ pub fn engine_config(settings: &Settings) -> EngineConfig {
             .map(|(id, ov)| (id.clone(), ov.zone_sizes.clone()))
             .collect(),
         hotplug: true,
+        resume: true,
         master_brightness: settings.master_brightness.min(FULL_BRIGHTNESS),
         brightness: start_brightness(None, settings),
         all_off: settings.all_off,

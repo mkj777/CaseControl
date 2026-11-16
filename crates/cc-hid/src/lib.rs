@@ -17,6 +17,8 @@
 //!   returns; Windows device paths are case-insensitive, so compare them with
 //!   `eq_ignore_ascii_case` and pass [`HidDeviceInfo::path`] to [`open`] unchanged.
 //! - `mutex` (Windows): named-mutex guard for the shared bus mutexes other tools use.
+//! - `power` (Windows): suspend and resume notifications via `PowerRegisterSuspendResumeNotification`, so the
+//!   engine can re-send device state after the PC wakes (devices fall back to their firmware state in sleep).
 //!
 //! # Shared access, never exclusive
 //!
@@ -47,6 +49,8 @@ pub mod hotplug;
 pub mod info;
 #[cfg(windows)]
 pub mod mutex;
+#[cfg(windows)]
+pub mod power;
 pub mod recording;
 pub mod transport;
 

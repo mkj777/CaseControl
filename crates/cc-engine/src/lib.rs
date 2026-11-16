@@ -15,6 +15,9 @@
 //! - Brightness (ADR 0001 #33): a device brightness per device and a master brightness scale what goes to the device
 //!   (colours, or a hardware mode's brightness); All off fades every driven device to black and holds it there. The
 //!   stored settings stay unscaled, so `current_settings()` and profiles never see dimmed colours.
+//! - Resume (sleep, hibernation): on Windows the engine subscribes to suspend/resume broadcasts and then calls
+//!   [`EngineHandle::reassert`]: debounced, it resets and re-sends every driven device's current output, retries
+//!   failed writes with back-off for a few seconds and re-opens devices that faulted or vanished during sleep.
 //! - [`EngineHandle::shutdown`] (or dropping the last handle) releases every active device and joins the threads.
 //!
 //! What this crate deliberately does not do: no device protocols (that is `cc-drivers`), no file I/O or profile
@@ -26,6 +29,7 @@ mod engine;
 mod error;
 mod hotplug;
 mod lighting;
+mod resume;
 mod view;
 mod worker;
 
