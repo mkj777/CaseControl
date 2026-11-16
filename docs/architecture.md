@@ -217,6 +217,14 @@ Settings: `autostart`, `start_minimized`, `frame_rate`, `detectors.<family> = tr
 - Tauri 2, features `tray-icon`; plugins: `tauri-plugin-autostart` (HKCU Run), `tauri-plugin-single-instance`,
   `tracing` to a rolling log file. CSP strict, no remote URLs, `dangerousRemoteDomainIpcAccess` empty.
 - Close hides to tray; tray menu: Show, Apply profile submenu, Release devices, Quit.
+- Command line (parsed by `LaunchArgs::parse`; exact matches, unknown arguments ignored): `--hidden` starts with the
+  window hidden (the autostart entry passes it). `--quit` asks a running instance to shut down: the single-instance
+  plugin decides inside `tauri::Builder::build`, before the window, tray, engine or device detection exist (they start
+  in the setup hook, which only `App::run` runs). With an instance running, the second process forwards its argv and
+  exits there; the running instance's callback calls `shutdown()` (devices released once, then exit) before the
+  forward returns, so the `--quit` process usually ends after the release. With none running, `run()` releases the
+  single-instance lock and returns without running the app (exit code 0). `--elevated-actions` is handled separately
+  by `main` (see Conflicts).
 - Commands: `list_devices`, `set_direct`, `set_zone`, `set_mode`, `resize_zone`, `save_to_hardware`, `release_device`,
   `release_all`, `rescan`, `set_device_hidden`, `set_zone_hidden`, `list_profiles/save_profile/apply_profile/
   rename_profile/delete_profile`, `scan_conflicts`, `startup_conflicts`, `resolve_conflicts`, `close_program`,
