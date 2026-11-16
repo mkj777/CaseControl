@@ -65,6 +65,15 @@ impl Default for Settings {
 pub struct ConflictSettings {
     /// Probe `127.0.0.1:6742` for a running OpenRGB SDK server. Off by default (the only socket use in the app).
     pub check_openrgb_port: bool,
+    /// Catalogue ids of the programs the start dialog no longer asks about (ADR 0001 #31). They still show on the
+    /// Conflicts page. Written only when not empty.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub dont_ask: BTreeSet<String>,
+    /// Start type a service had before CaseControl set it to Manual ("Turn off autostart"), keyed by service name,
+    /// so "Re-enable" restores exactly it. Values are lower-case start type names (`"auto"`, ...). An entry is
+    /// removed once the service was re-enabled. Written only when not empty.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub previous_start_types: BTreeMap<String, String>,
     /// Unknown keys of the `[conflicts]` table.
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -200,6 +209,10 @@ mod tests {
         s.detectors.insert("logitech".into(), false);
         s.detectors.insert("wooting".into(), true);
         s.conflicts.check_openrgb_port = true;
+        s.conflicts.dont_ask.insert("openrgb".into());
+        s.conflicts
+            .previous_start_types
+            .insert("SignalRgb.Service".into(), "auto".into());
         let mut ov = DeviceOverrides::default();
         ov.zone_sizes.insert("JRAINBOW1".into(), 60);
         ov.zone_sizes.insert("JRAINBOW2".into(), 8);
@@ -365,6 +378,53 @@ frame_rate = 30
         s.save(&paths).expect("save unhidden");
         let text = std::fs::read_to_string(paths.config_file()).expect("read");
         assert!(!text.contains("hidden"), "{text}");
+        assert_eq!(Settings::load(&paths).expect("reload"), s);
+    }
+
+    #[test]
+    fn conflict_memory_round_trips_and_is_omitted_when_empty() {
+        let s = full_settings();
+        let text = s.to_toml().expect("serialize");
+        assert!(text.contains("dont_ask = [\"openrgb\"]"), "{text}");
+        assert!(text.contains("previous_start_types"), "{text}");
+        let back = Settings::from_toml(&text).expect("parse");
+        assert!(back.conflicts.dont_ask.contains("openrgb"));
+        assert_eq!(back.conflicts.previous_start_types["SignalRgb.Service"], "auto");
+        assert_eq!(back, s);
+
+        let text = Settings::default().to_toml().expect("serialize");
+        assert!(!text.contains("dont_ask"), "{text}");
+        assert!(!text.contains("previous_start_types"), "{text}");
+    }
+
+    #[test]
+    fn old_conflicts_table_loads_with_empty_memory() {
+        let s = Settings::from_toml(
+            "[conflicts]
+check_openrgb_port = true
+",
+        )
+        .expect("parse");
+        assert!(s.conflicts.dont_ask.is_empty());
+        assert!(s.conflicts.previous_start_types.is_empty());
+        assert!(s.conflicts.extra.is_empty());
+    }
+
+    #[test]
+    fn clearing_dont_ask_removes_the_key_from_the_file() {
+        let (_tmp, paths) = temp_paths();
+        let mut s = Settings::default();
+        s.conflicts.dont_ask.insert("signalrgb".into());
+        s.save(&paths).expect("save");
+        assert!(
+            std::fs::read_to_string(paths.config_file())
+                .expect("read")
+                .contains("dont_ask")
+        );
+        s.conflicts.dont_ask.clear();
+        s.save(&paths).expect("save");
+        let text = std::fs::read_to_string(paths.config_file()).expect("read");
+        assert!(!text.contains("dont_ask"), "{text}");
         assert_eq!(Settings::load(&paths).expect("reload"), s);
     }
 

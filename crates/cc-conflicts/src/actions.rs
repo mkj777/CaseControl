@@ -1,7 +1,8 @@
-//! Opt-in actions. Call these only from an explicit user click in the conflict view.
+//! Single opt-in actions of the Conflicts page. Call these only from an explicit user click.
 //!
-//! Neither action changes how software starts: CaseControl never disables autostart, deletes services or
-//! uninstalls anything (ADR 0001 #12). A terminated process or stopped service may come back at the next logon.
+//! Neither action changes how software starts; a terminated process or stopped service may come back at the next
+//! logon. Switching autostart off and on is done by the [`Action`](crate::Action)s of the `resolve` module
+//! (ADR 0001 #31).
 
 /// Why an action was refused or failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -95,8 +96,8 @@ pub(crate) fn is_valid_service_name(name: &str) -> bool {
 /// does not wait for UAC or for the service to stop, so the caller should rescan afterwards.
 ///
 /// `sc.exe` is started by absolute path, never by bare name, so a planted `sc.exe` in the current directory or on
-/// `PATH` cannot be run elevated. Stopping does not disable autostart; the service starts again at the next boot
-/// (ADR 0001 #12 forbids changing the start type). `reason` is logged with the name.
+/// `PATH` cannot be run elevated. Stopping does not change the start type; the service starts again at the next
+/// boot unless its autostart is turned off separately. `reason` is logged with the name.
 pub fn request_stop_service(name: &str, reason: &str) -> Result<(), ActionError> {
     let parameters = stop_parameters(name)?;
     #[cfg(windows)]

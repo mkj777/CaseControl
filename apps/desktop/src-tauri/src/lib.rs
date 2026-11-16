@@ -11,16 +11,26 @@
 //! `quit` command, `RunEvent::ExitRequested`/`Exit`, which also covers Windows session end) releases the devices
 //! through [`AppState::shutdown_engine`] exactly once.
 //!
-//! It deliberately has no network access and no telemetry (ADR 0001 #13), never changes other software's autostart
-//! (ADR 0001 #12), and enables its own autostart only when the user switches it on in Settings.
+//! After the start (also a hidden one) a background thread scans for conflicting software; if RGB suites affect a
+//! visible device, the window is shown and `startup-conflicts` carries the start dialog model (ADR 0001 #31, see
+//! [`startup`]). Closing them or turning their autostart off happens only on the user's click
+//! ([`conflict_actions`]); what needs administrator rights runs in the [`elevated`] helper mode of this same
+//! executable, which `main` enters before anything here starts.
+//!
+//! It deliberately has no network access and no telemetry (ADR 0001 #13), changes other software's autostart only
+//! reversibly and only on a click (ADR 0001 #31), and enables its own autostart only when the user switches it on in
+//! Settings.
 
 pub mod commands;
+pub mod conflict_actions;
 pub mod conflicts;
+pub mod elevated;
 pub mod events;
 pub mod hidden;
 pub mod logging;
 pub mod prefs;
 pub mod profiles;
+pub mod startup;
 pub mod state;
 pub mod tray;
 
@@ -81,6 +91,40 @@ pub fn shutdown<R: Runtime>(app: &AppHandle<R>) {
     app.exit(0);
 }
 
+/// Scans for conflicts on a background thread after the start (device control is already running). If the start
+/// dialog has programs to ask about, shows the window (also after a hidden start) and emits `startup-conflicts`.
+fn spawn_startup_check<R: Runtime>(app: AppHandle<R>) {
+    let spawned = std::thread::Builder::new()
+        .name("cc-startup-conflicts".into())
+        .spawn(move || {
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            let view = match conflict_actions::scan_and_publish(&app, &state) {
+                Ok(view) => view,
+                Err(err) => {
+                    tracing::warn!(%err, "start-up conflict check failed");
+                    return;
+                }
+            };
+            if view.startup.is_empty() {
+                tracing::info!("start-up conflict check: nothing to ask");
+                return;
+            }
+            tracing::info!(
+                programs = ?view.startup.iter().map(|p| p.entry_id.as_str()).collect::<Vec<_>>(),
+                "start-up conflict check: asking the user"
+            );
+            if let Err(err) = show_main_window(&app) {
+                tracing::error!(%err, "cannot show main window for the start-up conflicts");
+            }
+            events::emit(&app, events::STARTUP_CONFLICTS, view.startup);
+        });
+    if let Err(err) = spawned {
+        tracing::error!(%err, "cannot start the start-up conflict check");
+    }
+}
+
 /// Builds and runs the Tauri application. Returns only on startup failure; a normal exit ends the process.
 pub fn run() {
     logging::init();
@@ -125,6 +169,10 @@ pub fn run() {
             commands::rename_profile,
             commands::delete_profile,
             commands::scan_conflicts,
+            commands::startup_conflicts,
+            commands::resolve_conflicts,
+            commands::set_autostart,
+            commands::set_dont_ask,
             commands::terminate_process,
             commands::stop_service,
             commands::get_settings,
@@ -161,6 +209,7 @@ pub fn run() {
             if !hidden && !start_minimized {
                 show_main_window(app.handle())?;
             }
+            spawn_startup_check(app.handle().clone());
             Ok(())
         })
         .build(tauri::generate_context!());

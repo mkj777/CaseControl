@@ -8,14 +8,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cc_config::Profile;
-use cc_conflicts::ScanOptions;
 use cc_core::{DeviceId, ModeState, Rgb};
 use cc_engine::{ApplyReport, DetectFailure, DeviceSetting, DeviceStatus, DeviceView, EngineHandle};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_autostart::ManagerExt as _;
 
-use crate::conflicts::{ConflictScan, KnownDevice, check_service, process_name, scan_view};
+use crate::conflict_actions::{
+    ActionReport, check_catalogue_id, conflict_view, known_devices, run_and_report, run_scan,
+    scan_and_publish, set_dont_ask_in,
+};
+use crate::conflicts::{ConflictScan, check_service, process_name};
 use crate::events::{self, CONFLICTS_UPDATED, DEVICES_CHANGED, PROFILES_CHANGED};
 use crate::hidden::{
     HiddenEntry, hidden_device_error, hidden_view, hidden_zones, is_device_hidden, mask_hidden_zones,
@@ -23,6 +26,7 @@ use crate::hidden::{
 };
 use crate::prefs::{SettingsPatch, SettingsView, apply_patch, record_zone_size};
 use crate::profiles::{clears_last, last_after_rename};
+use crate::startup::{ResolveRequest, StartupConflicts, plan_autostart, plan_resolve};
 use crate::state::AppState;
 
 /// Which Rust profile this binary was compiled with.
@@ -491,31 +495,81 @@ pub async fn delete_profile<R: Runtime>(
 /// Scans for conflicting software and emits `conflicts-updated`.
 #[tauri::command]
 pub async fn scan_conflicts<R: Runtime>(app: AppHandle<R>) -> Result<ConflictScan, String> {
-    blocking(app, |app, state| {
-        let opts = ScanOptions {
-            check_openrgb_port: state.settings().conflicts.check_openrgb_port,
-        };
-        let report = run_scan(&opts)?;
-        let devices: Vec<KnownDevice> = state
-            .engine()
-            .map(|e| e.devices().iter().map(KnownDevice::from).collect())
-            .unwrap_or_default();
-        let view = scan_view(&report, &devices);
-        state.set_last_scan(report);
-        events::emit(app, CONFLICTS_UPDATED, view.clone());
-        Ok(view)
+    blocking(app, |app, state| scan_and_publish(app, state)).await
+}
+
+/// The start dialog model from a fresh scan (also emits `conflicts-updated`). Empty when there is nothing to ask.
+#[tauri::command]
+pub async fn startup_conflicts<R: Runtime>(app: AppHandle<R>) -> Result<StartupConflicts, String> {
+    blocking(app, |app, state| Ok(scan_and_publish(app, state)?.startup)).await
+}
+
+/// The start dialog's Proceed: per program close it and/or turn its autostart off. Everything that needs
+/// administrator rights runs behind one UAC prompt. Returns per-action results and the scan afterwards (also emitted
+/// as `conflicts-updated`).
+#[tauri::command]
+pub async fn resolve_conflicts<R: Runtime>(
+    app: AppHandle<R>,
+    request: ResolveRequest,
+) -> Result<ActionReport, String> {
+    blocking(app, move |app, state| {
+        let report = run_scan(state)?;
+        let (_, visible) = known_devices(state);
+        let plan = plan_resolve(&request, &report, &visible);
+        tracing::info!(
+            programs = request.items.len(),
+            actions = plan.actions.len(),
+            refused = plan.refused.len(),
+            "resolving start-up conflicts on user request"
+        );
+        run_and_report(app, state, &report, &plan.actions, plan.refused)
     })
     .await
 }
 
-#[cfg(windows)]
-fn run_scan(opts: &ScanOptions) -> Result<cc_conflicts::ScanReport, String> {
-    Ok(cc_conflicts::Scanner::windows().scan(opts))
+/// The Conflicts page's Turn off (`enabled = false`) / Re-enable (`true`) of a finding's autostart. Works for every
+/// finding, vendor tools included.
+#[tauri::command]
+pub async fn set_autostart<R: Runtime>(
+    app: AppHandle<R>,
+    entry: String,
+    enabled: bool,
+) -> Result<ActionReport, String> {
+    blocking(app, move |app, state| {
+        let report = run_scan(state)?;
+        let remembered = state.settings().conflicts.previous_start_types.clone();
+        let actions = plan_autostart(&entry, enabled, &report, &remembered)?;
+        tracing::info!(entry = %entry, enabled, actions = actions.len(), "changing autostart on user request");
+        run_and_report(app, state, &report, &actions, Vec::new())
+    })
+    .await
 }
 
-#[cfg(not(windows))]
-fn run_scan(_opts: &ScanOptions) -> Result<cc_conflicts::ScanReport, String> {
-    Err("conflict scanning is only available on Windows".to_owned())
+/// Sets or clears "Don't ask again" for catalogue entry `entry`. Returns the view of the last scan with the new
+/// setting (also emitted as `conflicts-updated`).
+#[tauri::command]
+pub async fn set_dont_ask<R: Runtime>(
+    app: AppHandle<R>,
+    entry: String,
+    dont_ask: bool,
+) -> Result<ConflictScan, String> {
+    blocking(app, move |app, state| {
+        check_catalogue_id(&entry)?;
+        let changed = state.settings().conflicts.dont_ask.contains(&entry) != dont_ask;
+        if changed {
+            state.update_settings(|s| {
+                set_dont_ask_in(&mut s.conflicts.dont_ask, &entry, dont_ask);
+                Ok(())
+            })?;
+        }
+        let view = match state.with_last_scan(|r| Ok(r.clone())) {
+            Ok(report) => conflict_view(state, &report),
+            Err(_) => return scan_and_publish(app, state),
+        };
+        events::emit(app, CONFLICTS_UPDATED, view.clone());
+        Ok(view)
+    })
+    .await
 }
 
 /// Ends process `pid` of finding `finding` from the last scan (the name recorded there is re-checked).

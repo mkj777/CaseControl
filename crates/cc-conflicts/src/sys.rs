@@ -1,5 +1,6 @@
 //! The only module of this crate that contains `unsafe` code: thin, safe wrappers around the Win32 calls for
-//! process enumeration (Toolhelp), the service control manager, process termination and `ShellExecuteW`.
+//! process enumeration (Toolhelp), the service control manager (enumeration, stop, start type), process
+//! termination and `ShellExecuteW` / `ShellExecuteExW` (UAC).
 //!
 //! Every function here is safe to call. Handles are owned by RAII guards and closed on drop. Buffers that the
 //! system fills with structs are allocated as `Vec<u64>` so they are 8-byte aligned.
@@ -8,27 +9,34 @@ use std::mem::size_of;
 use std::path::Path;
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_NO_MORE_FILES,
-    HANDLE,
+    CloseHandle, ERROR_CANCELLED, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_MORE_DATA,
+    ERROR_NO_MORE_FILES, ERROR_SERVICE_NOT_ACTIVE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Services::{
-    CloseServiceHandle, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW, OpenSCManagerW, OpenServiceW,
-    QUERY_SERVICE_CONFIGW, QueryServiceConfigW, SC_ENUM_PROCESS_INFO, SC_HANDLE, SC_MANAGER_CONNECT,
-    SC_MANAGER_ENUMERATE_SERVICE, SERVICE_DRIVER, SERVICE_QUERY_CONFIG, SERVICE_RUNNING, SERVICE_STATE_ALL,
-    SERVICE_STOPPED, SERVICE_WIN32,
+    ChangeServiceConfigW, CloseServiceHandle, ControlService, ENUM_SERVICE_STATUS_PROCESSW,
+    ENUM_SERVICE_TYPE, EnumServicesStatusExW, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
+    QueryServiceConfigW, QueryServiceStatus, SC_ENUM_PROCESS_INFO, SC_HANDLE, SC_MANAGER_CONNECT,
+    SC_MANAGER_ENUMERATE_SERVICE, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG, SERVICE_CONTROL_STOP,
+    SERVICE_DEMAND_START, SERVICE_DRIVER, SERVICE_ERROR, SERVICE_NO_CHANGE, SERVICE_QUERY_CONFIG,
+    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATE_ALL, SERVICE_STATUS, SERVICE_STOP, SERVICE_STOPPED,
+    SERVICE_WIN32,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, TerminateProcess,
+    GetExitCodeProcess, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 
 use crate::actions::{ActionError, terminate_process_with};
+use crate::elevation::ElevationError;
 use crate::sources::{ScanError, ServiceInfo, ServiceKind, ServiceState, StartType};
 
 fn win32(call: &'static str, e: &windows::core::Error) -> ScanError {
@@ -324,4 +332,135 @@ fn service_config(scm: &OwnedScHandle, name: &str) -> Option<(Option<StartType>,
     // SAFETY: lpBinaryPathName is null or points to a NUL-terminated string inside `buf`, which is still alive.
     let path = unsafe { read_pwstr(config.lpBinaryPathName) }.filter(|p| !p.is_empty());
     Some((start_type, path))
+}
+
+/// Opens service `name` on the local SCM with `access`.
+fn open_service(name: &str, access: u32) -> Result<OwnedScHandle, String> {
+    // SAFETY: null machine and database names select the local active database; the handle is checked by the
+    // wrapper and owned below.
+    let scm = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+        .map_err(|e| format!("OpenSCManagerW failed: {}", e.message()))?;
+    let scm = OwnedScHandle(scm);
+    let wide = HSTRING::from(name);
+    // SAFETY: `scm` is a valid SCM handle and `wide` a NUL-terminated name that outlives the call.
+    let service = unsafe { OpenServiceW(scm.0, &wide, access) }
+        .map_err(|e| format!("OpenServiceW({name}) failed: {}", e.message()))?;
+    Ok(OwnedScHandle(service))
+}
+
+/// Current status of the service behind `service` (opened with `SERVICE_QUERY_STATUS`).
+fn service_status(service: &OwnedScHandle) -> Result<SERVICE_STATUS, String> {
+    let mut status = SERVICE_STATUS::default();
+    // SAFETY: `service` is a live service handle with SERVICE_QUERY_STATUS and `status` a writable struct.
+    unsafe { QueryServiceStatus(service.0, &mut status) }
+        .map_err(|e| format!("QueryServiceStatus failed: {}", e.message()))?;
+    Ok(status)
+}
+
+/// Asks service `name` to stop and waits up to `wait` for it to reach the stopped state. A service that is not
+/// running counts as stopped. Needs administrator rights for most services.
+pub fn stop_service(name: &str, wait: std::time::Duration) -> Result<(), String> {
+    let service = open_service(name, SERVICE_STOP | SERVICE_QUERY_STATUS)?;
+    let mut status = SERVICE_STATUS::default();
+    // SAFETY: `service` is a live service handle opened with SERVICE_STOP and `status` a writable struct.
+    match unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut status) } {
+        Ok(()) => {}
+        Err(e) if e.code() == ERROR_SERVICE_NOT_ACTIVE.to_hresult() => return Ok(()),
+        Err(e) => return Err(format!("ControlService(stop {name}) failed: {}", e.message())),
+    }
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if service_status(&service)?.dwCurrentState == SERVICE_STOPPED {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "service {name} was asked to stop but is still stopping after {} s",
+                wait.as_secs()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// Sets the start type of service `name` to Auto (`auto = true`) or Manual; the rest of its configuration is left
+/// unchanged (`SERVICE_NO_CHANGE`), so a delayed-auto flag survives a Manual / Auto round trip.
+pub fn set_service_start_type(name: &str, auto: bool) -> Result<(), String> {
+    let service = open_service(name, SERVICE_CHANGE_CONFIG)?;
+    let start = if auto {
+        SERVICE_AUTO_START
+    } else {
+        SERVICE_DEMAND_START
+    };
+    // SAFETY: `service` is a live service handle opened with SERVICE_CHANGE_CONFIG; every other field is passed as
+    // SERVICE_NO_CHANGE or null, which the API documents as "leave unchanged".
+    unsafe {
+        ChangeServiceConfigW(
+            service.0,
+            ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+            start,
+            SERVICE_ERROR(SERVICE_NO_CHANGE),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            None,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            PCWSTR::null(),
+        )
+    }
+    .map_err(|e| format!("ChangeServiceConfigW({name}) failed: {}", e.message()))
+}
+
+/// Starts `file` with `parameters` through `ShellExecuteExW` with the `runas` verb (one UAC prompt) and waits up to
+/// `timeout` for it to exit. Returns its exit code.
+pub fn run_as_admin_and_wait(
+    file: &Path,
+    parameters: &str,
+    timeout: std::time::Duration,
+) -> Result<u32, ElevationError> {
+    let verb = HSTRING::from("runas");
+    let file = HSTRING::from(file);
+    let parameters = HSTRING::from(parameters);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a properly sized SHELLEXECUTEINFOW whose string pointers point to HSTRINGs that outlive the
+    // call; the system writes hProcess into it.
+    if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
+        return Err(if e.code() == ERROR_CANCELLED.to_hresult() {
+            ElevationError::Declined
+        } else {
+            ElevationError::Failed(format!("ShellExecuteExW failed: {}", e.message()))
+        });
+    }
+    if info.hProcess.is_invalid() {
+        return Err(ElevationError::Failed(
+            "ShellExecuteExW returned no process handle".to_owned(),
+        ));
+    }
+    let process = OwnedHandle(info.hProcess);
+    let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+    // SAFETY: `process` is the live process handle ShellExecuteExW returned (SEE_MASK_NOCLOSEPROCESS).
+    let waited = unsafe { WaitForSingleObject(process.0, millis) };
+    if waited == WAIT_TIMEOUT {
+        return Err(ElevationError::Timeout(timeout.as_secs()));
+    }
+    if waited != WAIT_OBJECT_0 {
+        return Err(ElevationError::Failed(format!(
+            "waiting for the elevated helper failed ({})",
+            waited.0
+        )));
+    }
+    let mut code = 0u32;
+    // SAFETY: `process` is a live process handle and `code` a writable u32.
+    unsafe { GetExitCodeProcess(process.0, &mut code) }
+        .map_err(|e| ElevationError::Failed(format!("GetExitCodeProcess failed: {}", e.message())))?;
+    Ok(code)
 }
