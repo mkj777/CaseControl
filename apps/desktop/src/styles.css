@@ -1,51 +1,6 @@
-/* Visual direction (ADR 0001 #15, #23): dark, spacious, few large elements, neutral greys and white only. The device
-   colours in the previews are the only colour in the UI. System font, no component library, restrained motion.
-   Colours and spacing live in custom properties so the direction can change in one place. */
-:root {
-  --color-bg: #121316;
-  --color-surface: #17181c;
-  --color-surface-raised: #1f2126;
-  --color-surface-hover: #262830;
-  --color-border: #2a2c32;
-  --color-border-strong: #3a3d45;
-  --color-text: #e6e7ea;
-  --color-text-muted: #9a9ca3;
-  --color-text-faint: #6c6f77;
-  /* Neutral accent: focus rings, selection outlines, the primary button. */
-  --color-accent: #e6e7ea;
-  --color-accent-text: #121316;
-  --color-led-off: #0b0c0e;
-
-  --space-1: 4px;
-  --space-2: 8px;
-  --space-3: 12px;
-  --space-4: 16px;
-  --space-5: 20px;
-  --space-6: 24px;
-  --space-8: 40px;
-  --space-10: 56px;
-
-  --radius: 8px;
-  --radius-lg: 14px;
-  --sidebar-width: 220px;
-  --titlebar-height: 40px;
-  --content-width: 1040px;
-
-  --font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-size-sm: 13px;
-  --font-size: 15px;
-  --font-size-lg: 18px;
-  --font-size-xl: 28px;
-
-  --transition: 120ms ease-out;
-
-  color-scheme: dark;
-  font-family: var(--font-family);
-  font-size: var(--font-size);
-  line-height: 1.5;
-  color: var(--color-text);
-  background: var(--color-bg);
-}
+/* Base element styles and the few global rules (docs/design-system.md). Every value comes from tokens.css, which
+   main.ts imports first. Native elements look right without a class; the primitives in components/ui/ add structure,
+   variants and accessibility wiring on top. */
 
 *,
 *::before,
@@ -53,70 +8,75 @@
   box-sizing: border-box;
 }
 
+:root {
+  font-family: var(--font-sans);
+  font-size: var(--text-md);
+  line-height: var(--leading);
+  color: var(--text);
+  background: var(--bg);
+}
+
 body {
   margin: 0;
+  background: var(--bg);
+  /* A desktop tool: text is selectable only in fields (see the field rule below). */
+  user-select: none;
+  cursor: default;
 }
 
 h1 {
   margin: 0 0 var(--space-3);
-  font-size: var(--font-size-xl);
-  font-weight: 600;
+  font-size: var(--text-xl);
+  font-weight: var(--weight-strong);
+  line-height: var(--leading-tight);
 }
 
 h2 {
   margin: 0 0 var(--space-4);
-  font-size: var(--font-size-lg);
-  font-weight: 600;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-strong);
+  line-height: var(--leading-tight);
 }
 
 p {
   margin: 0;
 }
 
+ul,
+ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+a {
+  color: var(--text);
+}
+
+/* ---- Page frame -------------------------------------------------------------------------------------------------- */
+
+/* Text pages (Profiles, Conflicts, Settings) stop at 760 px; device pages are fluid to 1440 px (ADR 0001 #28, #30). */
 .page {
-  max-width: var(--content-width);
+  max-width: var(--page-max-text);
 }
 
-/* Pages whose content scales with the window (Devices overview and device view, ADR 0001 #28). */
 .page.wide {
-  max-width: none;
+  max-width: var(--page-max-wide);
 }
 
-.page-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--space-6);
-  margin-bottom: var(--space-8);
-}
-
-.page-description {
-  max-width: 60ch;
-  color: var(--color-text-muted);
-}
-
+/* A section starts with an h2; sections are --space-14 apart. */
 .section {
-  margin-top: var(--space-10);
+  margin-top: var(--space-14);
 }
+
+/* ---- The only global utilities ----------------------------------------------------------------------------------- */
 
 .muted {
-  color: var(--color-text-muted);
+  color: var(--text-muted);
 }
 
 .small {
-  font-size: var(--font-size-sm);
-}
-
-/* A plain notice block; text carries the meaning, not colour. */
-.notice {
-  padding: var(--space-4) var(--space-5);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius);
-  background: var(--color-surface);
-}
-
-.notice + .notice {
-  margin-top: var(--space-3);
+  font-size: var(--text-sm);
 }
 
 .row {
@@ -126,87 +86,104 @@ p {
   flex-wrap: wrap;
 }
 
+/* ---- Controls ---------------------------------------------------------------------------------------------------- */
+
+/* A plain button is the secondary button; Button adds the other variants and the small size. State rules sit in
+   :where() so any class on a button (a variant, a menu item, a swatch) overrides them without a specificity fight. */
 button {
-  padding: var(--space-2) var(--space-4);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: var(--control-height);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   font: inherit;
-  color: var(--color-text);
-  background: var(--color-surface-raised);
+  white-space: nowrap;
+  color: var(--text);
+  background: var(--surface-raised);
   cursor: pointer;
   transition:
+    color var(--transition),
     border-color var(--transition),
-    background var(--transition);
+    background-color var(--transition);
 }
 
-button:hover:not(:disabled) {
-  border-color: var(--color-border-strong);
-  background: var(--color-surface-hover);
+button:where(:hover:not(:disabled)) {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
 }
 
-button:disabled {
-  color: var(--color-text-faint);
+button:where(:active:not(:disabled)) {
+  background: var(--surface-pressed);
+}
+
+button:where(:disabled) {
+  color: var(--text-disabled);
   cursor: default;
 }
 
-button.primary {
-  border-color: var(--color-accent);
-  color: var(--color-accent-text);
-  background: var(--color-accent);
-}
-
-button.primary:hover:not(:disabled) {
-  background: #ffffff;
-}
-
-button.link {
-  padding: 0;
-  border: 0;
-  color: var(--color-text-muted);
-  background: none;
-}
-
-button.link:hover:not(:disabled) {
-  color: var(--color-text);
-  background: none;
-}
-
+/* Fields: a fill one step lighter than the surface and a subtle border; focus turns the border white (ADR 0001 #30). */
 input[type='text'],
 input[type='number'],
 select {
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius);
+  height: var(--control-height);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--field-border);
+  border-radius: var(--radius-md);
   font: inherit;
-  color: var(--color-text);
-  background: var(--color-surface);
+  color: var(--text);
+  background: var(--field-bg);
+  user-select: text;
+  transition: border-color var(--transition);
+}
+
+:where(input[type='text'], input[type='number'], select):hover:not(:disabled) {
+  border-color: var(--field-border-hover);
+}
+
+:where(input[type='text'], input[type='number'], select):focus {
+  border-color: var(--field-border-focus);
+}
+
+:where(input[type='text'], input[type='number'], select):disabled {
+  border-color: var(--border);
+  color: var(--text-disabled);
+  background: var(--surface);
+}
+
+:where(input, select)[aria-invalid='true'] {
+  border-color: var(--error);
+}
+
+input::placeholder {
+  color: var(--text-faint);
+}
+
+input[type='number'] {
+  font-variant-numeric: tabular-nums;
 }
 
 input[type='range'] {
-  accent-color: var(--color-accent);
+  accent-color: var(--accent);
 }
 
+/* Kept for "select several items in a list"; settings use Switch. */
 input[type='checkbox'] {
   width: 18px;
   height: 18px;
-  accent-color: var(--color-accent);
+  accent-color: var(--accent);
 }
 
-a {
-  color: var(--color-text);
-}
+/* ---- Focus and scrollbars ---------------------------------------------------------------------------------------- */
 
-button:focus-visible,
-a:focus-visible,
-input:focus-visible,
-select:focus-visible,
-[tabindex]:focus-visible {
-  outline: 2px solid var(--color-accent);
+/* Every interactive element; never removed without a replacement. */
+:focus-visible {
+  outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  :root {
-    --transition: 0ms;
-  }
+* {
+  scrollbar-color: var(--border-strong) transparent;
 }

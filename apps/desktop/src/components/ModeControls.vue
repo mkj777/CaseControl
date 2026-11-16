@@ -5,6 +5,7 @@ import { computed, ref, watch } from 'vue'
 import type { Direction, Mode, ModeState } from '../ipc'
 import { bounds, directionsOf, hasCap } from '../lib/device'
 import ColorPicker from './ColorPicker.vue'
+import { Button, Field, SegmentedControl, Select, Slider } from './ui'
 
 const props = withDefaults(defineProps<{ mode: Mode; state: ModeState; disabled?: boolean }>(), { disabled: false })
 const emit = defineEmits<{ update: [state: ModeState] }>()
@@ -47,6 +48,9 @@ function removeColor() {
   update({ colors })
 }
 
+/** Up to four directions fit a segmented control; more use a menu. */
+const directionOptions = computed(() => directions.value.map((d) => ({ value: d, label: DIRECTION_LABEL[d] })))
+
 const DIRECTION_LABEL: Record<Direction, string> = {
   Left: 'Left',
   Right: 'Right',
@@ -59,83 +63,85 @@ const DIRECTION_LABEL: Record<Direction, string> = {
 
 <template>
   <div class="controls">
-    <label v-if="speed" class="control">
-      <span class="label">Speed</span>
-      <input
-        type="range"
-        :min="speed[0]"
-        :max="speed[1]"
-        step="1"
-        :value="state.speed ?? speed[0]"
-        :disabled="disabled"
-        @input="update({ speed: Number(($event.target as HTMLInputElement).value) })"
-      />
-      <span class="value">{{ state.speed }}</span>
-    </label>
+    <Field v-if="speed" label="Speed">
+      <template #default="{ id }">
+        <Slider
+          :id="id"
+          :model-value="state.speed ?? speed[0]"
+          :min="speed[0]"
+          :max="speed[1]"
+          :disabled="disabled"
+          @update:model-value="update({ speed: $event })"
+        />
+      </template>
+      <template #value>{{ state.speed }}</template>
+    </Field>
 
-    <label v-if="brightness" class="control">
-      <span class="label">Brightness</span>
-      <input
-        type="range"
-        :min="brightness[0]"
-        :max="brightness[1]"
-        step="1"
-        :value="state.brightness ?? brightness[1]"
-        :disabled="disabled"
-        @input="update({ brightness: Number(($event.target as HTMLInputElement).value) })"
-      />
-      <span class="value">{{ state.brightness }}</span>
-    </label>
+    <Field v-if="brightness" label="Brightness">
+      <template #default="{ id }">
+        <Slider
+          :id="id"
+          :model-value="state.brightness ?? brightness[1]"
+          :min="brightness[0]"
+          :max="brightness[1]"
+          :disabled="disabled"
+          @update:model-value="update({ brightness: $event })"
+        />
+      </template>
+      <template #value>{{ state.brightness }}</template>
+    </Field>
 
-    <label v-if="directions.length > 0" class="control">
-      <span class="label">Direction</span>
-      <select
-        :value="state.direction ?? directions[0]"
+    <Field v-if="directions.length > 0 && directions.length <= 4" label="Direction" group>
+      <SegmentedControl
+        :model-value="state.direction ?? directions[0] ?? 'Left'"
+        :options="directionOptions"
         :disabled="disabled"
-        @change="update({ direction: ($event.target as HTMLSelectElement).value as Direction })"
+        @update:model-value="update({ direction: $event })"
+      />
+    </Field>
+    <Field v-else-if="directions.length > 4" v-slot="{ id }" label="Direction">
+      <Select
+        :id="id"
+        :model-value="state.direction ?? directions[0] ?? 'Left'"
+        :disabled="disabled"
+        @update:model-value="update({ direction: $event as Direction })"
       >
         <option v-for="d in directions" :key="d" :value="d">{{ DIRECTION_LABEL[d] }}</option>
-      </select>
-    </label>
+      </Select>
+    </Field>
 
-    <div v-if="colorRange && colorRange[1] > 0" class="colors">
-      <span class="label">Colours</span>
-      <div class="row">
-        <button
-          v-for="(c, i) in state.colors"
-          :key="i"
-          type="button"
-          class="chip"
-          :class="{ current: i === activeColor }"
-          :style="{ backgroundColor: c }"
-          :aria-label="`Colour ${i + 1}`"
+    <Field v-if="colorRange && colorRange[1] > 0" label="Colours" layout="stacked" group>
+      <div class="colors">
+        <div class="row">
+          <button
+            v-for="(c, i) in state.colors"
+            :key="i"
+            type="button"
+            class="chip"
+            :class="{ current: i === activeColor }"
+            :style="{ backgroundColor: c }"
+            :aria-label="`Colour ${i + 1}`"
+            :aria-pressed="i === activeColor"
+            :disabled="disabled"
+            @click="activeColor = i"
+          />
+          <Button v-if="state.colors.length < colorRange[1]" :disabled="disabled" @click="addColor">Add colour</Button>
+          <Button
+            v-if="state.colors.length > colorRange[0] && state.colors.length > 0"
+            :disabled="disabled"
+            @click="removeColor"
+          >
+            Remove colour
+          </Button>
+        </div>
+        <ColorPicker
+          v-if="state.colors.length > 0"
+          :model-value="state.colors[activeColor] ?? '#FFFFFF'"
           :disabled="disabled"
-          @click="activeColor = i"
+          @update:model-value="setColor"
         />
-        <button
-          v-if="state.colors.length < colorRange[1]"
-          type="button"
-          :disabled="disabled"
-          @click="addColor"
-        >
-          Add colour
-        </button>
-        <button
-          v-if="state.colors.length > colorRange[0] && state.colors.length > 0"
-          type="button"
-          :disabled="disabled"
-          @click="removeColor"
-        >
-          Remove colour
-        </button>
       </div>
-      <ColorPicker
-        v-if="state.colors.length > 0"
-        :model-value="state.colors[activeColor] ?? '#FFFFFF'"
-        :disabled="disabled"
-        @update:model-value="setColor"
-      />
-    </div>
+    </Field>
     <p v-else-if="mode.color_mode === 'Random'" class="muted">The device picks the colours in this mode.</p>
     <p v-else-if="mode.color_mode === 'PerLed'" class="muted">This mode uses the current LED colours.</p>
 
@@ -152,38 +158,27 @@ const DIRECTION_LABEL: Record<Direction, string> = {
   gap: var(--space-5);
 }
 
-.control {
-  display: grid;
-  grid-template-columns: 120px minmax(0, 320px) 48px;
-  align-items: center;
-  gap: var(--space-4);
-}
-
-.label {
-  color: var(--color-text-muted);
-}
-
-.value {
-  font-variant-numeric: tabular-nums;
-  color: var(--color-text-muted);
-}
-
 .colors {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
+  width: 100%;
 }
 
+/* Colour chips follow the LED border and selection rules. */
 .chip {
-  width: 40px;
-  height: 40px;
+  width: var(--control-height);
   padding: 0;
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius);
+  border: 1px solid var(--led-border);
+  border-radius: var(--radius-sm);
+}
+
+.chip:hover:not(:disabled) {
+  border-color: var(--text-muted);
 }
 
 .chip.current {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 3px;
+  outline: 2px solid var(--selection);
+  outline-offset: 2px;
 }
 </style>

@@ -1,14 +1,11 @@
 /*
- * CaseControl design tokens. Decided by the owner in ADR 0001 #30; see docs/design-system.md, "Decisions".
- *
- * Meant to replace the :root block at the top of apps/desktop/src/styles.css. Import it first
- * (`import './tokens.css'` before `import './styles.css'` in main.ts), then delete the old :root variables.
+ * CaseControl design tokens. Decided by the owner in ADR 0001 #30; rules in docs/design-system.md.
+ * This file is the one source of truth for the tokens; main.ts imports it before styles.css.
  *
  * Three layers, read top to bottom:
  *   1. Palette   raw values. Nothing outside this file uses them.
  *   2. Roles     what a value is for (--bg, --text-muted, --field-border ...). Components use only these.
  *   3. Scales and sizes   spacing, type, radius, motion, z-index, and the few component/layout sizes.
- * A legacy block at the end maps the current names to the new ones so adoption can go file by file.
  *
  * Contrast ratios (WCAG 2.x) are noted next to every text and boundary colour, measured against --bg / --surface
  * / --surface-raised.
@@ -135,6 +132,8 @@
   --icon-button-size: 32px;
   --switch-width: 40px;
   --switch-height: 22px;
+  --control-max-width: 320px; /* widest a text field, select or slider grows (Field control column) */
+  --row-max-width: 640px; /* settings rows, switch rows, stacked fields */
 
   --titlebar-height: 32px;
   --window-button-width: 46px;
@@ -163,30 +162,4 @@
   :root {
     --duration: 0ms;
   }
-}
-
-/* ---- Legacy names (remove once nothing uses them) ------------------------------------------------------------ */
-/* Current styles.css names mapped to the new roles. Note --space-8 and --space-10 change meaning: the old
-   --space-8 (40 px) is the new --space-10, the old --space-10 (56 px) is the new --space-14. Rename those two
-   uses first (see the migration list) before importing this file, or spacing shrinks. */
-:root {
-  --color-bg: var(--bg);
-  --color-surface: var(--surface);
-  --color-surface-raised: var(--surface-raised);
-  --color-surface-hover: var(--surface-hover);
-  --color-border: var(--border);
-  --color-border-strong: var(--border-strong);
-  --color-text: var(--text);
-  --color-text-muted: var(--text-muted);
-  --color-text-faint: var(--text-disabled);
-  --color-accent: var(--accent);
-  --color-accent-text: var(--accent-text);
-  --color-led-off: var(--led-off);
-  --radius: var(--radius-md);
-  --content-width: var(--page-max-wide);
-  --font-family: var(--font-sans);
-  --font-size-sm: var(--text-sm);
-  --font-size: var(--text-md);
-  --font-size-lg: var(--text-lg);
-  --font-size-xl: var(--text-xl);
 }

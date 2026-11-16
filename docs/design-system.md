@@ -1,14 +1,16 @@
 # CaseControl design system
 
 **Status: decided** (ADR 0001 #30, which amends #23). The owner's choices are listed under
-[Decisions](#decisions). Other fixed inputs are ADR 0001 #3, #12 to #16 and #18 to #29. Adoption in
-`apps/desktop` follows the [migration](#migration) order after the phase 3 work is merged.
+[Decisions](#decisions). Other fixed inputs are ADR 0001 #3, #12 to #16 and #18 to #29. Adopted in
+`apps/desktop` (phase 3 brief 02, all seven [migration](#migration) steps).
 
 Files:
 
 - `docs/design-system.md`: this document (rules, components, migration).
-- `docs/design-system/tokens.css`: the proposed tokens, ready to replace the `:root` block in
-  `apps/desktop/src/styles.css`.
+- `apps/desktop/src/tokens.css`: the tokens, the one source of truth. It moved here from
+  `docs/design-system/tokens.css` during adoption so it lives next to the code and Vite serves it (the dev server
+  does not serve files outside the app folder); `main.ts` imports it before `styles.css`.
+- `apps/desktop/src/components/ui/`: the primitives, exported from `index.ts`.
 
 ## How it is structured
 
@@ -41,7 +43,7 @@ underneath the roles, so the owner can retune greys without touching role names.
 
 ## Tokens
 
-All in `docs/design-system/tokens.css`. Components and pages use layer 2 and 3 only.
+All in `apps/desktop/src/tokens.css`. Components and pages use layer 2 and 3 only.
 
 ### Layer 1: palette
 
@@ -150,8 +152,9 @@ The window is at least 860 x 560 (`tauri.conf.json`).
   controls panel, then sections (LED count, Device). The stage is the largest thing on the page.
 - **Vertical rhythm:** page header to content `--space-10`; section to section `--space-14`; inside a section
   `--space-4`; a section starts with an h2.
-- **Forms in rows:** label column 120 px, control up to 320 px, value 48 px (the current ModeControls grid) becomes
-  the Field layout for every labelled control.
+- **Forms in rows:** label column 120 px, control up to `--control-max-width` (320 px), value 48 px (the former
+  ModeControls grid) is the Field layout for every labelled control. Settings rows, switch rows and stacked fields
+  stop at `--row-max-width` (640 px).
 
 ## Components
 
@@ -263,7 +266,8 @@ unless noted.
   `--error`, `aria-invalid`, inline error under the field),
   disabled.
 - **Rules:** commits on change or Enter, not per keystroke. Out-of-range input: clamp to the range on commit and keep the
-  hint visible (decision 12).
+  hint visible (decision 12). Input that is not a number (empty field) goes back to the current value. The
+  component renders the range hint itself.
 
 ### Text field
 
@@ -279,6 +283,9 @@ unless noted.
 
 - **Anatomy:** label (`--text-muted`), control, optional hint and inline error below. Two layouts: stacked
   (label above) and row (label column 120 px, control column up to 320 px, value column 48 px).
+- **Wiring:** the default slot receives `id` (for the control, so the label's `for` works), `describedBy` (hint and
+  error ids) and `invalid`. With `group`, the label names a `role="group"` instead of one control (colour chips,
+  segmented control).
 - **Rules:** wraps every labelled control so labels, hints and errors line up across pages.
 
 ### Select and menu
@@ -296,7 +303,9 @@ unless noted.
 - **States:** item hover and keyboard focus `--surface-hover`; disabled item `--text-disabled`.
 - **Behaviour:** opens at the pointer, clamped inside the window; also opens with Shift+F10 or the Menu key on a
   focused tile or zone. Arrow keys move, Enter activates, Esc or a click outside closes and returns focus to the
-  element that opened it. One level, no submenus. `role="menu"`, `role="menuitem"`, `--z-menu`.
+  element that opened it. One level, no submenus. `role="menu"`, `role="menuitem"`, `--z-menu`. Pages pass
+  `menuPoint(event)` as the position: a keyboard-opened menu has no pointer, so it opens at the focused element. A
+  hidden tile is not a link but stays focusable (`tabindex="0"`) so its menu (Unhide) is reachable by keyboard.
 - **Rules:** the browser menu is suppressed app-wide except in text fields. Every action in a context menu is
   also reachable another way or harmless (Hide / Unhide).
 
@@ -305,8 +314,9 @@ unless noted.
 - **Anatomy:** backdrop `--backdrop`; panel width `--dialog-width` (max window minus `--space-6` each side),
   `--surface`, 1 px `--border-strong`, `--radius-lg`, `--shadow-overlay`, padding `--space-6`. Title `--text-lg`;
   body `--text-muted`, paragraphs `--space-3` apart; actions right aligned, `--space-6` above, Cancel first.
-- **Variants:** ConfirmDialog (`role="alertdialog"`) is the only one today; a general Dialog with the same shell is
-  the base it should be built on.
+- **Variants:** Dialog is the shell (title, body slot, `actions` slot, `role` `dialog` or `alertdialog`, `busy`).
+  ConfirmDialog sits on top of it (`role="alertdialog"`, `danger` for danger confirms). The element marked
+  `data-autofocus` gets the initial focus.
 - **Behaviour:** focus moves to the safe choice (Cancel) on open; focus is trapped inside; Esc and a backdrop
   click cancel unless busy; focus returns to the opener on close.
 - **Rules:** the title is a question ("Save to device?"), the confirm label repeats the action ("Save to device"),
@@ -327,13 +337,17 @@ the meaning; colour is reserved for the states that need attention.
 | Installed, not running | `--text-muted`, border `--border-strong` |
 | Active profile | `--text`, border `--text` |
 
+In code: `<StatusBadge status="…">label</StatusBadge>` with `active`, `released`, `hidden`, `faulted`, `running`,
+`not-running` (covers "Installed, not running" and "Not running") and `current` (active profile).
+
 Severity group headings on the Conflicts page stay headings, not badges.
 
 ### Empty state
 
 - **Anatomy:** h2, one or two sentences in `--text-muted` up to 56ch saying why it is empty and what to do, at most
   one action (primary). Left aligned, padding `--space-14` top and bottom. No illustration, no icon.
-- **Rules:** used for "No devices detected", "No profiles yet", "Nothing found", "Device not found".
+- **Rules:** used for "No devices detected", "No profiles yet", "Nothing found", "Device not found". Where the
+  empty state is the whole page ("Device not found") it is the page's h1 (`level` 1) with the h2 look.
 
 ### Notice and inline error
 
@@ -351,7 +365,8 @@ Severity group headings on the Conflicts page stay headings, not badges.
 
 - **Anatomy:** `min-height` 72 px, padding `--space-4` `--space-2`, 1 px `--border` below (the list has one above);
   name (`--text-lg` 400) with optional badge on the left, actions on the right as `sm` buttons (one secondary, the
-  rest ghost).
+  rest ghost). Exception: a danger action (Delete) uses the `sm` danger button, not ghost. The first row draws the
+  top line, so the list itself needs no border.
 - **States:** default, current (badge "Active"), editing (the row turns into an inline form with the same height),
   disabled while busy.
 - **Rules:** rows are not cards. Used for profiles; also for "Found but not started" on Devices (no actions).
@@ -490,6 +505,8 @@ fluid layout, title bar) is merged, then adopt in this order; each step builds a
 | `.muted`, `.small`, `.row` utilities | kept as the only global utilities |
 
 ### Order
+
+Done in phase 3 (brief 02). The inventory and mapping above describe the code before adoption.
 
 1. **Tokens.** Rename the two shifted spacing uses (`--space-8` → `--space-10`, `--space-10` → `--space-14` in
    App.vue, styles.css and the pages), add `tokens.css` before `styles.css` in `main.ts`, delete the old `:root`

@@ -2,7 +2,16 @@
 // Conflicts: other software that may hold the same devices, with opt-in actions behind a confirmation
 // (ADR 0001 #12). Nothing here changes how that software starts.
 import { onBeforeUnmount, onMounted, ref } from 'vue'
-import ConfirmDialog from '../components/ConfirmDialog.vue'
+import {
+  Button,
+  Card,
+  ConfirmDialog,
+  EmptyState,
+  KeyValueList,
+  Notice,
+  PageHeader,
+  StatusBadge,
+} from '../components/ui'
 import { errorText, on, scanConflicts, stopService, terminateProcess, type ConflictScan, type Finding } from '../ipc'
 import { SEVERITY_LABEL, actionsOf, evidenceText, groupBySeverity, type FindingAction } from '../lib/conflicts'
 import { familyLabel } from '../lib/device'
@@ -65,43 +74,45 @@ async function onConfirm() {
 
 <template>
   <section class="page">
-    <header class="page-header">
-      <div>
-        <h1>Conflicts</h1>
-        <p class="page-description">
-          Other software that can control the same devices. When two programs drive a device, colours flicker or
-          fall back. CaseControl never changes how this software starts.
-        </p>
-      </div>
-      <button type="button" :disabled="scanning" @click="runScan">{{ scanning ? 'Scanning…' : 'Scan' }}</button>
-    </header>
+    <PageHeader
+      title="Conflicts"
+      description="Other software that can control the same devices. When two programs drive a device, colours flicker or fall back. CaseControl never changes how this software starts."
+    >
+      <template #actions>
+        <Button :disabled="scanning" @click="runScan">{{ scanning ? 'Scanning…' : 'Scan' }}</Button>
+      </template>
+    </PageHeader>
 
-    <p v-if="error" class="notice">{{ error }}</p>
-    <p v-if="message" class="notice">{{ message }}</p>
-    <div v-if="scan && scan.errors.length > 0" class="notice">
-      <p>Parts of the scan failed, so the list may be incomplete:</p>
-      <p v-for="(e, i) in scan.errors" :key="i" class="muted small">{{ e }}</p>
-    </div>
+    <Notice v-if="error" variant="error">{{ error }}</Notice>
+    <Notice v-if="message">{{ message }}</Notice>
+    <Notice v-if="scan && scan.errors.length > 0" variant="warning">
+      Parts of the scan failed, so the list may be incomplete:
+      <template #details>
+        <p v-for="(e, i) in scan.errors" :key="i">{{ e }}</p>
+      </template>
+    </Notice>
 
     <template v-if="scan">
-      <p v-if="scan.findings.length === 0" class="empty muted">Nothing found that competes for your devices.</p>
+      <EmptyState v-if="scan.findings.length === 0" title="Nothing found">
+        No other software competes for your devices.
+      </EmptyState>
 
       <div v-for="group in groupBySeverity(scan.findings)" :key="group.severity" class="group">
         <h2>{{ SEVERITY_LABEL[group.severity] }}</h2>
-        <article v-for="f in group.findings" :key="f.entry_id" class="finding">
+        <Card v-for="f in group.findings" :key="f.entry_id" as="article">
           <div class="finding-head">
             <div>
               <div class="name">{{ f.name }}</div>
               <div class="muted small">{{ f.vendor }}</div>
             </div>
-            <span class="state small" :class="{ running: f.running }">
+            <StatusBadge :status="f.running ? 'running' : 'not-running'">
               {{ f.running ? 'Running' : f.installed ? 'Installed, not running' : 'Not running' }}
-            </span>
+            </StatusBadge>
           </div>
 
           <p v-if="f.note" class="note">{{ f.note }}</p>
 
-          <dl class="facts small">
+          <KeyValueList class="small">
             <dt>Affects</dt>
             <dd>
               <template v-if="f.affected_devices.length > 0">
@@ -111,32 +122,33 @@ async function onConfirm() {
             </dd>
             <dt>Found</dt>
             <dd>
-              <ul class="evidence">
+              <ul>
                 <li v-for="(e, i) in f.evidence" :key="i">{{ evidenceText(e) }}</li>
               </ul>
             </dd>
-          </dl>
+          </KeyValueList>
 
           <div v-if="actionsOf(f).length > 0" class="row">
-            <button
+            <Button
               v-for="a in actionsOf(f)"
               :key="a.kind === 'process' ? `p${a.pid}` : `s${a.name}`"
-              type="button"
+              variant="danger"
               :disabled="acting"
               @click="pending = { finding: f, action: a }"
             >
               {{ a.kind === 'process' ? `End process ${a.name}` : `Stop ${a.driver ? 'driver' : 'service'} ${a.name}` }}
-            </button>
+            </Button>
           </div>
-        </article>
+        </Card>
       </div>
     </template>
-    <p v-else-if="scanning" class="empty muted">Scanning…</p>
+    <p v-else-if="scanning" class="muted">Scanning…</p>
 
     <ConfirmDialog
       :open="pending !== null"
       :title="pending?.action.kind === 'process' ? 'End process?' : 'Stop service?'"
       :confirm-label="pending?.action.kind === 'process' ? 'End process' : 'Stop'"
+      danger
       :busy="acting"
       @confirm="onConfirm"
       @cancel="pending = null"
@@ -160,26 +172,8 @@ async function onConfirm() {
 </template>
 
 <style scoped>
-.notice {
-  margin-bottom: var(--space-6);
-}
-
-.group {
-  margin-bottom: var(--space-10);
-}
-
-.finding {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  padding: var(--space-6);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  background: var(--color-surface);
-}
-
-.finding + .finding {
-  margin-top: var(--space-4);
+.group + .group {
+  margin-top: var(--space-14);
 }
 
 .finding-head {
@@ -190,50 +184,13 @@ async function onConfirm() {
 }
 
 .name {
-  font-size: var(--font-size-lg);
-  font-weight: 600;
-}
-
-.state {
-  flex: none;
-  padding: 2px var(--space-2);
-  border: 1px solid var(--color-border-strong);
-  border-radius: 999px;
-  color: var(--color-text-muted);
-}
-
-.state.running {
-  border-color: var(--color-text);
-  color: var(--color-text);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-strong);
+  line-height: var(--leading-tight);
 }
 
 .note {
-  max-width: 70ch;
-  color: var(--color-text-muted);
-}
-
-.facts {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: var(--space-2) var(--space-6);
-  margin: 0;
-}
-
-.facts dt {
-  color: var(--color-text-muted);
-}
-
-.facts dd {
-  margin: 0;
-}
-
-.evidence {
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.empty {
-  padding: var(--space-8) 0;
+  max-width: var(--measure);
+  color: var(--text-muted);
 }
 </style>
