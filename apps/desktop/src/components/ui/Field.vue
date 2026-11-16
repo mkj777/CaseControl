@@ -1,8 +1,8 @@
 <script setup lang="ts">
 // A labelled control (docs/design-system.md, "Field"): label, control, optional hint and inline error. `row` puts
 // the label in a 120 px column, the control in up to 320 px and the `value` slot (a readout) in 48 px; `stacked`
-// puts the label above; `inline` sizes the label to its text and the control to --toolbar-control-width, for a
-// toolbar. The default slot receives `id` (for the control), `describedBy` and `invalid` to wire up.
+// puts the label above; `inline` sizes the label to its text and the control to --toolbar-control-width (down to
+// --toolbar-control-min-width when the toolbar row is tight), for a toolbar. The default slot receives `id` (for the control), `describedBy` and `invalid` to wire up.
 // `group` is for a set of controls (colour chips): the label then names a role="group" instead of one control.
 import { computed, useId } from 'vue'
 
@@ -64,7 +64,7 @@ const describedBy = computed(
 }
 
 .inline {
-  grid-template-columns: auto var(--toolbar-control-width) auto;
+  grid-template-columns: auto minmax(var(--toolbar-control-min-width), var(--toolbar-control-width)) auto;
   column-gap: var(--space-3);
 }
 

@@ -1668,6 +1668,108 @@ fn all_off_takes_over_every_visible_device_and_all_on_hands_back_those_without_a
 }
 
 #[test]
+fn connect_all_takes_over_released_devices_with_setting_or_readback_only() {
+    let log = Log::default();
+    let wave_hw = with_effects(spec(id(2), "B", DeviceKind::Light), true);
+    wave_hw.behavior.lock().hardware = Some(wave());
+    let hidden_hw = with_effects(spec(id(4), "D", DeviceKind::Light), true);
+    hidden_hw.behavior.lock().hardware = Some(wave());
+    let broken = spec(id(5), "E", DeviceKind::Light);
+    broken.behavior.lock().fatal_direct = true;
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            wave_hw,
+            spec(id(3), "C", DeviceKind::Light),
+            hidden_hw,
+            broken,
+        ],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_excluded(HashSet::from([id(4)]));
+    // Device 1 has a setting and was released; device 5 faulted.
+    drive(&e, &log, 1);
+    e.release(&id(1)).unwrap();
+    let events = e.subscribe();
+    e.set_direct(&id(5), vec![RED; 7]).unwrap();
+    assert!(wait_until(SECOND, || matches!(
+        e.device(&id(5)).unwrap().status,
+        DeviceStatus::Faulted { .. }
+    )));
+    let calls_5 = calls_since(&log, 5, 0).len();
+
+    e.connect_all();
+    // Its last setting, and the mode it showed on its own.
+    assert!(shows(&log, 1, &[RED; 7]));
+    assert!(shows_mode(&log, 2, "3"));
+    for n in [1, 2] {
+        assert!(wait_until(SECOND, || e.device(&id(n)).unwrap().status
+            == DeviceStatus::Active));
+    }
+    assert_eq!(
+        e.device(&id(2)).unwrap().setting,
+        Some(DeviceSetting::Mode { state: wave() })
+    );
+    assert!(wait_until(SECOND, || events.try_iter().any(|ev| matches!(
+        ev,
+        EngineEvent::DeviceStateChanged { id: got, active: true, .. } if got == id(2)
+    ))));
+    // Nothing to show, hidden, faulted: left alone.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(calls_since(&log, 3, 0).is_empty(), "nothing sent to device 3");
+    assert_eq!(e.device(&id(3)).unwrap().status, DeviceStatus::Released);
+    assert!(
+        calls_since(&log, 4, 0).is_empty(),
+        "excluded devices are left alone"
+    );
+    assert_eq!(
+        calls_since(&log, 5, 0).len(),
+        calls_5,
+        "faulted devices are left alone"
+    );
+    assert!(!e.lighting().all_off);
+
+    // Everything connectable is driven: a second Connect all sends nothing.
+    let n = log.lock().len();
+    e.connect_all();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(log.lock().len(), n);
+}
+
+#[test]
+fn connect_all_turns_all_off_off_and_hands_back_devices_held_dark() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            spec(id(2), "B", DeviceKind::Light),
+        ],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    drive(&e, &log, 1);
+    e.set_all_off(true);
+    assert!(shows(&log, 1, &[Rgb::BLACK; 7]));
+    assert!(shows(&log, 2, &[Rgb::BLACK; 7]));
+    assert!(e.lighting().all_off);
+    let start = frames(&log, 1).len();
+
+    e.connect_all();
+    assert!(!e.lighting().all_off);
+    // Device 1 fades back up to its colours; device 2 had nothing but black and goes back to its own lighting.
+    assert!(shows(&log, 1, &[RED; 7]));
+    assert!(frames(&log, 1).len() - start >= 4, "a fade, not a cut");
+    assert!(wait_until(SECOND, || entries(&log, "release")
+        == [format!("{} release", id(2))]));
+    assert!(wait_until(SECOND, || e.device(&id(2)).unwrap().status
+        == DeviceStatus::Released));
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Active);
+}
+
+#[test]
 fn devices_detected_while_all_off_are_held_dark_unless_excluded() {
     let log = Log::default();
     let b = FakeBackend::new(

@@ -1,10 +1,11 @@
 <script setup lang="ts">
 // Devices overview (ADR 0001 #18): one large tile per device with a small live preview; a tile opens the device
 // view. Tiles fill the window width (ADR 0001 #28). Right-click a tile to hide or unhide the device; hidden devices
-// are shown greyed only with "Show hidden" on (ADR 0001 #26, #27). Under the title one toolbar row: master
-// brightness, All off and Release all (ADR 0001 #33) on the left, Show hidden and Rescan on the right. Each tile
-// shows the real status and what the device shows: its colours, the name of its own mode while released, empty LEDs
-// when that is unknown, dark LEDs while All off holds it.
+// are shown greyed only with "Show hidden" on (ADR 0001 #26, #27). No visible title (the sidebar says where you are;
+// the h1 stays for screen readers); the page starts with one toolbar row: All brightness, Connect all and Release
+// all (ADR 0001 #33) on the left, Show hidden and Rescan on the right. Connect all also ends All off (as a device
+// view's "Turn on" does). Each tile shows the real status and what the device shows: its colours, the name of its
+// own mode while released, empty LEDs when that is unknown, dark LEDs while All off holds it.
 import { computed, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import BrightnessSlider from '../components/BrightnessSlider.vue'
@@ -22,7 +23,7 @@ import {
   menuPoint,
   type MenuItem,
 } from '../components/ui'
-import { errorText, releaseAll, setAllOff, setMasterBrightness, type DeviceView } from '../ipc'
+import { connectAll, errorText, releaseAll, setMasterBrightness, type DeviceView } from '../ipc'
 import {
   STATUS_LABEL,
   deviceErrorText,
@@ -76,12 +77,26 @@ async function toggleHidden(id: string, hidden: boolean) {
   }
 }
 
-// ---- brightness, All off, Release all (ADR 0001 #33) -----------------------------------------------------------
+// ---- All brightness, Connect all, Release all (ADR 0001 #33) ---------------------------------------------------
 
-const lightingBusy = ref(false)
+const connecting = ref(false)
 const releasing = ref(false)
 /** The lighting controls need a running engine. */
 const engineDown = computed(() => !deviceState.loaded || deviceState.engineError !== null)
+/** Nothing to release: no device is driven. */
+const noneActive = computed(() => !deviceState.devices.some((d) => statusOf(d) === 'active'))
+/** Connect all has something to do: All off is on, or a released, visible device has a setting or a known own mode
+ * to be taken over with (one without either would stay released, so it does not count). */
+const canConnect = computed(
+  () =>
+    deviceState.lighting.all_off ||
+    deviceState.devices.some(
+      (d) =>
+        statusOf(d) === 'released' &&
+        !isDeviceHidden(d.description.info.id) &&
+        (d.setting !== null || d.hardware !== null),
+    ),
+)
 
 async function sendMaster(percent: number, persist: boolean) {
   deviceState.lighting = await setMasterBrightness(percent, persist)
@@ -92,15 +107,15 @@ function lightingFailed(e: unknown) {
   void refreshDevices()
 }
 
-async function onAllOff(off: boolean) {
+async function onConnectAll() {
   error.value = null
-  lightingBusy.value = true
+  connecting.value = true
   try {
-    deviceState.lighting = await setAllOff(off)
+    deviceState.lighting = await connectAll()
   } catch (e) {
     lightingFailed(e)
   } finally {
-    lightingBusy.value = false
+    connecting.value = false
   }
 }
 
@@ -124,7 +139,7 @@ async function onReleaseAll() {
 
 <template>
   <section class="page wide">
-    <PageHeader title="Devices">
+    <PageHeader title="Devices" title-hidden>
       <template #actions>
         <Switch v-model="deviceState.showHiddenDevices" label="Show hidden" compact />
         <Button :disabled="deviceState.scanning" @click="rescanDevices">
@@ -133,20 +148,16 @@ async function onReleaseAll() {
       </template>
       <template #controls>
         <BrightnessSlider
-          label="Brightness"
+          label="All brightness"
           :value="deviceState.lighting.master_brightness"
           :send="sendMaster"
           :disabled="engineDown"
           @error="lightingFailed"
         />
-        <Switch
-          :model-value="deviceState.lighting.all_off"
-          label="All off"
-          compact
-          :disabled="engineDown || lightingBusy"
-          @update:model-value="onAllOff"
-        />
-        <Button :disabled="engineDown || lightingBusy || releasing" @click="onReleaseAll">
+        <Button :disabled="engineDown || connecting || releasing || !canConnect" @click="onConnectAll">
+          Connect all
+        </Button>
+        <Button :disabled="engineDown || connecting || releasing || noneActive" @click="onReleaseAll">
           {{ releasing ? 'Releasing…' : 'Release all' }}
         </Button>
       </template>

@@ -132,7 +132,7 @@ The window is at least 860 x 560 (`tauri.conf.json`).
 ┌───────────────┬──────────────────────────────────────────────┐
 │ CaseControl   │  (drag region)                   ─   □   ✕   │  32 px, --titlebar-height
 │               │                                              │
-│ Devices       │   Page title                      [Action]   │  page header
+│ Devices       │   Page title                      [Action]   │  page header (Devices: title hidden)
 │ Profiles      │   [Lighting controls]       [View actions]   │  toolbar row (optional)
 │ Conflicts     │                                              │  --space-10
 │ Settings      │   content                                    │
@@ -188,11 +188,18 @@ unless noted.
 - **Anatomy:** optional back link (`← Devices`, `--text-muted`, hover `--text`, `--space-6` below), h1 with an
   optional status badge next to it, at most one description line in `--text-muted` up to `--measure`, and the
   view actions (slot `actions`) at the top right.
+- **Hidden title** (`titleHidden`): a top-level page whose name the sidebar already shows and whose header is only
+  a toolbar (the Devices overview) has no visible title. The h1 stays as a visually hidden heading, so the page
+  keeps its accessible name, and the toolbar row is the first thing on the page (no gap above it).
 - **Toolbar row:** a page with page-wide lighting controls (slot `controls`) gets one toolbar row under the title
-  (`--space-6` above it): the lighting controls grouped on the left, the view actions grouped on the right in the
-  same row instead of next to the title. Gap `--space-6` inside a group, `--space-8` between the groups; the row
-  wraps only when the window is too narrow. The Devices page: Brightness, All off, Release all | Show hidden,
-  Rescan. A device page: Brightness | Show hidden.
+  (`--space-6` above it, none with a hidden title): the lighting controls grouped on the left, the view actions
+  grouped on the right in the same row instead of next to the title. Gap `--space-4` inside a group, `--space-6`
+  between the groups. The brightness slider is the flexible part: it is `--toolbar-control-width` (200 px) when
+  there is room and shrinks to `--toolbar-control-min-width` (80 px) before anything wraps; only then do the view
+  actions move to a second row (left aligned). The Devices page: All brightness, Connect all, Release all | Show
+  hidden, Rescan; it stays on one row from about 1000 px window width (the default 1100 px included) and wraps
+  below that, since its fixed parts alone (labels, buttons, switch, readout) measure about 560 px and the content
+  at the 860 px minimum is 576 px. A device page: Brightness | Show hidden.
 - **Variants:** list page (title, optional description, actions), detail page (back link, title, status badge).
   There is no metadata line under the title; facts such as kind and vendor go into the page's key-value list.
 - **Rules:** at most two actions, secondary style (Rescan, Scan, the compact Show hidden switch). The primary
@@ -280,16 +287,16 @@ unless noted.
   flight (`latestSender`). When the drag ends it drops the queued live value, waits for the one in flight and sends
   the final value once more with `persist = true`, which is the one that gets saved. Until that send has finished
   it shows its own value, so a device refresh in between cannot pull the thumb back.
-- **Layout:** the inline Field layout (label at its own width, slider `--toolbar-control-width`, readout), since it
-  always sits in a page toolbar.
+- **Layout:** the inline Field layout (label at its own width, slider `--toolbar-control-width` down to
+  `--toolbar-control-min-width`, readout), since it always sits in a page toolbar.
 - **States:** disabled (engine down, device locked, a hardware mode without a brightness parameter: "This mode has
   no brightness setting.", or a released device that has no setting and whose own lighting cannot be read, so
   there is nothing to dim: "Set a colour or mode first."). A failed send is emitted as `error`; the page shows it
   as an inline Notice.
 - **Takes over:** on a released device it takes control (with its last setting, else its own mode as read back),
   like every lighting control.
-- **Rules:** every brightness control is this component (master brightness on the Devices page, device brightness
-  on a device page), usually in the PageHeader `controls` row. The `send` callback decides what `persist` saves;
+- **Rules:** every brightness control is this component (master brightness, labelled "All brightness", on the
+  Devices page; device brightness on a device page), usually in the PageHeader `controls` row. The `send` callback decides what `persist` saves;
   the slider never saves on its own.
 
 ### Number field
@@ -318,7 +325,8 @@ unless noted.
 
 - **Anatomy:** label (`--text-muted`), control, optional hint and inline error below. Three layouts: stacked
   (label above), row (label column 120 px, control column up to 320 px, value column 48 px) and inline (label at
-  its own width, control `--toolbar-control-width`, value at its own width; for a page toolbar).
+  its own width, control `--toolbar-control-width` shrinking to `--toolbar-control-min-width` in a tight toolbar,
+  value at its own width; for a page toolbar).
 - **Wiring:** the default slot receives `id` (for the control, so the label's `for` works), `describedBy` (hint and
   error ids) and `invalid`. With `group`, the label names a `role="group"` instead of one control (colour chips,
   segmented control).
@@ -443,8 +451,13 @@ The preview is the focus of the app (ADR #15), so it gets the most room and the 
 - **Released** (the device shows its own lighting): badge "Released"; the tile line and the device view's mode menu
   name its own mode when it can be read ("Own lighting (Rainbow wave)", else "Own lighting"); the preview shows its
   own colours or unknown LEDs. Every control stays usable and takes the device over.
-- **All off:** the switch on the Devices page; every driven device's preview is dark, its tile line says "All off",
-  and its device view shows an `info` Notice "All lights are off." with a "Turn on" button.
+- **All off:** set by the engine's All off (kept across restarts); every driven device's preview is dark, its tile
+  line says "All off", and its device view shows an `info` Notice "All lights are off." with a "Turn on" button.
+  The Devices overview has no All off switch; its Connect all ends All off too.
+- **Connect all / Release all** (Devices toolbar, secondary buttons): Release all hands every device back and is
+  disabled while no device is Active. Connect all takes every released, visible, non-faulted device over with the
+  same rules as brightness (last setting, else its own mode as read back; a device with neither stays released)
+  and ends All off; it is disabled when every such device is already Active and All off is not on.
 
 ## Copy and filler
 

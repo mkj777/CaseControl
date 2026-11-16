@@ -199,6 +199,7 @@ pub fn run() {
             commands::set_device_brightness,
             commands::set_master_brightness,
             commands::set_all_off,
+            commands::connect_all,
             commands::rescan,
             commands::set_device_hidden,
             commands::set_zone_hidden,

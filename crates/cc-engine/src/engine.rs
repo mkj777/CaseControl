@@ -221,13 +221,16 @@ impl State {
         slot.view(self.device_brightness(id))
     }
 
-    /// Takes over every undriven device that is not excluded (see [`Slot::take_over`]).
-    fn take_over_all(&mut self, dark: bool) {
+    /// Takes over every undriven device that is not excluded (see [`Slot::take_over`]); returns the devices it took.
+    fn take_over_all(&mut self, dark: bool) -> Vec<DeviceId> {
+        let mut taken = Vec::new();
         for (id, slot) in &mut self.devices {
             if slot.want.is_none() && !self.excluded.contains(id) && slot.take_over(dark) {
                 debug!(%id, dark, "device taken over");
+                taken.push(id.clone());
             }
         }
+        taken
     }
 }
 
@@ -1060,6 +1063,35 @@ impl Shared {
         Self::start_fade(this, generation, if off { 0.0 } else { 1.0 });
     }
 
+    /// Connect all: takes over every undriven device that is not excluded or faulted, as brightness does (last
+    /// setting, else the hardware readback, else it stays released), and clears All off like All on (fade up, devices
+    /// held dark without a setting are handed back).
+    fn connect_all(this: &Arc<Self>) {
+        if this.is_closed() {
+            return;
+        }
+        let fade = {
+            let mut st = this.state.lock();
+            let taken = st.take_over_all(false);
+            if st.off {
+                // The fade re-sends every driven device, the ones just taken included.
+                st.off = false;
+                st.fade_gen += 1;
+                this.hand_back_held_dark(&mut st);
+                Some(st.fade_gen)
+            } else {
+                for id in &taken {
+                    this.refresh_locked(&mut st, Some(id));
+                }
+                None
+            }
+        };
+        info!(all_on = fade.is_some(), "connect all");
+        if let Some(generation) = fade {
+            Self::start_fade(this, generation, 1.0);
+        }
+    }
+
     /// All on: devices held dark without a setting ([`Want::Off`]) go back to their own lighting (released), since
     /// there is nothing to fade them up to.
     fn hand_back_held_dark(&self, st: &mut State) {
@@ -1621,6 +1653,15 @@ impl EngineHandle {
     /// the fade runs on its own thread. Setting the current state again does nothing.
     pub fn set_all_off(&self, off: bool) {
         Shared::set_all_off(self.shared(), off);
+    }
+
+    /// Connect all, the counterpart of [`release_all`](Self::release_all): takes over every device the engine does
+    /// not drive (never set, or released) that is neither excluded nor faulted, with its last setting, else the mode
+    /// it shows on its own (`DeviceView::hardware`); a device with neither keeps its own lighting, since there is
+    /// nothing to show. Also turns All off off, as [`set_all_off(false)`](Self::set_all_off) does (fade up, devices
+    /// held dark without a setting go back to their own lighting). Returns at once.
+    pub fn connect_all(&self) {
+        Shared::connect_all(self.shared());
     }
 
     /// Master brightness and the All off state.

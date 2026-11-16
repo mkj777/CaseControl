@@ -16,6 +16,7 @@ const COMMANDS: &[&str] = &[
     "set_device_brightness",
     "set_master_brightness",
     "set_all_off",
+    "connect_all",
     "rescan",
     "set_device_hidden",
     "set_zone_hidden",
