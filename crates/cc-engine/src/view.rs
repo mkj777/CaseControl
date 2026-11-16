@@ -26,10 +26,12 @@ pub struct DeviceView {
     pub description: DeviceDescription,
     /// Control status.
     pub status: DeviceStatus,
-    /// The last setting the engine was asked to show, if any.
+    /// What the device was last actually set to (recorded by its thread after the write), if anything.
     pub setting: Option<DeviceSetting>,
     /// The engine's colour buffer, one entry per LED.
     pub colors: Vec<Rgb>,
+    /// Family id of the backend that detected the device (`Backend::name()`).
+    pub family: String,
 }
 
 /// One device a backend found but could not bring up.

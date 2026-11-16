@@ -434,9 +434,9 @@ pub struct LightspeedController {
     feature: u8,
     zones: Vec<ZoneInfo>,
     initial: Vec<ZoneEffectState>,
-    /// SetSWControl(1, 1) is in effect.
+    /// SetSWControl(1, 1) was acknowledged.
     claimed: bool,
-    /// An effect was written without software control (any non-Direct mode).
+    /// A SW-control or effect write was attempted since the last release: release() must run.
     touched: bool,
     sent: Vec<Option<Rgb>>,
 }
@@ -478,6 +478,12 @@ impl LightspeedController {
     }
 
     fn set_sw(&mut self, on: bool) -> Result<(), DeviceError> {
+        // Marked before sending: any SW-control write may have taken effect even if its ack is lost, so release()
+        // must run afterwards. `claimed` only records an acknowledged claim (an unacknowledged one is re-sent).
+        self.touched = true;
+        if !on {
+            self.claimed = false;
+        }
         self.link.set_sw_control(self.feature, on)?;
         self.claimed = on;
         Ok(())
@@ -551,7 +557,6 @@ impl Controller for LightspeedController {
             return self.set_direct(&state.colors);
         }
         self.set_sw(false)?;
-        self.touched = true;
         let speed = raw_speed(state.speed.unwrap_or(DEFAULT_SPEED));
         let brightness = state.brightness.unwrap_or(BRIGHTNESS_MAX).min(BRIGHTNESS_MAX) as u8;
         for i in 0..self.zones.len() {
@@ -582,14 +587,17 @@ impl Controller for LightspeedController {
 
     fn release(&mut self) -> Result<(), DeviceError> {
         // The legacy controller sends nothing on shutdown. Here: SetSWControl(0, 0) (`11 <idx> <fi> 87 00 00`),
-        // which hands the zones back to the firmware's effect engine, once after we touched the device.
-        if !self.claimed && !self.touched {
+        // which hands the zones back to the firmware's effect engine, once after we touched the device. Then each
+        // zone's open-time effect is replayed (volatile, persistence 0) where its GetEffect readback maps onto
+        // SetZoneEffect (`hidpp::restore_params`), so our volatile Static/effect writes do not linger.
+        if !self.touched {
             return Ok(());
         }
         self.set_sw(false)?;
         self.touched = false;
         self.clear_sent();
-        Ok(())
+        self.link
+            .restore_effects(self.feature, &self.zones, &self.initial)
     }
 }
 
@@ -646,8 +654,10 @@ pub(crate) mod tests {
                 );
             }
         }
-        b = rr(b, FEAT, fp8070::GET_EFFECT, &[0], &[0, 1, 0xFF, 0, 0]);
-        rr(b, FEAT, fp8070::GET_EFFECT, &[1], &[1, 1, 0xFF, 0, 0])
+        // Zone 0 readback maps (Static, index 1, red, marker 0x02); zone 1 echoes the wrong zone and is not
+        // restored.
+        b = rr(b, FEAT, fp8070::GET_EFFECT, &[0], &[0, 1, 0xFF, 0, 0, 0x02]);
+        rr(b, FEAT, fp8070::GET_EFFECT, &[1], &[0, 1, 0xFF, 0, 0])
     }
 
     fn controller(extra: ScriptBuilder) -> (LightspeedController, FakeTransport) {
@@ -675,6 +685,12 @@ pub(crate) mod tests {
 
     fn ack(function: u8) -> Vec<u8> {
         long_reply(IDX, FEAT, function, &[])
+    }
+
+    /// Release tail after SetSWControl(0, 0): zone 0's readback replayed verbatim with persistence 0.
+    fn restore(b: ScriptBuilder) -> ScriptBuilder {
+        b.write(set_effect([0, 1, 0xFF, 0, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+            .read(ack(fp8070::SET_EFFECT))
     }
 
     fn sw(b: ScriptBuilder, on: bool) -> ScriptBuilder {
@@ -810,8 +826,8 @@ pub(crate) mod tests {
                 .read(ack(fp8070::SET_EFFECT))
         };
         let mut s = frame(sw(ScriptBuilder::new(), true));
-        // Second identical frame: nothing. Then release: 11 01 0A 87 00 00.
-        s = sw(s, false);
+        // Second identical frame: nothing. Then release: 11 01 0A 87 00 00, then the restore.
+        s = restore(sw(s, false));
         s = frame(sw(s, true));
         let (mut c, fake) = controller(s);
         c.set_direct(&[red, red]).expect("frame");
@@ -841,8 +857,8 @@ pub(crate) mod tests {
                 .write(set_effect([z, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
                 .read(ack(fp8070::SET_EFFECT));
         }
-        // release after an effect was written: SetSWControl(0, 0).
-        s = sw(s, false);
+        // release after an effect was written: SetSWControl(0, 0), then the restore.
+        s = restore(sw(s, false));
         let (mut c, fake) = controller(s);
         c.set_mode(&ModeState {
             mode: 2,
@@ -884,6 +900,20 @@ pub(crate) mod tests {
             colors: vec![blue, blue],
         })
         .expect("direct");
+        fake.finish().expect("script consumed");
+    }
+
+    #[test]
+    fn lost_claim_ack_still_releases() {
+        let s = ScriptBuilder::new()
+            .write(long_request(IDX, FEAT, fp8070::SET_SW_CTL, &[1, 1]).to_vec())
+            .read_timeout();
+        let s = restore(sw(s, false));
+        let (mut c, fake) = controller(s);
+        assert_eq!(c.set_direct(&[Rgb::BLACK, Rgb::BLACK]), Err(DeviceError::Timeout));
+        assert!(!c.is_claimed());
+        c.release().expect("release");
+        c.release().expect("second release is a no-op");
         fake.finish().expect("script consumed");
     }
 

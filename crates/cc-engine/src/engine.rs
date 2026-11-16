@@ -73,6 +73,7 @@ impl Slot {
             status: self.status.clone(),
             setting: self.setting.clone(),
             colors: self.colors.clone(),
+            family: self.family.clone(),
         }
     }
 
@@ -86,12 +87,10 @@ impl Slot {
         }
     }
 
-    /// Stores `colors` as the device's buffer and Direct setting and hands it to the worker as the latest frame.
-    fn push_frame(&mut self, colors: Vec<Rgb>) {
-        *self.frame.lock() = Some(colors.clone());
-        self.setting = Some(DeviceSetting::Direct {
-            colors: colors.clone(),
-        });
+    /// Stores `colors` as the device's buffer and hands it to the worker as the latest frame (sequence `seq`). The
+    /// setting is recorded by the worker once the frame has actually been sent.
+    fn push_frame(&mut self, seq: u64, colors: Vec<Rgb>) {
+        *self.frame.lock() = Some((seq, colors.clone()));
         self.colors = colors;
         // Full channel: the worker is busy and will pick the frame up from the slot anyway.
         let _ = self.tx.try_send(Command::Wake);
@@ -112,8 +111,12 @@ pub(crate) struct Shared {
     subscribers: Mutex<Vec<Sender<EngineEvent>>>,
     backends: Vec<Box<dyn Backend>>,
     frame_interval_ns: AtomicU64,
-    /// Set once shutdown starts: API calls are rejected and no events go out.
+    /// Set once shutdown starts: API calls are rejected, no events go out, detection stops adding devices.
     closed: AtomicBool,
+    /// Makes shutdown idempotent.
+    shutdown_started: AtomicBool,
+    /// Orders frames, modes, releases and resizes (see the worker module).
+    next_seq: AtomicU64,
     /// Serializes detection passes and shutdown.
     detect_lock: Mutex<()>,
     hotplug: Mutex<Option<HotplugRuntime>>,
@@ -128,6 +131,10 @@ fn interval_ns(fps: u32) -> u64 {
 impl Shared {
     pub(crate) fn frame_interval(&self) -> Duration {
         Duration::from_nanos(self.frame_interval_ns.load(Ordering::Relaxed))
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn is_closed(&self) -> bool {
@@ -148,6 +155,61 @@ impl Shared {
             && !matches!(slot.status, DeviceStatus::Faulted { .. })
         {
             slot.status = status;
+        }
+    }
+
+    /// Called by a worker after a colour frame went out: the device now shows `colors`.
+    pub(crate) fn direct_applied(&self, id: &DeviceId, generation: u64, colors: Vec<Rgb>) {
+        let mut st = self.state.lock();
+        if let Some(slot) = st.devices.get_mut(id).filter(|s| s.generation == generation) {
+            slot.setting = Some(DeviceSetting::Direct { colors });
+        }
+    }
+
+    /// Called by a worker after a mode was applied: records it and emits `DeviceStateChanged`.
+    pub(crate) fn mode_applied(&self, id: &DeviceId, generation: u64, state: ModeState) {
+        {
+            let mut st = self.state.lock();
+            let Some(slot) = st.devices.get_mut(id).filter(|s| s.generation == generation) else {
+                return;
+            };
+            slot.setting = Some(DeviceSetting::Mode { state: state.clone() });
+        }
+        self.emit(EngineEvent::DeviceStateChanged {
+            id: id.clone(),
+            state,
+        });
+    }
+
+    /// Called by a worker after zone `zone` was resized: adopts the new description, carries the colour buffer and a
+    /// Direct setting over, and remembers the size by zone name. If the device shows direct colours, or a pending
+    /// frame was dropped because of the resize, the carried-over buffer is queued as a new frame.
+    pub(crate) fn resized(
+        &self,
+        id: &DeviceId,
+        generation: u64,
+        zone: usize,
+        desc: DeviceDescription,
+        dropped: bool,
+    ) {
+        let mut st = self.state.lock();
+        let Some(slot) = st.devices.get_mut(id).filter(|s| s.generation == generation) else {
+            return;
+        };
+        let colors = remap_buffer(&slot.description, &desc, &slot.colors);
+        let direct = matches!(slot.setting, Some(DeviceSetting::Direct { .. }));
+        if let Some(DeviceSetting::Direct { colors: c }) = &mut slot.setting {
+            *c = remap_buffer(&slot.description, &desc, c);
+        }
+        let name = desc.zones.get(zone).map(|z| (z.name.clone(), z.len));
+        slot.description = desc;
+        slot.colors = colors.clone();
+        if direct || dropped {
+            let seq = self.next_seq();
+            slot.push_frame(seq, colors);
+        }
+        if let Some((name, len)) = name {
+            st.zone_sizes.entry(id.clone()).or_default().insert(name, len);
         }
     }
 
@@ -177,12 +239,21 @@ impl Shared {
             let st = this.state.lock();
             DetectContext {
                 disabled_families: st.disabled_families.clone(),
-                skip: st.devices.keys().cloned().collect(),
+                // Faulted devices are retried: a fresh controller replaces the faulted one.
+                skip: st
+                    .devices
+                    .iter()
+                    .filter(|(_, s)| !matches!(s.status, DeviceStatus::Faulted { .. }))
+                    .map(|(id, _)| id.clone())
+                    .collect(),
             }
         };
         let mut found = Vec::new();
         let mut failures = Vec::new();
         for backend in &this.backends {
+            if this.is_closed() {
+                return;
+            }
             if bus.is_some_and(|b| backend.bus() != b) || !ctx.is_enabled(backend.name()) {
                 continue;
             }
@@ -211,6 +282,9 @@ impl Shared {
             st.failures.drain(..excess);
         }
         for (family, ctrl) in found {
+            if this.is_closed() {
+                return;
+            }
             Self::add_device(this, family, ctrl);
         }
     }
@@ -226,7 +300,9 @@ impl Shared {
             let st = this.state.lock();
             (
                 st.zone_sizes.get(&id).cloned().unwrap_or_default(),
-                st.devices.contains_key(&id),
+                st.devices
+                    .get(&id)
+                    .is_some_and(|s| !matches!(s.status, DeviceStatus::Faulted { .. })),
             )
         };
         if duplicate {
@@ -270,32 +346,73 @@ impl Shared {
                 return;
             }
         };
-        info!(%id, name = %description.info.name, %family, "device added");
         let info = description.info.clone();
-        let pending = {
-            let mut st = this.state.lock();
-            st.devices.insert(
-                id.clone(),
-                Slot {
-                    family,
-                    generation,
-                    colors: vec![Rgb::BLACK; description.led_count()],
-                    description,
-                    status: DeviceStatus::Active,
-                    setting: None,
-                    frame,
-                    tx,
-                    thread: Some(thread),
-                },
-            );
-            st.pending.remove(&id)
+        let slot = Slot {
+            family,
+            generation,
+            colors: vec![Rgb::BLACK; description.led_count()],
+            description,
+            status: DeviceStatus::Active,
+            setting: None,
+            frame,
+            tx,
+            thread: Some(thread),
         };
+        let (pending, replaced) = {
+            let mut st = this.state.lock();
+            if this.is_closed() {
+                // Shutdown started meanwhile; the new device was never driven, so it needs no release.
+                let _ = slot.tx.try_send(Command::Stop {
+                    release: false,
+                    reply: None,
+                });
+                return;
+            }
+            let replaced = st.devices.insert(id.clone(), slot);
+            (st.pending.remove(&id), replaced)
+        };
+        if let Some(old) = replaced {
+            info!(%id, "faulted device detected again; replacing it");
+            // The faulted worker no longer talks to the device; let it end on its own.
+            let _ = old.tx.try_send(Command::Stop {
+                release: false,
+                reply: None,
+            });
+        }
+        info!(%id, name = %info.name, "device added");
         this.emit(EngineEvent::DeviceAdded(info));
         if let Some(setting) = pending
-            && let Err(e) = this.apply_one(&id, setting)
+            && let Err(e) = this.queue_setting(&id, setting)
         {
             warn!(%id, error = %e, "pending setting could not be applied");
         }
+    }
+
+    /// Applies `setting` without waiting for the device (used during detection, which must not block on acks).
+    fn queue_setting(&self, id: &DeviceId, setting: DeviceSetting) -> Result<(), EngineError> {
+        let mut st = self.state.lock();
+        let slot = st
+            .devices
+            .get_mut(id)
+            .ok_or_else(|| EngineError::UnknownDevice(id.clone()))?;
+        match setting.fit_to(slot.description.led_count()) {
+            DeviceSetting::Direct { colors } => {
+                check_has_direct(&slot.description)?;
+                let seq = self.next_seq();
+                slot.push_frame(seq, colors);
+            }
+            DeviceSetting::Mode { state } => {
+                slot.description
+                    .validate_state(&state)
+                    .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
+                let (reply, _) = crossbeam_channel::bounded(1);
+                let seq = self.next_seq();
+                slot.tx
+                    .try_send(Command::SetMode { seq, state, reply })
+                    .map_err(|_| EngineError::Timeout)?;
+            }
+        }
+        Ok(())
     }
 
     fn record_failure(&self, family: &str, ctrl: &dyn Controller, error: DeviceError) {
@@ -380,22 +497,22 @@ impl Shared {
     }
 
     /// Sends a command built by `make` and waits for its reply within the ack timeout.
-    fn acked<T>(
+    fn acked(
         &self,
         id: &DeviceId,
         tx: Sender<Command>,
-        make: impl FnOnce(Reply<T>) -> Command,
-    ) -> Result<T, EngineError> {
+        make: impl FnOnce(Reply) -> Command,
+    ) -> Result<(), EngineError> {
         self.acked_within(id, tx, make, self.timing.ack_timeout)
     }
 
-    fn acked_within<T>(
+    fn acked_within(
         &self,
         id: &DeviceId,
         tx: Sender<Command>,
-        make: impl FnOnce(Reply<T>) -> Command,
+        make: impl FnOnce(Reply) -> Command,
         timeout: Duration,
-    ) -> Result<T, EngineError> {
+    ) -> Result<(), EngineError> {
         let deadline = Instant::now() + timeout;
         let (rtx, rrx) = crossbeam_channel::bounded(1);
         tx.send_deadline(make(rtx), deadline).map_err(|e| match e {
@@ -434,7 +551,8 @@ impl Shared {
                 colors.len()
             )));
         }
-        slot.push_frame(colors);
+        let seq = self.next_seq();
+        slot.push_frame(seq, colors);
         Ok(())
     }
 
@@ -464,7 +582,8 @@ impl Shared {
         }
         let mut buffer = slot.colors.clone();
         buffer[range].copy_from_slice(&colors);
-        slot.push_frame(buffer);
+        let seq = self.next_seq();
+        slot.push_frame(seq, buffer);
         Ok(())
     }
 
@@ -479,24 +598,15 @@ impl Shared {
             slot.description
                 .validate_state(&state)
                 .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-            // A mode supersedes a colour frame that has not been sent yet.
-            slot.frame.lock().take();
         }
-        let sent = state.clone();
-        self.acked(id, tx, move |r| Command::SetMode(sent, r))?;
-        if let Some(slot) = self.state.lock().devices.get_mut(id) {
-            slot.setting = Some(DeviceSetting::Mode { state: state.clone() });
-        }
-        self.emit(EngineEvent::DeviceStateChanged {
-            id: id.clone(),
-            state,
-        });
-        Ok(())
+        // The worker records the setting and emits DeviceStateChanged when (and if) it applies the mode.
+        let seq = self.next_seq();
+        self.acked(id, tx, move |reply| Command::SetMode { seq, state, reply })
     }
 
     fn resize_zone(&self, id: &DeviceId, zone: usize, len: usize) -> Result<(), EngineError> {
         let tx = self.slot_tx(id)?;
-        let zone_name = {
+        {
             let st = self.state.lock();
             let slot = st
                 .devices
@@ -522,23 +632,15 @@ impl Shared {
                     )));
                 }
             }
-            slot.frame.lock().take();
-            z.name.clone()
-        };
-        let desc = self.acked(id, tx, move |reply| Command::Resize { zone, len, reply })?;
-        let mut st = self.state.lock();
-        st.zone_sizes
-            .entry(id.clone())
-            .or_default()
-            .insert(zone_name, len);
-        if let Some(slot) = st.devices.get_mut(id) {
-            slot.colors = remap_buffer(&slot.description, &desc, &slot.colors);
-            if let Some(DeviceSetting::Direct { colors }) = &mut slot.setting {
-                *colors = slot.colors.clone();
-            }
-            slot.description = desc;
         }
-        Ok(())
+        // The worker updates description, buffer and remembered size when the resize actually happens.
+        let seq = self.next_seq();
+        self.acked(id, tx, move |reply| Command::Resize {
+            seq,
+            zone,
+            len,
+            reply,
+        })
     }
 
     fn save_to_hardware(&self, id: &DeviceId) -> Result<(), EngineError> {
@@ -548,10 +650,8 @@ impl Shared {
 
     fn release(&self, id: &DeviceId) -> Result<(), EngineError> {
         let tx = self.slot_tx(id)?;
-        if let Some(slot) = self.state.lock().devices.get(id) {
-            slot.frame.lock().take();
-        }
-        self.acked(id, tx, Command::Release)
+        let seq = self.next_seq();
+        self.acked(id, tx, move |reply| Command::Release { seq, reply })
     }
 
     fn apply_one(&self, id: &DeviceId, setting: DeviceSetting) -> Result<(), EngineError> {
@@ -569,7 +669,8 @@ impl Shared {
         }
     }
 
-    /// Stops a removed slot's worker, releasing first if asked, within `timeout`. Joins the thread only if it
+    /// Stops a removed slot's worker within `timeout`; with `release`, the worker releases the device first if it
+    /// considers it Active (its own state, not the engine's copy). Joins the thread only if it
     /// answered; a thread stuck in a driver call is left behind rather than blocking the caller.
     fn stop_slot(
         &self,
@@ -578,7 +679,6 @@ impl Shared {
         release: bool,
         timeout: Duration,
     ) -> Result<(), EngineError> {
-        let release = release && slot.status == DeviceStatus::Active;
         let r = self.acked_within(
             id,
             slot.tx.clone(),
@@ -625,14 +725,22 @@ impl Shared {
     }
 
     fn shutdown(&self, timeout: Duration) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let start = Instant::now();
+        let deadline = start + timeout;
+        // From here on API calls fail, no events go out and an in-flight detection adds nothing.
+        self.closed.store(true, Ordering::Release);
         let hotplug = self.hotplug.lock().take();
         if let Some(h) = hotplug {
-            h.stop();
+            h.stop_within(deadline.saturating_duration_since(Instant::now()));
         }
-        let _guard = self.detect_lock.lock();
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
+        // Wait for an in-flight detection pass to finish, but only within the budget: a backend stuck in `detect`
+        // must not block quitting. Detection checks `closed` before adding anything.
+        let guard = self.detect_lock.try_lock_until(deadline);
+        if guard.is_none() {
+            warn!("detection still running at shutdown; not waiting for it");
         }
         let slots: Vec<(DeviceId, Slot)> = std::mem::take(&mut self.state.lock().devices)
             .into_iter()
@@ -640,11 +748,12 @@ impl Shared {
         let n = slots.len();
         for (i, (id, slot)) in slots.into_iter().enumerate() {
             let left = u32::try_from(n - i).unwrap_or(u32::MAX);
-            let budget = timeout.saturating_sub(start.elapsed()) / left;
+            let budget = deadline.saturating_duration_since(Instant::now()) / left;
             if let Err(e) = self.stop_slot(&id, slot, true, budget) {
                 warn!(%id, error = %e, "release on shutdown failed");
             }
         }
+        drop(guard);
         self.subscribers.lock().clear();
         info!(devices = n, elapsed = ?start.elapsed(), "engine shut down");
     }
@@ -751,6 +860,8 @@ pub(crate) fn start_with(
         backends,
         frame_interval_ns: AtomicU64::new(interval_ns(cfg.frame_rate)),
         closed: AtomicBool::new(false),
+        shutdown_started: AtomicBool::new(false),
+        next_seq: AtomicU64::new(0),
         detect_lock: Mutex::new(()),
         hotplug: Mutex::new(None),
         next_generation: AtomicU64::new(0),

@@ -384,6 +384,45 @@ pub struct ZoneEffectState {
     pub raw: Option<Payload>,
 }
 
+/// Effect ids whose SetZoneEffect parameter layout is known (the HID++ 2.0 controller's `SetZoneEffect` table).
+const KNOWN_LAYOUTS: &[u16] = &[
+    effect::OFF,
+    effect::STATIC,
+    effect::CYCLE,
+    effect::WAVE,
+    effect::AUDIO,
+    effect::BREATHING,
+    effect::RIPPLE,
+    effect::DECOMPOSITION,
+    effect::SIGNATURE1,
+    effect::SIGNATURE2,
+    effect::CYCLE_SAT,
+    effect::WAVE_SAT,
+    effect::RIPPLE_SAT,
+];
+
+/// Maps a zone's 0x8070 GetEffect readback onto SetZoneEffect parameters, or `None` if it cannot be mapped.
+///
+/// The reference never parses the GetEffect reply (it only logs it at trace level), so the mapping rests on the
+/// one structural fact that can be checked: SetZoneEffect takes `[zone, effect index, 10 effect parameter bytes,
+/// persistence, ...]`, and a GetEffect reply in the same shape echoes the zone in byte 0 and names one of the zone's
+/// own effects in byte 1. The readback is used only when byte 0 equals the zone index, byte 1 is an effect index the
+/// zone reported in discovery, and that effect's id has a known parameter layout. Bytes 0..12 are then sent
+/// verbatim, byte 12 (persistence) is forced to 0 and bytes 13..16 to 0, so the replay never writes flash.
+pub fn restore_params(state: &ZoneEffectState, zone: &ZoneInfo) -> Option<[u8; 16]> {
+    let raw = state.raw?;
+    if state.zone != zone.index || raw[0] != zone.index {
+        return None;
+    }
+    let fx = zone.effect_by_index(raw[1])?;
+    if !KNOWN_LAYOUTS.contains(&fx.id) {
+        return None;
+    }
+    let mut params = [0u8; 16];
+    params[..12].copy_from_slice(&raw[..12]);
+    Some(params)
+}
+
 /// Upper bound for counts read from the device; anything larger is treated as a garbled reply.
 const MAX_ZONES: u8 = 32;
 const MAX_EFFECTS: u8 = 32;
@@ -532,6 +571,35 @@ impl Link {
         Ok(out)
     }
 
+    /// Replays each zone's open-time effect (see [`restore_params`]) with SetZoneEffect, persistence 0. Zones whose
+    /// readback cannot be mapped are skipped and logged. Every zone is attempted; the first error is returned.
+    pub fn restore_effects(
+        &mut self,
+        feature: u8,
+        zones: &[ZoneInfo],
+        initial: &[ZoneEffectState],
+    ) -> Result<(), DeviceError> {
+        let mut first_err = Ok(());
+        for zone in zones {
+            let state = initial.iter().find(|s| s.zone == zone.index);
+            let Some(params) = state.and_then(|s| restore_params(s, zone)) else {
+                tracing::info!(
+                    target: "cc_drivers::logitech",
+                    zone = zone.index,
+                    raw = %state.and_then(|s| s.raw).map(|r| cc_hid::hex(&r)).unwrap_or_default(),
+                    "open-time effect readback not mappable, zone not restored"
+                );
+                continue;
+            };
+            if let Err(e) = self.set_zone_effect(feature, &params)
+                && first_err.is_ok()
+            {
+                first_err = Err(e);
+            }
+        }
+        first_err
+    }
+
     /// 0x8070 SetSWControl(enabled, enabled).
     pub fn set_sw_control(&mut self, feature: u8, enabled: bool) -> Result<(), DeviceError> {
         let en = u8::from(enabled);
@@ -678,6 +746,58 @@ pub(crate) mod tests {
         let mut link = Link::new(Box::new(fake.clone()), 0xFF);
         assert_eq!(link.request(0x04, 0x30, &[]), Err(DeviceError::Timeout));
         fake.finish().expect("script consumed");
+    }
+
+    #[test]
+    fn restore_params_mapping() {
+        let zone = ZoneInfo {
+            index: 1,
+            location: 1,
+            effects: vec![
+                EffectInfo {
+                    index: 0,
+                    id: effect::OFF,
+                    caps: 0,
+                    period: 0,
+                },
+                EffectInfo {
+                    index: 2,
+                    id: 0x0042, // unknown layout
+                    caps: 0,
+                    period: 0,
+                },
+                EffectInfo {
+                    index: 3,
+                    id: effect::BREATHING,
+                    caps: 0,
+                    period: 0,
+                },
+            ],
+        };
+        let st = |raw: [u8; 16]| ZoneEffectState {
+            zone: 1,
+            raw: Some(raw),
+        };
+        // Echoes zone 1 and names Breathing (index 3): bytes 0..12 verbatim, persistence and tail forced to 0.
+        let raw = [1, 3, 9, 8, 7, 0x13, 0x88, 0, 50, 0, 0, 0, 1, 0xAA, 0xBB, 0xCC];
+        assert_eq!(
+            restore_params(&st(raw), &zone),
+            Some([1, 3, 9, 8, 7, 0x13, 0x88, 0, 50, 0, 0, 0, 0, 0, 0, 0])
+        );
+        // Wrong zone echo, unknown effect index, unknown layout, no readback: not mapped.
+        let mut wrong_zone = raw;
+        wrong_zone[0] = 0;
+        assert_eq!(restore_params(&st(wrong_zone), &zone), None);
+        let mut bad_index = raw;
+        bad_index[1] = 7;
+        assert_eq!(restore_params(&st(bad_index), &zone), None);
+        let mut unknown = raw;
+        unknown[1] = 2;
+        assert_eq!(restore_params(&st(unknown), &zone), None);
+        assert_eq!(
+            restore_params(&ZoneEffectState { zone: 1, raw: None }, &zone),
+            None
+        );
     }
 
     #[test]

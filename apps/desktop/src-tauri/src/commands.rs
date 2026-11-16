@@ -7,13 +7,13 @@
 
 use cc_config::Profile;
 use cc_conflicts::ScanOptions;
-use cc_core::{DeviceId, DeviceInfo, ModeState, Rgb};
+use cc_core::{DeviceId, ModeState, Rgb};
 use cc_engine::{ApplyReport, DetectFailure, DeviceView};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_autostart::ManagerExt as _;
 
-use crate::conflicts::{ConflictScan, check_service, process_name, scan_view};
+use crate::conflicts::{ConflictScan, KnownDevice, check_service, process_name, scan_view};
 use crate::events::{self, CONFLICTS_UPDATED, DEVICES_CHANGED, PROFILES_CHANGED};
 use crate::prefs::{SettingsPatch, SettingsView, apply_patch, record_zone_size};
 use crate::profiles::{clears_last, last_after_rename};
@@ -376,9 +376,9 @@ pub async fn scan_conflicts<R: Runtime>(app: AppHandle<R>) -> Result<ConflictSca
             check_openrgb_port: state.settings().conflicts.check_openrgb_port,
         };
         let report = run_scan(&opts)?;
-        let devices: Vec<DeviceInfo> = state
+        let devices: Vec<KnownDevice> = state
             .engine()
-            .map(|e| e.devices().into_iter().map(|d| d.description.info).collect())
+            .map(|e| e.devices().iter().map(KnownDevice::from).collect())
             .unwrap_or_default();
         let view = scan_view(&report, &devices);
         state.set_last_scan(report);
@@ -429,7 +429,10 @@ pub async fn stop_service<R: Runtime>(
 /// The Settings page's data.
 #[tauri::command]
 pub async fn get_settings<R: Runtime>(app: AppHandle<R>) -> Result<SettingsView, String> {
-    blocking(app, |_, state| Ok(SettingsView::of(&state.settings()))).await
+    blocking(app, |_, state| {
+        Ok(SettingsView::of(&state.settings(), state.settings_error()))
+    })
+    .await
 }
 
 /// Applies a partial settings change, saves it, and carries it over to the running app: frame rate and detector
@@ -465,7 +468,7 @@ pub async fn set_settings<R: Runtime>(
                 engine.rescan();
             }
         }
-        Ok(SettingsView::of(&state.settings()))
+        Ok(SettingsView::of(&state.settings(), state.settings_error()))
     })
     .await
 }
@@ -509,7 +512,8 @@ mod tests {
     #[test]
     fn device_list_json_shape() {
         use cc_core::{
-            Bus, ColorMode, DeviceDescription, DeviceError, DeviceKind, Led, Mode, ModeCaps, Zone, ZoneKind,
+            Bus, ColorMode, DeviceDescription, DeviceError, DeviceInfo, DeviceKind, Led, Mode, ModeCaps,
+            Zone, ZoneKind,
         };
         use cc_engine::{DeviceSetting, DeviceStatus};
 
@@ -566,6 +570,7 @@ mod tests {
                     colors: vec![red, red],
                 }),
                 colors: vec![red, Rgb::BLACK],
+                family: "msi_mystic_light".into(),
             }],
             failures: vec![DetectFailure {
                 family: "wooting".into(),
@@ -602,6 +607,7 @@ mod tests {
             serde_json::json!({ "kind": "direct", "colors": ["#FF0000", "#FF0000"] })
         );
         assert_eq!(d["colors"], serde_json::json!(["#FF0000", "#000000"]));
+        assert_eq!(d["family"], serde_json::json!("msi_mystic_light"));
         assert_eq!(
             json["failures"][0]["error"],
             serde_json::json!({ "Transport": "busy" })

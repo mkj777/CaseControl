@@ -427,7 +427,10 @@ pub struct G560Controller {
     feature: u8,
     zones: Vec<ZoneInfo>,
     initial: Vec<ZoneEffectState>,
+    /// SetSWControl(1, 1) was acknowledged.
     claimed: bool,
+    /// A claim was attempted (acknowledged or not): release() must run.
+    touched: bool,
     sent: Vec<Option<Rgb>>,
     active: Option<ModeState>,
 }
@@ -443,6 +446,7 @@ impl G560Controller {
             zones: probe.zones,
             initial: probe.initial,
             claimed: false,
+            touched: false,
             sent: vec![None; n],
             active: None,
         }
@@ -465,6 +469,9 @@ impl G560Controller {
 
     fn claim(&mut self) -> Result<(), DeviceError> {
         if !self.claimed {
+            // Marked before sending: a lost ack may still have left the device under software control, and
+            // release() must then hand it back.
+            self.touched = true;
             self.link.set_sw_control(self.feature, true)?;
             self.claimed = true;
         }
@@ -609,15 +616,19 @@ impl Controller for G560Controller {
 
     fn release(&mut self) -> Result<(), DeviceError> {
         // Shutdown: SetSWControl(0, 0) hands lighting back to the firmware effect. The G560 has no onboard-profile
-        // feature, and this driver never touches one.
-        if !self.claimed {
+        // feature, and this driver never touches one. Then each zone's open-time effect is replayed (volatile,
+        // persistence 0) where its GetEffect readback maps onto SetZoneEffect (`hidpp::restore_params`), so our
+        // volatile Static/effect writes do not linger.
+        if !self.touched {
             return Ok(());
         }
         self.link.set_sw_control(self.feature, false)?;
         self.claimed = false;
+        self.touched = false;
         self.sent.iter_mut().for_each(|s| *s = None);
         self.active = None;
-        Ok(())
+        self.link
+            .restore_effects(self.feature, &self.zones, &self.initial)
     }
 }
 
@@ -659,7 +670,15 @@ pub(crate) mod tests {
                 );
             }
         }
-        b = rr(b, FEAT, fp8070::GET_EFFECT, &[0], &[0, 7, 1]);
+        // Zone 0 readback: Breathing (index 2) in SetZoneEffect shape, with a set persistence byte that the
+        // restore must clear.
+        b = rr(
+            b,
+            FEAT,
+            fp8070::GET_EFFECT,
+            &[0],
+            &[0, 2, 1, 2, 3, 0x13, 0x88, 0, 50, 0, 0, 0, 1],
+        );
         // Zone 1 readback rejected by the device: kept as None, not an error.
         b.write(long_request(DEV, FEAT, fp8070::GET_EFFECT, &[1]).to_vec())
             .read(vec![0x11, DEV, 0xFF, FEAT, 0xE7, 0x02])
@@ -686,6 +705,15 @@ pub(crate) mod tests {
 
     fn ack(function: u8) -> Vec<u8> {
         long_reply(DEV, FEAT, function, &[])
+    }
+
+    /// Release tail after SetSWControl(0, 0): zone 0's readback replayed with persistence 0; zone 1 (readback
+    /// rejected at open) is skipped.
+    fn restore(b: ScriptBuilder) -> ScriptBuilder {
+        b.write(set_effect([
+            0, 2, 1, 2, 3, 0x13, 0x88, 0, 50, 0, 0, 0, 0, 0, 0, 0,
+        ]))
+        .read(ack(fp8070::SET_EFFECT))
     }
 
     fn claim(b: ScriptBuilder, on: bool) -> ScriptBuilder {
@@ -720,7 +748,7 @@ pub(crate) mod tests {
                 .caps
                 .contains(ModeCaps::SPEED | ModeCaps::BRIGHTNESS | ModeCaps::SAVE_MANUAL)
         );
-        assert_eq!(c.initial_state()[0].raw.map(|r| r[1]), Some(7));
+        assert_eq!(c.initial_state()[0].raw.map(|r| r[1]), Some(2));
         assert_eq!(c.initial_state()[1].raw, None);
         assert!(!c.is_claimed());
         fake.finish().expect("script consumed");
@@ -869,7 +897,7 @@ pub(crate) mod tests {
         };
         let mut s = frame(claim(ScriptBuilder::new(), true));
         // release: SetSWControl(0, 0) = 11 FF 04 87 00 00 ...
-        s = claim(s, false);
+        s = restore(claim(s, false));
         // set_direct after release: claim again and repaint everything (the cache was dropped).
         s = frame(claim(s, true));
         let (mut c, fake) = controller(s);
@@ -878,6 +906,21 @@ pub(crate) mod tests {
         c.release().expect("second release is a no-op");
         assert!(!c.is_claimed());
         c.set_direct(&[red, red]).expect("frame after release");
+        fake.finish().expect("script consumed");
+    }
+
+    #[test]
+    fn lost_claim_ack_still_releases() {
+        // SetSWControl(1, 1) goes out but its reply is lost: set_direct fails, release still hands control back.
+        let s = ScriptBuilder::new()
+            .write(long_request(DEV, FEAT, fp8070::SET_SW_CTL, &[1, 1]).to_vec())
+            .read_timeout();
+        let s = restore(claim(s, false));
+        let (mut c, fake) = controller(s);
+        assert_eq!(c.set_direct(&[Rgb::BLACK, Rgb::BLACK]), Err(DeviceError::Timeout));
+        assert!(!c.is_claimed());
+        c.release().expect("release");
+        c.release().expect("second release is a no-op");
         fake.finish().expect("script consumed");
     }
 

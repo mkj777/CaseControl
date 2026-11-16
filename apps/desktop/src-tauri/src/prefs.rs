@@ -23,11 +23,13 @@ pub struct SettingsView {
     pub check_openrgb_port: bool,
     /// Profile applied last (re-applied on start).
     pub last_profile: Option<String>,
+    /// Why settings are not saved this session, if they are not (shown as a notice).
+    pub save_error: Option<String>,
 }
 
 impl SettingsView {
-    /// The view of `settings`.
-    pub fn of(settings: &Settings) -> Self {
+    /// The view of `settings`; `save_error` says why changes cannot be saved, if they cannot.
+    pub fn of(settings: &Settings, save_error: Option<String>) -> Self {
         Self {
             autostart: settings.autostart,
             start_minimized: settings.start_minimized,
@@ -38,6 +40,7 @@ impl SettingsView {
                 .collect(),
             check_openrgb_port: settings.conflicts.check_openrgb_port,
             last_profile: settings.last_profile.clone(),
+            save_error,
         }
     }
 }
@@ -151,7 +154,7 @@ mod tests {
     fn view_lists_every_family() {
         let mut s = Settings::default();
         s.detectors.insert(family::LOGITECH.into(), false);
-        let v = SettingsView::of(&s);
+        let v = SettingsView::of(&s, None);
         assert_eq!(v.detectors.len(), family::ALL.len());
         assert!(!v.detectors[family::LOGITECH]);
         assert!(v.detectors[family::WOOTING]);
@@ -160,11 +163,13 @@ mod tests {
 
     #[test]
     fn view_serializes_to_frontend_shape() {
-        let json = serde_json::to_value(SettingsView::of(&Settings::default())).expect("serializes");
+        let json = serde_json::to_value(SettingsView::of(&Settings::default(), Some("x".into())))
+            .expect("serializes");
         assert_eq!(json["autostart"], serde_json::json!(false));
         assert_eq!(json["frame_rate"], serde_json::json!(30));
         assert_eq!(json["detectors"]["wooting"], serde_json::json!(true));
         assert_eq!(json["last_profile"], serde_json::Value::Null);
+        assert_eq!(json["save_error"], serde_json::json!("x"));
     }
 
     #[test]

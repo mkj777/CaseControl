@@ -29,6 +29,8 @@ pub struct Storage {
 pub struct AppState {
     storage: Result<Storage, String>,
     settings: Mutex<Settings>,
+    /// Set when settings must not be saved this session (unreadable file or no storage).
+    settings_error: Option<String>,
     engine: Result<EngineHandle, String>,
     last_scan: Mutex<Option<ScanReport>>,
     shut_down: AtomicBool,
@@ -49,14 +51,26 @@ impl AppState {
             },
             None => Err("cannot determine the user's AppData folders".to_owned()),
         };
-        let settings = match &storage {
-            Ok(s) => Settings::load(&s.paths).unwrap_or_else(|err| {
-                tracing::error!(%err, "cannot read settings; using defaults");
-                Settings::default()
-            }),
+        let (settings, settings_error) = match &storage {
+            Ok(s) => match Settings::load(&s.paths) {
+                Ok(settings) => (settings, None),
+                Err(err) => {
+                    // The file exists but cannot be read: never overwrite it with defaults this session.
+                    tracing::error!(%err, "cannot read settings; using defaults and not saving settings this session");
+                    (
+                        Settings::default(),
+                        Some(format!(
+                            "The settings file could not be read ({err}). CaseControl runs with default settings                              and will not save settings until it is restarted."
+                        )),
+                    )
+                }
+            },
             Err(err) => {
                 tracing::error!(%err, "no storage; settings and profiles will not be saved");
-                Settings::default()
+                (
+                    Settings::default(),
+                    Some(format!("Settings cannot be saved: {err}")),
+                )
             }
         };
         let engine = cc_engine::start(engine_config(&settings), cc_drivers::all_backends()).map_err(|err| {
@@ -66,6 +80,7 @@ impl AppState {
         Self {
             storage,
             settings: Mutex::new(settings),
+            settings_error,
             engine,
             last_scan: Mutex::new(None),
             shut_down: AtomicBool::new(false),
@@ -116,12 +131,21 @@ impl AppState {
         self.settings.lock()
     }
 
+    /// Why settings are not saved this session, if they are not.
+    pub fn settings_error(&self) -> Option<String> {
+        self.settings_error.clone()
+    }
+
     /// Runs `change` on a copy of the settings and saves the copy; the in-memory settings only change if both
-    /// succeed. Holds the settings lock throughout, so concurrent updates do not lose each other's changes.
+    /// succeed. Holds the settings lock throughout, so concurrent updates do not lose each other's changes. Refused
+    /// while [`settings_error`](Self::settings_error) is set, so an unreadable config is never overwritten.
     pub fn update_settings<T>(
         &self,
         change: impl FnOnce(&mut Settings) -> Result<T, String>,
     ) -> Result<T, String> {
+        if let Some(err) = &self.settings_error {
+            return Err(err.clone());
+        }
         let storage = self.storage()?;
         let mut guard = self.settings.lock();
         let mut next = guard.clone();
