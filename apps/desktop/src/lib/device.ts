@@ -130,6 +130,32 @@ export function matrixCells(zone: Zone): { width: number; cells: MatrixCell[] } 
   }
 }
 
+/** Indices of the zones whose names are in `names` (hidden zones). */
+export function zoneIndicesNamed(desc: DeviceDescription, names: readonly string[]): Set<number> {
+  const wanted = new Set(names)
+  const out = new Set<number>()
+  desc.zones.forEach((z, i) => {
+    if (wanted.has(z.name)) out.add(i)
+  })
+  return out
+}
+
+/** Device-buffer LED indices of the zones in `zones`. */
+export function ledsOfZones(desc: DeviceDescription, zones: ReadonlySet<number>): Set<number> {
+  const out = new Set<number>()
+  desc.zones.forEach((z, i) => {
+    if (!zones.has(i)) return
+    for (let led = z.start; led < z.start + z.len; led++) out.add(led)
+  })
+  return out
+}
+
+/** Device-buffer LED indices outside the zones in `hiddenZones`, in order. */
+export function visibleLeds(desc: DeviceDescription, hiddenZones: ReadonlySet<number>): number[] {
+  const hidden = ledsOfZones(desc, hiddenZones)
+  return desc.leds.map((_, i) => i).filter((i) => !hidden.has(i))
+}
+
 /** Readable text of a driver error. */
 export function deviceErrorText(e: DeviceError): string {
   if (e === 'Unsupported') return 'Not supported by this device'

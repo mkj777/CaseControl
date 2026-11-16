@@ -14,6 +14,8 @@ const COMMANDS: &[&str] = &[
     "release_device",
     "release_all",
     "rescan",
+    "set_device_hidden",
+    "set_zone_hidden",
     "list_profiles",
     "save_profile",
     "apply_profile",

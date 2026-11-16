@@ -222,10 +222,20 @@ export interface AppInfo {
   profile: 'debug' | 'release'
 }
 
+/** What the user hid of one device (ADR 0001 #26). */
+export interface HiddenEntry {
+  /** The whole device is hidden (not controlled). */
+  device: boolean
+  /** Names of the hidden zones (kept black in direct colour). */
+  zones: string[]
+}
+
 export interface DeviceList {
   devices: DeviceView[]
   failures: DetectFailure[]
   engine_error: string | null
+  /** Devices with something hidden, by id; devices with nothing hidden are absent. */
+  hidden: Record<DeviceId, HiddenEntry>
 }
 
 export interface ReleaseResult {
@@ -275,6 +285,10 @@ export const saveToHardware = (id: DeviceId) => invoke<void>('save_to_hardware',
 export const releaseDevice = (id: DeviceId) => invoke<void>('release_device', { id })
 export const releaseAll = () => invoke<ReleaseResult[]>('release_all')
 export const rescan = () => invoke<DeviceList>('rescan')
+export const setDeviceHidden = (id: DeviceId, hidden: boolean) =>
+  invoke<DeviceList>('set_device_hidden', { id, hidden })
+export const setZoneHidden = (id: DeviceId, zoneName: string, hidden: boolean) =>
+  invoke<DeviceList>('set_zone_hidden', { id, zoneName, hidden })
 
 export const listProfiles = () => invoke<ProfileList>('list_profiles')
 export const saveProfile = (name: string) => invoke<ProfileList>('save_profile', { name })

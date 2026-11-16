@@ -3,6 +3,7 @@
 // device".
 
 import type { Zone } from '../ipc'
+import { BLACK } from './color'
 
 export type Selection = ReadonlySet<number>
 
@@ -63,10 +64,26 @@ export function clampSelection(sel: Selection, ledCount: number): Selection {
   return new Set([...sel].filter((i) => i >= 0 && i < ledCount))
 }
 
-/** The buffer with `color` written to the selected LEDs, or to every LED when nothing is selected. */
-export function paint(colors: readonly string[], sel: Selection, color: string): string[] {
-  if (sel.size === 0) return colors.map(() => color)
-  return colors.map((c, i) => (sel.has(i) ? color : c))
+/**
+ * The buffer with `color` written to the selected LEDs. When nothing is selected, it goes to the LEDs in `scope`
+ * (the visible ones), or to every LED when there is no scope.
+ */
+export function paint(colors: readonly string[], sel: Selection, color: string, scope?: Selection): string[] {
+  const target = sel.size > 0 ? sel : scope
+  if (!target) return colors.map(() => color)
+  return colors.map((c, i) => (target.has(i) ? color : c))
+}
+
+/** The buffer with the LEDs in `off` set to black (hidden zones). */
+export function blackOut(colors: readonly string[], off: Selection): string[] {
+  if (off.size === 0) return [...colors]
+  return colors.map((c, i) => (off.has(i) ? BLACK : c))
+}
+
+/** The selection without the LEDs in `drop`; the same object when nothing changes. */
+export function without(sel: Selection, drop: Selection): Selection {
+  if (![...sel].some((i) => drop.has(i))) return sel
+  return new Set([...sel].filter((i) => !drop.has(i)))
 }
 
 /** The colour the picker starts from: the first selected LED's, or the first LED's when nothing is selected. */

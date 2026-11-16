@@ -1,6 +1,6 @@
 //! Application settings (`config.toml`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cc_core::DeviceId;
@@ -76,6 +76,13 @@ pub struct ConflictSettings {
 pub struct DeviceOverrides {
     /// LED count per resizable zone, keyed by zone name (names are stable, indices are not guaranteed to be).
     pub zone_sizes: BTreeMap<String, usize>,
+    /// The user hid this device: the app does not control it (ADR 0001 #26). Written only when `true`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+    /// Names of the zones the user hid; they are kept black in direct colour (ADR 0001 #26). Written only when
+    /// not empty.
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub hidden_zones: BTreeSet<String>,
     /// Unknown keys of this device's table.
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -196,7 +203,16 @@ mod tests {
         let mut ov = DeviceOverrides::default();
         ov.zone_sizes.insert("JRAINBOW1".into(), 60);
         ov.zone_sizes.insert("JRAINBOW2".into(), 8);
+        ov.hidden_zones.insert("JRGB1".into());
+        ov.hidden_zones.insert("JRAINBOW2".into());
         s.devices.insert(DeviceId::hid(0x1462, 0x7D75, None), ov);
+        s.devices.insert(
+            DeviceId::hid(0x046D, 0xC33C, None),
+            DeviceOverrides {
+                hidden: true,
+                ..DeviceOverrides::default()
+            },
+        );
         s
     }
 
@@ -270,6 +286,86 @@ mod tests {
 
         let again = Settings::from_toml(&s.to_toml().expect("serialize")).expect("reparse");
         assert_eq!(again, s);
+    }
+
+    #[test]
+    fn hidden_flags_round_trip() {
+        let s = full_settings();
+        let text = s.to_toml().expect("serialize");
+        assert!(text.contains("hidden = true"), "{text}");
+        assert!(text.contains("hidden_zones = ["), "{text}");
+        let back = Settings::from_toml(&text).expect("parse");
+        let board = &back.devices[&DeviceId::hid(0x1462, 0x7D75, None)];
+        assert!(!board.hidden);
+        assert_eq!(
+            board.hidden_zones,
+            BTreeSet::from(["JRAINBOW2".to_owned(), "JRGB1".to_owned()])
+        );
+        assert!(back.devices[&DeviceId::hid(0x046D, 0xC33C, None)].hidden);
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn old_device_tables_load_without_hidden_flags() {
+        let text = "[devices.\"hid:1462:7d75\".zone_sizes]
+JRAINBOW1 = 30
+";
+        let s = Settings::from_toml(text).expect("parse");
+        let dev = &s.devices[&DeviceId::hid(0x1462, 0x7D75, None)];
+        assert!(!dev.hidden);
+        assert!(dev.hidden_zones.is_empty());
+        assert!(dev.extra.is_empty());
+    }
+
+    #[test]
+    fn unhidden_devices_write_no_hidden_keys() {
+        let mut s = Settings::default();
+        let mut ov = DeviceOverrides::default();
+        ov.zone_sizes.insert("JRAINBOW1".into(), 30);
+        s.devices.insert(DeviceId::hid(0x1462, 0x7D75, None), ov);
+        let text = s.to_toml().expect("serialize");
+        assert!(!text.contains("hidden"), "{text}");
+    }
+
+    #[test]
+    fn existing_file_with_device_table_stays_identical() {
+        let (_tmp, paths) = temp_paths();
+        let original = "autostart = false
+start_minimized = false
+frame_rate = 30
+
+[conflicts]
+                        check_openrgb_port = false
+
+[detectors]
+
+[devices.\"hid:1462:7d75\".zone_sizes]
+                        JRAINBOW1 = 30
+";
+        std::fs::write(paths.config_file(), original).expect("write");
+        Settings::load(&paths).expect("load").save(&paths).expect("save");
+        assert_eq!(
+            std::fs::read_to_string(paths.config_file()).expect("read"),
+            original
+        );
+    }
+
+    #[test]
+    fn unhiding_removes_the_keys_from_the_file() {
+        let (_tmp, paths) = temp_paths();
+        let id = DeviceId::hid(0x1462, 0x7D75, None);
+        let mut s = Settings::default();
+        let ov = s.devices.entry(id.clone()).or_default();
+        ov.hidden = true;
+        ov.hidden_zones.insert("JRGB1".into());
+        s.save(&paths).expect("save hidden");
+        let ov = s.devices.get_mut(&id).expect("device entry");
+        ov.hidden = false;
+        ov.hidden_zones.clear();
+        s.save(&paths).expect("save unhidden");
+        let text = std::fs::read_to_string(paths.config_file()).expect("read");
+        assert!(!text.contains("hidden"), "{text}");
+        assert_eq!(Settings::load(&paths).expect("reload"), s);
     }
 
     #[test]
