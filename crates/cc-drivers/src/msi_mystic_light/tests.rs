@@ -702,3 +702,54 @@ fn hardware_mode_keeps_header_counts() {
     c.set_mode(&state).expect("static");
     fake.finish().expect("script consumed");
 }
+
+#[test]
+fn hardware_mode_decodes_the_configuration_read_at_open() {
+    // JRGB1 (offset 1) runs Rainbow wave (26) at speed HIGH (2), brightness 7: flags (7 << 2) | 2 = 0x1E. Rainbow
+    // wave takes no colours.
+    let mut cfg = original();
+    cfg[1] = 26;
+    cfg[5] = 0x1E;
+    let fake = open_steps_with(FakeTransport::builder(), cfg).build();
+    let c = MysticLight185::open(Box::new(fake.clone()), &candidate(0x7D75, None)).expect("opens");
+    assert_eq!(
+        c.hardware_mode(),
+        Some(ModeState {
+            mode: 26,
+            speed: Some(2),
+            brightness: Some(7),
+            direction: None,
+            colors: vec![],
+        })
+    );
+    fake.finish().expect("script consumed");
+
+    // Static (1) at brightness 10: each zone's first colour (@2..5 for JRGB1, @135..138 for JRGB2 in mixed mode) on
+    // its LEDs; JRAINBOW1 gets 2 LEDs from its count byte (@41) and its colour from @32..35.
+    let mut cfg = original();
+    cfg[1] = 1;
+    cfg[5] = 10 << 2;
+    cfg[2..5].copy_from_slice(&[0xFF, 0, 0]);
+    cfg[135..138].copy_from_slice(&[0, 0xFF, 0]);
+    cfg[32..35].copy_from_slice(&[0, 0, 0xFF]);
+    cfg[41] = 2;
+    let fake = open_steps_with(FakeTransport::builder(), cfg).build();
+    let c = MysticLight185::open(Box::new(fake.clone()), &candidate(0x7D75, None)).expect("opens");
+    let (red, green, blue) = (Rgb::new(0xFF, 0, 0), Rgb::new(0, 0xFF, 0), Rgb::new(0, 0, 0xFF));
+    let state = c.hardware_mode().expect("static decodes");
+    assert_eq!(state.mode, 1);
+    assert_eq!(state.brightness, Some(10));
+    assert_eq!(state.speed, None, "Static has no speed");
+    assert_eq!(state.colors, vec![red, green, blue, blue]);
+    fake.finish().expect("script consumed");
+
+    // Left in per-LED mode (effect 0x25) or disabled (0): the colours are unknown, so nothing is reported.
+    for effect in [0x25, 0] {
+        let mut cfg = original();
+        cfg[1] = effect;
+        let fake = open_steps_with(FakeTransport::builder(), cfg).build();
+        let c = MysticLight185::open(Box::new(fake.clone()), &candidate(0x7D75, None)).expect("opens");
+        assert_eq!(c.hardware_mode(), None, "effect {effect}");
+        fake.finish().expect("script consumed");
+    }
+}

@@ -20,12 +20,15 @@ pub enum EngineEvent {
         /// What went wrong.
         error: String,
     },
-    /// A device's mode or parameters changed.
+    /// A device was taken under software control or handed back to its own lighting, or switched to a hardware
+    /// mode.
     DeviceStateChanged {
         /// The device.
         id: DeviceId,
-        /// The new state.
-        state: ModeState,
+        /// Whether CaseControl drives the device now (`false`: it shows its own lighting).
+        active: bool,
+        /// The hardware mode the device was switched to, when that was the change.
+        state: Option<ModeState>,
     },
 }
 
@@ -55,8 +58,14 @@ mod tests {
                 error: "device disconnected".into(),
             },
             EngineEvent::DeviceStateChanged {
+                id: id.clone(),
+                active: true,
+                state: Some(state.clone()),
+            },
+            EngineEvent::DeviceStateChanged {
                 id,
-                state: state.clone(),
+                active: false,
+                state: None,
             },
         ];
         for ev in events {

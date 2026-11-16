@@ -5,7 +5,7 @@
 //! zones set to black. Hardware modes act on the whole board and are left alone. The flags live in
 //! `cc_config::DeviceOverrides` (by device id and zone name); this module holds the pure functions over them.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use cc_config::{DeviceSetting, Settings};
 use cc_core::{DeviceDescription, DeviceId, Rgb};
@@ -35,6 +35,16 @@ pub fn hidden_view(settings: &Settings) -> BTreeMap<DeviceId, HiddenEntry> {
                 },
             )
         })
+        .collect()
+}
+
+/// The ids of every hidden device (the engine's excluded set: brightness and All off never take them over).
+pub fn hidden_devices(settings: &Settings) -> HashSet<DeviceId> {
+    settings
+        .devices
+        .iter()
+        .filter(|(_, ov)| ov.hidden)
+        .map(|(id, _)| id.clone())
         .collect()
 }
 

@@ -76,6 +76,60 @@ export function currentHardwareMode(view: DeviceView): number | null {
   return s.state.mode
 }
 
+/** The device's own lighting as far as it is known: its mode (unless that is the direct mode, whose colours say it
+ * all) and its per-LED colours (only for per-LED colour modes). */
+export function ownLighting(view: DeviceView): { mode: Mode | null; colors: string[] | null } {
+  const hw = view.hardware
+  if (!hw) return { mode: null, colors: null }
+  const mode = view.description.modes.find((m) => m.id === hw.mode) ?? null
+  const perLed = mode?.color_mode === 'PerLed' && hw.colors.length === view.description.leds.length
+  return {
+    mode: mode && mode.id !== view.description.direct_mode ? mode : null,
+    colors: perLed ? hw.colors : null,
+  }
+}
+
+/**
+ * What the LEDs show, for the previews: the device's colours while CaseControl drives it (black while All off holds
+ * it dark), its own per-LED colours while released, and `null` when that is unknown (the preview then draws empty
+ * LEDs instead of made-up colours).
+ */
+export function shownColors(view: DeviceView, allOff: boolean): readonly string[] | null {
+  if (view.status.state === 'active') return allOff ? view.colors.map(() => BLACK) : view.colors
+  if (view.status.state === 'released') return ownLighting(view).colors
+  return view.colors
+}
+
+/** One line about what the device shows, for its tile: "All off", the own mode's name while released, the hardware
+ * mode's name while driven in one; `null` when the preview says it already (direct colours, unknown lighting). */
+export function lightingLabel(view: DeviceView, allOff: boolean): string | null {
+  if (view.status.state === 'active') {
+    if (allOff) return 'All off'
+    const id = currentHardwareMode(view)
+    return id === null ? null : (view.description.modes.find((m) => m.id === id)?.name ?? null)
+  }
+  if (view.status.state === 'released') return ownLighting(view).mode?.name ?? null
+  return null
+}
+
+/**
+ * The mode a brightness change acts on: the hardware mode the device is driven with, or for a released device the
+ * mode it would be taken over with (its last setting, else its own lighting). `null` for direct colours, which are
+ * always dimmed.
+ */
+export function brightnessMode(view: DeviceView): Mode | null {
+  const s = view.setting
+  const id = s?.kind === 'mode' ? s.state.mode : s ? null : (view.hardware?.mode ?? null)
+  if (id === null || id === view.description.direct_mode) return null
+  return view.description.modes.find((m) => m.id === id) ?? null
+}
+
+/** Whether a brightness change has anything to act on: the device is driven, has a setting, or its own lighting is
+ * known. Otherwise it keeps its own lighting and the slider is disabled. */
+export function canDim(view: DeviceView): boolean {
+  return view.status.state === 'active' || view.setting !== null || view.hardware !== null
+}
+
 /** Whether any mode can be saved to the device's flash on request. */
 export function canSaveToHardware(desc: DeviceDescription): boolean {
   return desc.modes.some((m) => hasCap(m, 'SAVE_MANUAL'))

@@ -12,8 +12,8 @@ use cc_core::{
 };
 
 use super::hidpp::{
-    EffectInfo, Link, PAGE_COLOR_LED_EFFECTS, PAGE_DEVICE_NAME_TYPE, PAGE_FEATURE_SET, ZoneEffectState,
-    ZoneInfo, effect,
+    DecodedEffect, EffectInfo, Link, PAGE_COLOR_LED_EFFECTS, PAGE_DEVICE_NAME_TYPE, PAGE_FEATURE_SET,
+    ZoneEffectState, ZoneInfo, effect,
 };
 
 /// G560 product id.
@@ -118,6 +118,87 @@ pub fn device_kind(device_type: u8) -> DeviceKind {
 
 /// Builds the 16 SetZoneEffect parameter bytes (`SetZoneEffect` in the HID++ 2.0 controller): zone, effect index,
 /// 10 effect parameter bytes laid out per effect type, persistence at byte 12.
+/// Inverse of [`slider_to_period`]: the speed slider value for `period` (clamped to the range), rounded.
+pub fn period_to_slider(period: u16, min_ms: u16, max_ms: u16) -> u32 {
+    let p = period.clamp(min_ms, max_ms);
+    let range = u32::from(max_ms - min_ms).max(1);
+    let steps = SPEED_MAX - SPEED_MIN;
+    SPEED_MIN + (u32::from(max_ms - p) * steps + range / 2) / range
+}
+
+/// Inverse of [`wave_direction`].
+pub fn direction_from_code(code: u8) -> Option<Direction> {
+    match code {
+        6 => Some(Direction::Left),
+        1 => Some(Direction::Right),
+        7 => Some(Direction::Up),
+        2 => Some(Direction::Down),
+        3 => Some(Direction::Horizontal),
+        8 => Some(Direction::Vertical),
+        _ => None,
+    }
+}
+
+/// The mode the device shows on its own, from each zone's open-time readback: the first zone whose readback decodes
+/// ([`decode_effect`](super::hidpp::decode_effect)) names the mode (its effect index, or "Off"), speed, brightness
+/// and direction; per-LED colours come from every zone (black where a zone's readback has none). `None` when no
+/// zone decodes or the result is not a valid state of `desc`.
+pub fn hardware_state(
+    desc: &DeviceDescription,
+    zones: &[ZoneInfo],
+    initial: &[ZoneEffectState],
+) -> Option<ModeState> {
+    let decoded: Vec<Option<DecodedEffect>> = zones
+        .iter()
+        .map(|z| {
+            initial
+                .iter()
+                .find(|s| s.zone == z.index)
+                .and_then(|s| super::hidpp::decode_effect(s, z))
+        })
+        .collect();
+    let first = decoded.iter().flatten().next()?;
+    let id = if first.effect.id == effect::OFF {
+        OFF_MODE
+    } else {
+        u32::from(first.effect.index)
+    };
+    let mode = desc.mode(id).filter(|_| desc.direct_mode != Some(id))?;
+    let has = |c| mode.caps.contains(c);
+    let speed = first.period.filter(|_| has(ModeCaps::SPEED)).map(|p| {
+        if matches!(first.effect.id, effect::RIPPLE | effect::RIPPLE_SAT) {
+            period_to_slider(p, RIPPLE_PERIOD_MIN_MS, RIPPLE_PERIOD_MAX_MS)
+        } else {
+            period_to_slider(p, PERIOD_MIN_MS, PERIOD_MAX_MS)
+        }
+    });
+    let brightness = first
+        .brightness
+        .zip(mode.brightness.clone())
+        .filter(|_| has(ModeCaps::BRIGHTNESS))
+        .map(|(b, r)| u32::from(b).clamp(*r.start(), *r.end()));
+    let direction = first
+        .direction
+        .and_then(direction_from_code)
+        .filter(|d| has(d.required_cap()));
+    let colors = match mode.color_mode {
+        ColorMode::PerLed => decoded
+            .iter()
+            .map(|d| d.and_then(|d| d.color).unwrap_or(Rgb::BLACK))
+            .collect(),
+        ColorMode::ModeSpecific => vec![first.color.unwrap_or(Rgb::BLACK)],
+        ColorMode::None | ColorMode::Random => Vec::new(),
+    };
+    let state = ModeState {
+        mode: id,
+        speed,
+        brightness,
+        direction,
+        colors,
+    };
+    desc.validate_state(&state).is_ok().then_some(state)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn effect_params(
     zone: u8,
@@ -630,6 +711,11 @@ impl Controller for G560Controller {
         self.link
             .restore_effects(self.feature, &self.zones, &self.initial)
     }
+
+    /// The open-time readback, which is also what `release()` replays.
+    fn hardware_mode(&self) -> Option<ModeState> {
+        hardware_state(&self.desc, &self.zones, &self.initial)
+    }
 }
 
 #[cfg(test)]
@@ -751,6 +837,46 @@ pub(crate) mod tests {
         assert_eq!(c.initial_state()[0].raw.map(|r| r[1]), Some(2));
         assert_eq!(c.initial_state()[1].raw, None);
         assert!(!c.is_claimed());
+        fake.finish().expect("script consumed");
+    }
+
+    #[test]
+    fn hardware_mode_from_the_open_time_readback() {
+        // Zone 0 read back Breathing (index 2), colour 01 02 03, period 5000 ms, brightness 50; zone 1's readback
+        // was rejected, so its LED is black. Speed: 1 + ((20000 - 5000) * 99 + 9500) / 19000 = 79.
+        let (c, fake) = controller(ScriptBuilder::new());
+        assert_eq!(
+            c.hardware_mode(),
+            Some(ModeState {
+                mode: 2,
+                speed: Some(79),
+                brightness: Some(50),
+                direction: None,
+                colors: vec![Rgb::new(1, 2, 3), Rgb::BLACK],
+            })
+        );
+        assert_eq!(
+            period_to_slider(PERIOD_MAX_MS, PERIOD_MIN_MS, PERIOD_MAX_MS),
+            SPEED_MIN
+        );
+        assert_eq!(
+            period_to_slider(PERIOD_MIN_MS, PERIOD_MIN_MS, PERIOD_MAX_MS),
+            SPEED_MAX
+        );
+        for slider in [1, 40, 79, 100] {
+            let p = slider_to_period(slider, PERIOD_MIN_MS, PERIOD_MAX_MS);
+            assert_eq!(period_to_slider(p, PERIOD_MIN_MS, PERIOD_MAX_MS), slider);
+        }
+        for d in [
+            Direction::Left,
+            Direction::Right,
+            Direction::Up,
+            Direction::Down,
+            Direction::Horizontal,
+            Direction::Vertical,
+        ] {
+            assert_eq!(direction_from_code(wave_direction(Some(d))), Some(d));
+        }
         fake.finish().expect("script consumed");
     }
 

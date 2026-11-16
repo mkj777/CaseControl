@@ -87,17 +87,17 @@ const hintNames = computed(() => {
   border-right: 1px solid var(--border);
 }
 
-/* The app name sits in the sidebar's part of the title strip: exactly as high as the content's title strip
-   (--titlebar-height), so both strips form one band with the window controls, and inset by --space-6, the same
-   inset as the nav item text below (sidebar --space-3 + item --space-3). */
+/* The app name sits below the window's top edge with room above it (--space-8; it does not have to line up with the
+   content's title strip), inset by --space-6 like the nav item text below (sidebar --space-3 + item --space-3).
+   All sizes are tokens in px, so the proportions hold at every display scaling. */
 .brand {
   display: flex;
   align-items: center;
   flex: none;
-  height: var(--titlebar-height);
-  /* Reach the sidebar's edges so the whole strip drags the window. */
+  min-height: var(--control-height);
+  /* Reach the sidebar's edges so the whole block, including the space above, drags the window. */
   margin: 0 calc(-1 * var(--space-3));
-  padding: 0 var(--space-6);
+  padding: var(--space-8) var(--space-6) 0;
   font-size: var(--text-lg);
   font-weight: var(--weight-strong);
 }

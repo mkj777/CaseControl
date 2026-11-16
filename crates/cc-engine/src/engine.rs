@@ -54,9 +54,12 @@ pub struct EngineConfig {
     pub master_brightness: u8,
     /// Device brightness in percent per device; a device without an entry has 100.
     pub brightness: BTreeMap<DeviceId, u8>,
-    /// Start with All off: every device the engine is given a setting for goes straight to black (no fade); the
-    /// settings are stored but not shown until [`EngineHandle::set_all_off`]`(false)`.
+    /// Start with All off: every device goes straight to black (no fade) when it is detected or given a setting;
+    /// the settings are stored but not shown until [`EngineHandle::set_all_off`]`(false)`.
     pub all_off: bool,
+    /// Devices that brightness and All off changes never take over (the app's hidden devices); see
+    /// [`EngineHandle::set_excluded`].
+    pub excluded: HashSet<DeviceId>,
 }
 
 impl Default for EngineConfig {
@@ -70,6 +73,7 @@ impl Default for EngineConfig {
             master_brightness: FULL,
             brightness: BTreeMap::new(),
             all_off: false,
+            excluded: HashSet::new(),
         }
     }
 }
@@ -82,6 +86,8 @@ struct Slot {
     status: DeviceStatus,
     setting: Option<DeviceSetting>,
     colors: Vec<Rgb>,
+    /// What the device shows on its own, as its driver read it (validated against the description).
+    hardware: Option<ModeState>,
     /// What the engine drives the device with (unscaled), or `None` while it does not drive it (never set, or
     /// released). Brightness and fade changes re-send only devices that have one.
     want: Option<Want>,
@@ -99,6 +105,7 @@ impl Slot {
             status: self.status.clone(),
             setting: self.setting.clone(),
             colors: self.colors.clone(),
+            hardware: self.hardware.clone(),
             family: self.family.clone(),
             brightness,
         }
@@ -114,13 +121,14 @@ impl Slot {
         }
     }
 
-    /// The unscaled setting the engine drives the device with, if it drives it.
+    /// The unscaled setting the engine drives the device with, if it drives it with one.
     fn wanted_setting(&self) -> Option<DeviceSetting> {
         match self.want.as_ref()? {
             Want::Direct => Some(DeviceSetting::Direct {
                 colors: self.colors.clone(),
             }),
             Want::Mode(state) => Some(DeviceSetting::Mode { state: state.clone() }),
+            Want::Off => None,
         }
     }
 
@@ -128,7 +136,41 @@ impl Slot {
     fn output(&self, levels: Levels) -> Option<Output> {
         self.want
             .as_ref()
-            .map(|want| lighting::output(&self.description, want, &self.colors, levels))
+            .and_then(|want| lighting::output(&self.description, want, &self.colors, levels))
+    }
+
+    fn is_faulted(&self) -> bool {
+        matches!(self.status, DeviceStatus::Faulted { .. })
+    }
+
+    /// Makes the engine drive an undriven device (ADR 0001 #33, phase 3 brief 05): with its last setting if it has
+    /// one, else with the mode it shows on its own (so nothing visibly changes until the levels do), else, only for
+    /// All off (`dark`), held dark without a setting. Returns whether the device is driven afterwards. A faulted
+    /// device is never taken.
+    fn take_over(&mut self, dark: bool) -> bool {
+        if self.want.is_some() {
+            return true;
+        }
+        if self.is_faulted() {
+            return false;
+        }
+        let led_count = self.description.led_count();
+        let want = match self.setting.clone().map(|s| s.fit_to(led_count)) {
+            Some(DeviceSetting::Direct { colors }) if self.description.direct_mode.is_some() => {
+                self.colors = colors;
+                Some(Want::Direct)
+            }
+            Some(DeviceSetting::Mode { state }) if self.description.validate_state(&state).is_ok() => {
+                Some(Want::Mode(state))
+            }
+            _ => match &self.hardware {
+                Some(hw) => Some(Want::Mode(hw.clone())),
+                None if dark && lighting::off_output(&self.description).is_some() => Some(Want::Off),
+                None => None,
+            },
+        };
+        self.want = want;
+        self.want.is_some()
     }
 
     /// Hands `output` to the worker as the latest frame (sequence `seq`). The setting is recorded by the worker once
@@ -148,6 +190,8 @@ struct State {
     removed: BTreeMap<DeviceId, (Instant, DeviceSetting)>,
     disabled_families: HashSet<String>,
     zone_sizes: BTreeMap<DeviceId, BTreeMap<String, usize>>,
+    /// Devices brightness and All off changes never take over.
+    excluded: HashSet<DeviceId>,
     /// Master brightness, percent.
     master: u8,
     /// Device brightness by id (entries of 100 are dropped).
@@ -175,6 +219,15 @@ impl State {
 
     fn view(&self, id: &DeviceId, slot: &Slot) -> DeviceView {
         slot.view(self.device_brightness(id))
+    }
+
+    /// Takes over every undriven device that is not excluded (see [`Slot::take_over`]).
+    fn take_over_all(&mut self, dark: bool) {
+        for (id, slot) in &mut self.devices {
+            if slot.want.is_none() && !self.excluded.contains(id) && slot.take_over(dark) {
+                debug!(%id, dark, "device taken over");
+            }
+        }
     }
 }
 
@@ -232,13 +285,34 @@ impl Shared {
         self.subscribers.lock().retain(|s| s.send(ev.clone()).is_ok());
     }
 
-    /// Called by a worker when its device's status changes. Ignored if the slot was replaced or removed meanwhile.
+    /// Called by a worker when its device's status changes (taken or released); emits `DeviceStateChanged` when it
+    /// did change. Ignored if the slot was replaced or removed meanwhile, or is faulted.
     pub(crate) fn set_status(&self, id: &DeviceId, generation: u64, status: DeviceStatus) {
+        let changed = {
+            let mut st = self.state.lock();
+            match st.devices.get_mut(id).filter(|s| s.generation == generation) {
+                Some(slot) if !slot.is_faulted() && slot.status != status => {
+                    slot.status = status.clone();
+                    true
+                }
+                _ => false,
+            }
+        };
+        if changed {
+            debug!(%id, ?status, "device status changed");
+            self.emit(EngineEvent::DeviceStateChanged {
+                id: id.clone(),
+                active: status == DeviceStatus::Active,
+                state: None,
+            });
+        }
+    }
+
+    /// Called by a worker with what its driver reads as the device's own lighting (after a release).
+    pub(crate) fn set_hardware(&self, id: &DeviceId, generation: u64, hardware: Option<ModeState>) {
         let mut st = self.state.lock();
-        if let Some(slot) = st.devices.get_mut(id).filter(|s| s.generation == generation)
-            && !matches!(slot.status, DeviceStatus::Faulted { .. })
-        {
-            slot.status = status;
+        if let Some(slot) = st.devices.get_mut(id).filter(|s| s.generation == generation) {
+            slot.hardware = hardware.filter(|h| slot.description.validate_state(h).is_ok());
         }
     }
 
@@ -255,7 +329,8 @@ impl Shared {
         if let (true, DeviceSetting::Mode { state }) = (event, setting) {
             self.emit(EngineEvent::DeviceStateChanged {
                 id: id.clone(),
-                state,
+                active: true,
+                state: Some(state),
             });
         }
     }
@@ -375,6 +450,7 @@ impl Shared {
         generation: u64,
         zone: usize,
         desc: DeviceDescription,
+        hardware: Option<ModeState>,
         dropped: bool,
     ) {
         let mut st = self.state.lock();
@@ -387,6 +463,7 @@ impl Shared {
             *c = remap_buffer(&slot.description, &desc, c);
         }
         let name = desc.zones.get(zone).map(|z| (z.name.clone(), z.len));
+        slot.hardware = hardware.filter(|h| desc.validate_state(h).is_ok());
         slot.description = desc;
         slot.colors = colors;
         if let Some((name, len)) = name {
@@ -517,6 +594,15 @@ impl Shared {
         }
 
         let description = ctrl.description().clone();
+        let hardware = ctrl
+            .hardware_mode()
+            .filter(|h| description.validate_state(h).is_ok());
+        // The colour buffer starts with what the device shows, where that is known per LED, so a first zone edit
+        // keeps the other zones as they are.
+        let colors = match &hardware {
+            Some(h) if h.colors.len() == description.led_count() => h.colors.clone(),
+            _ => vec![Rgb::BLACK; description.led_count()],
+        };
         let generation = this.next_generation.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = crossbeam_channel::bounded(COMMAND_CAPACITY);
         let frame: FrameSlot = Arc::default();
@@ -543,10 +629,11 @@ impl Shared {
         let slot = Slot {
             family,
             generation,
-            colors: vec![Rgb::BLACK; description.led_count()],
+            colors,
             description,
-            status: DeviceStatus::Active,
+            status: DeviceStatus::Released,
             setting: None,
+            hardware,
             want: None,
             resuming: false,
             frame,
@@ -583,10 +670,25 @@ impl Shared {
         }
         info!(%id, name = %info.name, "device added");
         this.emit(EngineEvent::DeviceAdded(info));
-        if let Some(setting) = pending
-            && let Err(e) = this.queue_setting(&id, setting)
-        {
-            warn!(%id, error = %e, "pending setting could not be applied");
+        match pending {
+            Some(setting) => {
+                if let Err(e) = this.queue_setting(&id, setting) {
+                    warn!(%id, error = %e, "pending setting could not be applied");
+                }
+            }
+            None => this.hold_dark_if_off(&id),
+        }
+    }
+
+    /// While All off is on, a device that appears (and is not excluded) is taken over and held dark like the others.
+    fn hold_dark_if_off(&self, id: &DeviceId) {
+        let mut st = self.state.lock();
+        if !st.off || st.excluded.contains(id) {
+            return;
+        }
+        if st.devices.get_mut(id).is_some_and(|s| s.take_over(true)) {
+            debug!(%id, "new device held dark (All off)");
+            self.refresh_locked(&mut st, Some(id));
         }
     }
 
@@ -908,6 +1010,11 @@ impl Shared {
         } else {
             st.brightness.insert(id.clone(), value);
         }
+        if !st.excluded.contains(id)
+            && let Some(slot) = st.devices.get_mut(id)
+        {
+            slot.take_over(false);
+        }
         self.refresh_locked(&mut st, Some(id));
         Ok(())
     }
@@ -927,6 +1034,7 @@ impl Shared {
         }
         let mut st = self.state.lock();
         st.master = value.min(FULL);
+        st.take_over_all(false);
         self.refresh_locked(&mut st, None);
     }
 
@@ -941,10 +1049,37 @@ impl Shared {
             }
             st.off = off;
             st.fade_gen += 1;
+            if off {
+                st.take_over_all(true);
+            } else {
+                this.hand_back_held_dark(&mut st);
+            }
             st.fade_gen
         };
         info!(off, "all off toggled");
         Self::start_fade(this, generation, if off { 0.0 } else { 1.0 });
+    }
+
+    /// All on: devices held dark without a setting ([`Want::Off`]) go back to their own lighting (released), since
+    /// there is nothing to fade them up to.
+    fn hand_back_held_dark(&self, st: &mut State) {
+        for (id, slot) in &mut st.devices {
+            if slot.want != Some(Want::Off) {
+                continue;
+            }
+            slot.want = None;
+            let seq = self.next_seq();
+            let (reply, _) = crossbeam_channel::bounded(1);
+            if slot.tx.try_send(Command::Release { seq, reply }).is_err() {
+                warn!(%id, "could not queue the release of a device held dark");
+            } else {
+                debug!(%id, "device held dark handed back (All on)");
+            }
+        }
+    }
+
+    fn set_excluded(&self, excluded: HashSet<DeviceId>) {
+        self.state.lock().excluded = excluded;
     }
 
     fn apply_one(&self, id: &DeviceId, setting: DeviceSetting) -> Result<(), EngineError> {
@@ -1299,6 +1434,7 @@ pub(crate) fn start_with(
             zone_sizes: cfg.zone_sizes,
             master: cfg.master_brightness.min(FULL),
             brightness: normalized_brightness(cfg.brightness),
+            excluded: cfg.excluded,
             off: cfg.all_off,
             fade: if cfg.all_off { 0.0 } else { 1.0 },
             fade_gen: 0,
@@ -1366,7 +1502,8 @@ impl EngineHandle {
         self.shared().set_zone(id, zone, colors)
     }
 
-    /// Switches to a hardware mode; waits for the device (3 s timeout) and emits `DeviceStateChanged`.
+    /// Switches to a hardware mode; waits for the device (3 s timeout) and emits `DeviceStateChanged` with the
+    /// state (a device that was not driven before also gets one for being taken).
     pub fn set_mode(&self, id: &DeviceId, state: ModeState) -> Result<(), EngineError> {
         self.shared().set_mode(id, state)
     }
@@ -1442,10 +1579,14 @@ impl EngineHandle {
             .collect()
     }
 
-    /// Sets device `id`'s brightness in percent (clamped to 100) and re-sends the device at the new level if the
-    /// engine drives it (ADR 0001 #33). Direct colours are scaled; in a hardware mode with a brightness parameter the
-    /// mode's brightness is scaled inside its range; other hardware modes are not affected. The stored colours and
-    /// mode stay unscaled. Coalesced like [`set_direct`](Self::set_direct).
+    /// Sets device `id`'s brightness in percent (clamped to 100) and sends the device at the new level (ADR 0001
+    /// #33). Direct colours are scaled; in a hardware mode with a brightness parameter the mode's brightness is scaled
+    /// inside its range; other hardware modes are not affected. The stored colours and mode stay unscaled. Coalesced
+    /// like [`set_direct`](Self::set_direct).
+    ///
+    /// Takes over a device the engine does not drive (never set, or released) unless it is excluded: with its last
+    /// setting, else with the mode it shows on its own (`DeviceView::hardware`). A device with neither keeps its
+    /// own lighting; the value is stored and applies once the device is driven.
     pub fn set_device_brightness(&self, id: &DeviceId, percent: u8) -> Result<(), EngineError> {
         self.shared().set_device_brightness(id, percent)
     }
@@ -1463,18 +1604,21 @@ impl EngineHandle {
     }
 
     /// Sets the master brightness in percent (clamped to 100), multiplied into every device, and re-sends the driven
-    /// devices.
+    /// devices. Undriven devices that are not excluded are taken over first, as by
+    /// [`set_device_brightness`](Self::set_device_brightness).
     pub fn set_master_brightness(&self, percent: u8) {
         self.shared().set_master_brightness(percent);
     }
 
-    /// All off (`true`) fades every device the engine drives (not released, with a setting) to black over 500 ms
-    /// and holds it there: direct colours are scaled down step by step; a hardware mode with a brightness parameter
-    /// is stepped down to its minimum, then switched to the device's "Off" mode if it has one, else to black in
-    /// direct mode. All on (`false`) fades back to the current settings, restoring a hardware mode at its lowest
-    /// brightness and stepping it up. Changes made while off are stored but not shown until on. A toggle during a
-    /// fade takes over from the current level (latest wins). Returns at once; the fade runs on its own thread.
-    /// Setting the current state again does nothing.
+    /// All off (`true`) first takes over every undriven device that is not excluded (its last setting, else the
+    /// mode it shows on its own, else held dark without a setting), then fades every driven device to black over
+    /// 500 ms and holds it there: direct colours are scaled down step by step; a hardware mode with a brightness
+    /// parameter is stepped down to its minimum, then switched to the device's "Off" mode if it has one, else to
+    /// black in direct mode. Devices detected while off are held dark too. All on (`false`) hands the devices held
+    /// dark without a setting back to their own lighting (released) and fades the others back to their settings,
+    /// restoring a hardware mode at its lowest brightness and stepping it up. Changes made while off are stored but
+    /// not shown until on. A toggle during a fade takes over from the current level (latest wins). Returns at once;
+    /// the fade runs on its own thread. Setting the current state again does nothing.
     pub fn set_all_off(&self, off: bool) {
         Shared::set_all_off(self.shared(), off);
     }
@@ -1486,6 +1630,12 @@ impl EngineHandle {
             master_brightness: st.master,
             all_off: st.off,
         }
+    }
+
+    /// Replaces the devices that brightness and All off changes never take over (the app's hidden devices). Devices
+    /// the engine already drives are not affected; release them separately.
+    pub fn set_excluded(&self, excluded: HashSet<DeviceId>) {
+        self.shared().set_excluded(excluded);
     }
 
     /// Changes the frame rate; clamped to `1..=60`. Takes effect with the next frame.

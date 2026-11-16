@@ -23,8 +23,8 @@ use crate::conflict_actions::{
 use crate::conflicts::ConflictScan;
 use crate::events::{self, CONFLICTS_UPDATED, DEVICES_CHANGED, PROFILES_CHANGED};
 use crate::hidden::{
-    HiddenEntry, hidden_device_error, hidden_view, hidden_zones, is_device_hidden, mask_hidden_zones,
-    zone_write,
+    HiddenEntry, hidden_device_error, hidden_devices, hidden_view, hidden_zones, is_device_hidden,
+    mask_hidden_zones, zone_write,
 };
 use crate::prefs::{
     SettingsPatch, SettingsView, apply_patch, clear_brightness_overrides, record_brightness, record_zone_size,
@@ -435,7 +435,8 @@ pub async fn set_all_off<R: Runtime>(app: AppHandle<R>, off: bool) -> Result<Lig
 }
 
 /// Hides or unhides a device (ADR 0001 #26) and saves that. Hiding releases the device to its own hardware mode;
-/// unhiding changes nothing on the hardware. Returns the new device list.
+/// unhiding changes nothing on the hardware. Either way the engine learns which devices brightness and All off must
+/// not take over. Returns the new device list.
 #[tauri::command]
 pub async fn set_device_hidden<R: Runtime>(
     app: AppHandle<R>,
@@ -448,15 +449,17 @@ pub async fn set_device_hidden<R: Runtime>(
             Ok(())
         })?;
         tracing::info!(%id, hidden, "device visibility changed");
-        if hidden
-            && let Ok(engine) = state.engine()
-            && engine
-                .device(&id)
-                .is_some_and(|v| v.status == DeviceStatus::Active)
-        {
-            engine
-                .release(&id)
-                .map_err(|err| format!("The device is hidden, but it could not be released: {err}"))?;
+        if let Ok(engine) = state.engine() {
+            engine.set_excluded(hidden_devices(&state.settings()));
+            if hidden
+                && engine
+                    .device(&id)
+                    .is_some_and(|v| v.status == DeviceStatus::Active)
+            {
+                engine
+                    .release(&id)
+                    .map_err(|err| format!("The device is hidden, but it could not be released: {err}"))?;
+            }
         }
         Ok(device_list_now(state))
     })
@@ -848,6 +851,13 @@ mod tests {
                     colors: vec![red, red],
                 }),
                 colors: vec![red, Rgb::BLACK],
+                hardware: Some(ModeState {
+                    mode: 0,
+                    speed: Some(1),
+                    brightness: None,
+                    direction: None,
+                    colors: vec![],
+                }),
                 family: "msi_mystic_light".into(),
                 brightness: 55,
             }],
@@ -901,6 +911,10 @@ mod tests {
             serde_json::json!({ "kind": "direct", "colors": ["#FF0000", "#FF0000"] })
         );
         assert_eq!(d["colors"], serde_json::json!(["#FF0000", "#000000"]));
+        assert_eq!(
+            d["hardware"],
+            serde_json::json!({ "mode": 0, "speed": 1, "brightness": null, "direction": null, "colors": [] })
+        );
         assert_eq!(d["family"], serde_json::json!("msi_mystic_light"));
         assert_eq!(d["brightness"], serde_json::json!(55));
         assert_eq!(

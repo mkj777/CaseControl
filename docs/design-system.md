@@ -133,7 +133,7 @@ The window is at least 860 x 560 (`tauri.conf.json`).
 │ CaseControl   │  (drag region)                   ─   □   ✕   │  32 px, --titlebar-height
 │               │                                              │
 │ Devices       │   Page title                      [Action]   │  page header
-│ Profiles      │   Description, max 60ch                      │
+│ Profiles      │   [Lighting controls]       [View actions]   │  toolbar row (optional)
 │ Conflicts     │                                              │  --space-10
 │ Settings      │   content                                    │
 │               │                                              │
@@ -171,7 +171,8 @@ unless noted.
 ### App shell, sidebar and title bar
 
 - **Anatomy:** grid of sidebar (`--sidebar-width`) and content. Sidebar: "CaseControl" at the top
-  (`--text-lg`, 600, in the drag region), then the nav. Content: a 32 px top strip that is a drag region, with
+  (`--text-lg`, 600, in the drag region) with `--space-8` above it, so it does not sit under the window edge (it
+  does not line up with the content's title strip), then the nav `--space-6` below. Content: a 32 px top strip that is a drag region, with
   minimise, maximise/restore and close at the top right, each `--window-button-width` x `--titlebar-height`.
 - **Nav item:** `--control-height`, padding `--space-3`, `--radius-md`, `--text-muted`. Hover and current:
   `--text` on `--surface-raised`. Current item also gets `aria-current="page"`. Text only, no icons.
@@ -184,24 +185,30 @@ unless noted.
 
 ### Page header
 
-- **Anatomy:** optional back link (`← Devices`, `--text-muted`, hover `--text`, `--space-6` below), h1, one
-  description line in `--text-muted` up to `--measure`, actions aligned to the top right (slot `actions`), and
-  optionally a row of lighting controls under the title (slot `controls`, `--space-6` above it). The controls row
-  wraps; its gap is `--space-4` between lines and `--space-8` between controls.
-- **Variants:** list page (title, description, actions), detail page (back link, title, metadata line
-  "Kind · Vendor", status badge next to the title). Either may have the controls row: the Devices page puts the
-  master Brightness, the All off switch and Release all there, a device page its device Brightness.
-- **Rules:** at most two actions, secondary style (Rescan, Scan). The primary action of a page is in its content,
-  not in the header. `--space-10` below. The controls row is the one exception to "at most two": it holds the
-  page-wide lighting controls that act at once (BrightnessSlider, compact Switch, a secondary Button), not page
-  actions, and nothing else goes there. It shows only together with a title.
+- **Anatomy:** optional back link (`← Devices`, `--text-muted`, hover `--text`, `--space-6` below), h1 with an
+  optional status badge next to it, at most one description line in `--text-muted` up to `--measure`, and the
+  view actions (slot `actions`) at the top right.
+- **Toolbar row:** a page with page-wide lighting controls (slot `controls`) gets one toolbar row under the title
+  (`--space-6` above it): the lighting controls grouped on the left, the view actions grouped on the right in the
+  same row instead of next to the title. Gap `--space-6` inside a group, `--space-8` between the groups; the row
+  wraps only when the window is too narrow. The Devices page: Brightness, All off, Release all | Show hidden,
+  Rescan. A device page: Brightness | Show hidden.
+- **Variants:** list page (title, optional description, actions), detail page (back link, title, status badge).
+  There is no metadata line under the title; facts such as kind and vendor go into the page's key-value list.
+- **Rules:** at most two actions, secondary style (Rescan, Scan, the compact Show hidden switch). The primary
+  action of a page is in its content, not in the header. `--space-10` below. The toolbar's lighting group holds
+  only controls that act at once (BrightnessSlider, compact Switch, a secondary Button). A description is there only
+  when the title alone does not say what the page is for (Conflicts); never one that restates the title or the
+  controls ("Choose a device to set its colours", "Changes are saved right away").
 
 ### Card and tile
 
 - **Card** (static container): `--surface`, 1 px `--border`, `--radius-lg`, padding `--space-6`, content gap
   `--space-4`. Used for conflict findings, the preview stage (padding `--space-10`), the dialog body.
 - **Tile** (a card that is a link): same look, `min-height` 220 px, whole tile is the link target. Head (name
-  `--text-lg` 600, metadata `--text-sm` muted, status badge right), compact preview pinned to the bottom.
+  `--text-lg` 600, status badge right, optionally one `--text-sm` muted line about what the device shows: "All off",
+  the name of its own mode while released, the hardware mode it is driven with), compact preview pinned to the
+  bottom. No kind or vendor line: the name and the preview identify the device.
 - **States:** hover `--surface-raised` + `--border-strong`; focus ring; **hidden** (ADR #27, only when "Show
   hidden" is on): content at 45 % opacity, a "Hidden" badge, not a link, context menu still works.
 - **Rules:** cards are not nested. Stacked cards are `--space-4` apart, tiles in a grid `--space-6`. Right-click or
@@ -273,9 +280,14 @@ unless noted.
   flight (`latestSender`). When the drag ends it drops the queued live value, waits for the one in flight and sends
   the final value once more with `persist = true`, which is the one that gets saved. Until that send has finished
   it shows its own value, so a device refresh in between cannot pull the thumb back.
-- **States:** disabled (engine down, device locked, or a hardware mode without a brightness parameter; then the
-  hint says so: "This mode has no brightness setting."). A failed send is emitted as `error`; the page shows it as
-  an inline Notice.
+- **Layout:** the inline Field layout (label at its own width, slider `--toolbar-control-width`, readout), since it
+  always sits in a page toolbar.
+- **States:** disabled (engine down, device locked, a hardware mode without a brightness parameter: "This mode has
+  no brightness setting.", or a released device that has no setting and whose own lighting cannot be read, so
+  there is nothing to dim: "Set a colour or mode first."). A failed send is emitted as `error`; the page shows it
+  as an inline Notice.
+- **Takes over:** on a released device it takes control (with its last setting, else its own mode as read back),
+  like every lighting control.
 - **Rules:** every brightness control is this component (master brightness on the Devices page, device brightness
   on a device page), usually in the PageHeader `controls` row. The `send` callback decides what `persist` saves;
   the slider never saves on its own.
@@ -304,8 +316,9 @@ unless noted.
 
 ### Field
 
-- **Anatomy:** label (`--text-muted`), control, optional hint and inline error below. Two layouts: stacked
-  (label above) and row (label column 120 px, control column up to 320 px, value column 48 px).
+- **Anatomy:** label (`--text-muted`), control, optional hint and inline error below. Three layouts: stacked
+  (label above), row (label column 120 px, control column up to 320 px, value column 48 px) and inline (label at
+  its own width, control `--toolbar-control-width`, value at its own width; for a page toolbar).
 - **Wiring:** the default slot receives `id` (for the control, so the label's `for` works), `describedBy` (hint and
   error ids) and `invalid`. With `group`, the label names a `role="group"` instead of one control (colour chips,
   segmented control).
@@ -352,8 +365,8 @@ the meaning; colour is reserved for the states that need attention.
 
 | Status | Look |
 |---|---|
-| Active | `--text`, border `--border-strong` |
-| Released | `--text-muted`, border `--border-strong` |
+| Active (CaseControl drives the device, also while All off holds it dark) | `--text`, border `--border-strong` |
+| Released (the device shows its own lighting, also before CaseControl ever drove it) | `--text-muted`, border `--border-strong` |
 | Hidden | `--text-faint`, dashed border `--border-strong` |
 | Faulted | `--status-faulted` text and border |
 | Running (conflict) | `--warning` text and border |
@@ -362,6 +375,9 @@ the meaning; colour is reserved for the states that need attention.
 
 In code: `<StatusBadge status="…">label</StatusBadge>` with `active`, `released`, `hidden`, `faulted`, `running`,
 `not-running` (covers "Installed, not running" and "Not running") and `current` (active profile).
+
+A device badge always shows the engine's real status, which it reports with `device-state-changed`; the page never
+guesses it.
 
 Severity group headings on the Conflicts page stay headings, not badges.
 
@@ -409,14 +425,39 @@ The preview is the focus of the app (ADR #15), so it gets the most room and the 
 - **LED shapes:** linear zones are round dots, matrix zones are square keys (`--radius-sm`) on the device's grid,
   single zones are a rectangle (`--radius-md`). Sizes scale with the stage width (ADR #28) up to a cap: dot 28 px,
   key by grid, single 160 x 80 px. Compact preview on tiles: dot 8 px, key gap 2 px, single 32 x 16 px.
-- **Colour:** the fill is exactly the device colour. `#000000` is drawn as `--led-off`. Every LED has a 1 px
+- **Colour:** the fill is exactly what the device shows. `#000000` is drawn as `--led-off`. Every LED has a 1 px
   `--led-border`, so off LEDs stay visible. No transition on the fill (see Motion).
+- **What it shows:** while CaseControl drives the device, its colours; while All off holds it dark, every LED off;
+  while released, the device's own per-LED colours if its driver can read them, else **unknown**: no fill and a
+  dashed `--led-border`, so the layout shows without made-up colours. Never draw white or black for a colour that
+  is not known.
 - **Selection:** 2 px outline in `--selection` with 2 px offset. Hover on a selectable LED: border `--text-muted`.
 - **Zone names:** `--text-sm` ghost buttons above each zone; click selects the zone, Ctrl-click adds.
 - **Hidden zones** (Show hidden on): 45 % opacity, "Hidden" badge next to the zone name, not selectable.
 - **Selection controls** (All, None, count) sit above the stage (ADR #28), ghost buttons.
 - **Rules:** no labels, glows, reflections or device photos in the stage. Swatches and colour chips follow the same
   border and selection rules.
+
+## Device states
+
+- **Released** (the device shows its own lighting): badge "Released"; the tile line and the device view's mode menu
+  name its own mode when it can be read ("Own lighting (Rainbow wave)", else "Own lighting"); the preview shows its
+  own colours or unknown LEDs. Every control stays usable and takes the device over.
+- **All off:** the switch on the Devices page; every driven device's preview is dark, its tile line says "All off",
+  and its device view shows an `info` Notice "All lights are off." with a "Turn on" button.
+
+## Copy and filler
+
+- **No dot separators.** Never join facts with "·" (or "•", "|"). Show a secondary fact on its own line, as a row of
+  a key-value list, or drop it.
+- **No restating helper text.** No subtitle, hint or note that repeats what the title, the label or the visible
+  state already says ("Choose a device to set its colours and effects.", "Set how many LEDs are connected to each
+  header.", "Open in the tray without showing this window."). Keep a hint only when it adds a fact the control does
+  not show (a range, a side effect, a permission prompt, a non-obvious gesture).
+- **No confirmation notices for visible state.** When the result of an action is visible (a badge changes to
+  Released), no notice repeats it.
+- **No decorative bits.** No duplicate labels, ornaments or filler lines; controls that belong together sit in one
+  row (see the page toolbar), not scattered over several.
 
 ## Text selection
 

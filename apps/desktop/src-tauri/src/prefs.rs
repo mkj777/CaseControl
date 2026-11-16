@@ -160,7 +160,7 @@ pub fn start_brightness(last_profile: Option<&Profile>, settings: &Settings) -> 
 
 /// The engine configuration for `settings`: frame rate, disabled families, remembered zone sizes, master
 /// brightness, All off, the per-device brightness changes (the last profile's own map is laid underneath when it is
-/// re-applied), hot-plug and resume handling on.
+/// re-applied), the hidden devices (never taken over by brightness or All off), hot-plug and resume handling on.
 pub fn engine_config(settings: &Settings) -> EngineConfig {
     EngineConfig {
         frame_rate: settings
@@ -178,6 +178,7 @@ pub fn engine_config(settings: &Settings) -> EngineConfig {
         master_brightness: settings.master_brightness.min(FULL_BRIGHTNESS),
         brightness: start_brightness(None, settings),
         all_off: settings.all_off,
+        excluded: crate::hidden::hidden_devices(settings),
     }
 }
 

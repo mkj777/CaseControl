@@ -44,6 +44,15 @@ pub trait Controller: Send {
 
     /// Hands the device back to its firmware/hardware mode. Called on shutdown and on explicit "release".
     fn release(&mut self) -> Result<(), DeviceError>;
+
+    /// The lighting the device shows on its own (its hardware mode), as read from the device before software control
+    /// was taken, expressed as a state of one of the description's modes; `None` when the driver cannot read it or
+    /// cannot express it as a mode (the default). Must not do I/O: drivers return what they read when the device was
+    /// opened (or re-read when control was taken again). The engine shows it for a released device and adopts it as
+    /// the device's setting when a brightness or All off change takes over a device that has none, so nothing jumps.
+    fn hardware_mode(&self) -> Option<ModeState> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -117,6 +126,7 @@ pub(crate) mod tests {
         assert_eq!(c.resize_zone(1, 10), Err(DeviceError::Unsupported));
         assert_eq!(c.save_to_hardware(), Err(DeviceError::Unsupported));
         assert_eq!(c.keepalive(), Ok(()));
+        assert_eq!(c.hardware_mode(), None);
         assert_eq!(c.release(), Ok(()));
     }
 

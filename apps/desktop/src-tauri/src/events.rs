@@ -10,7 +10,8 @@ pub const DEVICE_ADDED: &str = "device-added";
 pub const DEVICE_REMOVED: &str = "device-removed";
 /// A device was taken out of service; payload: `{ id, error }`.
 pub const DEVICE_FAULTED: &str = "device-faulted";
-/// A device switched to a hardware mode; payload: `{ id, state: ModeState }`.
+/// A device was taken under control, handed back to its own lighting, or switched to a hardware mode; payload:
+/// `{ id, active, state: ModeState | null }`.
 pub const DEVICE_STATE_CHANGED: &str = "device-state-changed";
 /// Device colours or status changed through a path the frontend did not start (tray actions); no payload.
 pub const DEVICES_CHANGED: &str = "devices-changed";
@@ -28,9 +29,10 @@ pub fn engine_event(ev: &EngineEvent) -> (&'static str, Value) {
         EngineEvent::DeviceAdded(info) => (DEVICE_ADDED, json!(info)),
         EngineEvent::DeviceRemoved(id) => (DEVICE_REMOVED, json!({ "id": id })),
         EngineEvent::DeviceFaulted { id, error } => (DEVICE_FAULTED, json!({ "id": id, "error": error })),
-        EngineEvent::DeviceStateChanged { id, state } => {
-            (DEVICE_STATE_CHANGED, json!({ "id": id, "state": state }))
-        }
+        EngineEvent::DeviceStateChanged { id, active, state } => (
+            DEVICE_STATE_CHANGED,
+            json!({ "id": id, "active": active, "state": state }),
+        ),
     }
 }
 
@@ -104,9 +106,27 @@ mod tests {
             direction: None,
             colors: vec![],
         };
-        let (name, payload) = engine_event(&EngineEvent::DeviceStateChanged { id, state });
+        let (name, payload) = engine_event(&EngineEvent::DeviceStateChanged {
+            id: id.clone(),
+            active: true,
+            state: Some(state),
+        });
         assert_eq!(name, DEVICE_STATE_CHANGED);
+        assert_eq!(payload["active"], json!(true));
         assert_eq!(payload["state"]["brightness"], json!(50));
         assert_eq!(payload["state"]["direction"], Value::Null);
+
+        let (name, payload) = engine_event(&EngineEvent::DeviceStateChanged {
+            id,
+            active: false,
+            state: None,
+        });
+        assert_eq!(
+            (name, payload),
+            (
+                DEVICE_STATE_CHANGED,
+                json!({ "id": "hid:046d:0a78", "active": false, "state": null })
+            )
+        );
     }
 }

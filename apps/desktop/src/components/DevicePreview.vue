@@ -2,7 +2,8 @@
 // Draws a device's LEDs in their current colours: matrix zones as a key grid, linear zones as rows of dots,
 // single zones as one larger swatch. Everything scales with the width of the preview (ADR 0001 #28): dots and keys
 // grow with the space up to a cap, long rows wrap. In the device view it is also where LEDs are selected
-// (ADR 0001 #22) and where a right-click on a zone opens its menu (ADR 0001 #26).
+// (ADR 0001 #22) and where a right-click on a zone opens its menu (ADR 0001 #26). Without colours (`null`: a device
+// showing its own lighting that cannot be read back) the LEDs are drawn empty, never in made-up colours.
 import { computed, onBeforeUnmount, ref } from 'vue'
 import type { DeviceDescription, Zone } from '../ipc'
 import { BLACK } from '../lib/color'
@@ -13,7 +14,8 @@ import { Button, StatusBadge } from './ui'
 const props = withDefaults(
   defineProps<{
     description: DeviceDescription
-    colors: readonly string[]
+    /** One colour per LED, or `null` when what the device shows is unknown. */
+    colors: readonly string[] | null
     selection?: Selection
     /** LEDs can be selected (device view in static colour mode). */
     interactive?: boolean
@@ -56,7 +58,8 @@ const layout = computed<ZoneLayout[]>(() =>
 )
 
 /** The fill is exactly the device colour; an LED that is off is drawn as --led-off so it stays visible. */
-function color(led: number): string {
+function color(led: number): string | undefined {
+  if (props.colors === null) return undefined
   const c = props.colors[led] ?? BLACK
   return c.toUpperCase() === BLACK ? 'var(--led-off)' : c
 }
@@ -114,7 +117,7 @@ onBeforeUnmount(endSweep)
 </script>
 
 <template>
-  <div class="preview" :class="[variant, { interactive }]">
+  <div class="preview" :class="[variant, { interactive, unknown: colors === null }]">
     <div
       v-for="z in layout"
       :key="z.index"
@@ -243,6 +246,12 @@ onBeforeUnmount(endSweep)
 
 .led {
   border: 1px solid var(--led-border);
+}
+
+/* Unknown colours: an empty outline, so the layout shows without pretending a colour. */
+.unknown .led {
+  border-style: dashed;
+  background: none;
 }
 
 .interactive .zone:not(.hidden) .led {

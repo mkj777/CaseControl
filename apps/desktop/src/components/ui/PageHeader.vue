@@ -1,7 +1,9 @@
 <script setup lang="ts">
-// Page header (docs/design-system.md, "Page header"). List pages: title, description, actions (slot `actions`, at
-// most two, secondary). Detail pages: back link, title with a status badge (slot `badge`), metadata line. Slot
-// `controls` holds page-wide controls in a row under the title (brightness, All off; ADR 0001 #33).
+// Page header (docs/design-system.md, "Page header"). Title with an optional status badge (slot `badge`), back link
+// on detail pages, at most one description line. Slot `actions` holds the page's view actions (Rescan, Scan, Show
+// hidden). Slot `controls` holds page-wide lighting controls (brightness, All off, Release all; ADR 0001 #33): with
+// it the header gets one toolbar row under the title, lighting controls on the left and the actions on the right,
+// instead of putting the actions next to the title.
 import { RouterLink, type RouteLocationRaw } from 'vue-router'
 
 withDefaults(
@@ -9,11 +11,9 @@ withDefaults(
     /** Left out only when the page body is an EmptyState with its own h1 ("Device not found"). */
     title?: string
     description?: string
-    /** Metadata line under the title on detail pages ("Kind · Vendor"). */
-    meta?: string
     back?: { to: RouteLocationRaw; label: string }
   }>(),
-  { title: undefined, description: undefined, meta: undefined, back: undefined },
+  { title: undefined, description: undefined, back: undefined },
 )
 </script>
 
@@ -26,12 +26,14 @@ withDefaults(
           <h1>{{ title }}</h1>
           <slot name="badge" />
         </div>
-        <p v-if="meta" class="line">{{ meta }}</p>
         <p v-if="description" class="line">{{ description }}</p>
       </div>
-      <div v-if="$slots.actions" class="actions"><slot name="actions" /></div>
+      <div v-if="$slots.actions && !$slots.controls" class="actions"><slot name="actions" /></div>
     </header>
-    <div v-if="title && $slots.controls" class="controls"><slot name="controls" /></div>
+    <div v-if="title && $slots.controls" class="toolbar">
+      <div class="group"><slot name="controls" /></div>
+      <div v-if="$slots.actions" class="group"><slot name="actions" /></div>
+    </div>
   </div>
 </template>
 
@@ -67,7 +69,6 @@ withDefaults(
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  margin-bottom: var(--space-3);
 }
 
 .title-row h1 {
@@ -76,6 +77,7 @@ withDefaults(
 
 .line {
   max-width: var(--measure);
+  margin-top: var(--space-3);
   color: var(--text-muted);
 }
 
@@ -86,11 +88,20 @@ withDefaults(
   gap: var(--space-5);
 }
 
-.controls {
+/* One row: lighting controls left, view actions right. It wraps only when the window is too narrow. */
+.toolbar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  justify-content: space-between;
   gap: var(--space-4) var(--space-8);
   margin-top: var(--space-6);
+}
+
+.group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4) var(--space-6);
 }
 </style>

@@ -1,16 +1,17 @@
 //! Read-only snapshots the engine hands out: device views, apply reports, detection failures.
 
 use cc_config::DeviceSetting;
-use cc_core::{DeviceDescription, DeviceError, DeviceId, Rgb};
+use cc_core::{DeviceDescription, DeviceError, DeviceId, ModeState, Rgb};
 use serde::Serialize;
 
 /// Whether the engine is driving a device.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum DeviceStatus {
-    /// Under software control (or ready to be).
+    /// Under software control: CaseControl is outputting a setting (or holding it dark for All off).
     Active,
-    /// Handed back to its hardware mode; the next colour or mode call takes control again.
+    /// Showing its own lighting: never taken since it was detected, or handed back. Any lighting control (colours,
+    /// mode, brightness, All off) takes control again.
     Released,
     /// Taken out of service; the engine no longer talks to it until it is re-plugged or rescanned after removal.
     Faulted {
@@ -28,8 +29,13 @@ pub struct DeviceView {
     pub status: DeviceStatus,
     /// What the device was last actually set to (recorded by its thread after the write), if anything.
     pub setting: Option<DeviceSetting>,
-    /// The engine's colour buffer, one entry per LED.
+    /// The engine's colour buffer, one entry per LED. Starts with the device's own per-LED colours where its driver
+    /// can read them (see `hardware`), else black.
     pub colors: Vec<Rgb>,
+    /// What the device shows on its own (its hardware mode), as its driver read it, if it can (see
+    /// `cc_core::Controller::hardware_mode`). This is what a released device shows, and what a brightness or All off
+    /// change adopts as the setting of a device that has none.
+    pub hardware: Option<ModeState>,
     /// Family id of the backend that detected the device (`Backend::name()`).
     pub family: String,
     /// Device brightness in percent (ADR 0001 #33); `colors` and `setting` are unscaled.

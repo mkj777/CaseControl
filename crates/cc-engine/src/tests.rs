@@ -42,6 +42,8 @@ struct Behavior {
     resize_delay: Duration,
     /// `release` fails with a transport error.
     fail_release: bool,
+    /// What `hardware_mode` reports.
+    hardware: Option<ModeState>,
 }
 
 struct FakeCtrl {
@@ -121,6 +123,10 @@ impl Controller for FakeCtrl {
             return Err(DeviceError::Transport("release failed".into()));
         }
         Ok(())
+    }
+
+    fn hardware_mode(&self) -> Option<ModeState> {
+        self.behavior.lock().hardware.clone()
     }
 }
 
@@ -364,6 +370,14 @@ fn entries(log: &Log, needle: &str) -> Vec<String> {
         .collect()
 }
 
+/// Sends device `n` red colours and waits until they went out (the device is driven).
+fn drive(e: &EngineHandle, log: &Log, n: u16) {
+    e.set_direct(&id(n), vec![RED; 7]).unwrap();
+    assert!(wait_until(SECOND, || frames(log, n).last() == Some(&hex(&[RED; 7]))));
+    assert!(wait_until(SECOND, || e.device(&id(n)).unwrap().status
+        == DeviceStatus::Active));
+}
+
 fn static_red() -> ModeState {
     ModeState {
         mode: 1,
@@ -398,9 +412,14 @@ fn detection_produces_sorted_views_and_failures() {
     assert_eq!(names, ["Board", "Alpha keyboard", "Zeta keyboard"]);
 
     let v = e.device(&id(1)).unwrap();
-    assert_eq!(v.status, DeviceStatus::Active);
+    assert_eq!(
+        v.status,
+        DeviceStatus::Released,
+        "a device shows its own lighting until it is driven"
+    );
     assert_eq!(v.colors, vec![Rgb::BLACK; 7]);
     assert_eq!(v.setting, None);
+    assert_eq!(v.hardware, None);
     assert!(e.device(&id(9)).is_none());
 
     let f = e.failures();
@@ -411,7 +430,8 @@ fn detection_produces_sorted_views_and_failures() {
     assert_eq!(f[0].error, DeviceError::Timeout);
 
     let json = serde_json::to_value(e.device(&id(1)).unwrap()).unwrap();
-    assert_eq!(json["status"], serde_json::json!({"state": "active"}));
+    assert_eq!(json["status"], serde_json::json!({"state": "released"}));
+    assert_eq!(json["hardware"], serde_json::Value::Null);
     assert!(log.lock().is_empty(), "detection alone sends nothing");
 }
 
@@ -530,12 +550,24 @@ fn acked_commands_return_results_and_emit_state_changes() {
         e.device(&id(1)).unwrap().setting,
         Some(DeviceSetting::Mode { state: static_red() })
     );
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Active);
     assert_eq!(
         events.recv_timeout(SECOND).unwrap(),
         EngineEvent::DeviceStateChanged {
             id: id(1),
-            state: static_red()
-        }
+            active: true,
+            state: None
+        },
+        "taken"
+    );
+    assert_eq!(
+        events.recv_timeout(SECOND).unwrap(),
+        EngineEvent::DeviceStateChanged {
+            id: id(1),
+            active: true,
+            state: Some(static_red())
+        },
+        "mode applied"
     );
 
     let mut bad = static_red();
@@ -550,7 +582,20 @@ fn acked_commands_return_results_and_emit_state_changes() {
     );
     assert_eq!(e.release(&id(1)), Ok(()));
     assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
-    assert!(events.try_recv().is_err(), "only mode changes emit events");
+    assert_eq!(
+        events.recv_timeout(SECOND).unwrap(),
+        EngineEvent::DeviceStateChanged {
+            id: id(1),
+            active: false,
+            state: None
+        },
+        "released"
+    );
+    assert_eq!(e.release(&id(1)), Ok(()));
+    assert!(
+        events.try_recv().is_err(),
+        "only changes of status or mode emit events"
+    );
 }
 
 #[test]
@@ -819,7 +864,9 @@ fn apply_present_and_pending_devices() {
         Some(DeviceSetting::Mode { state: static_red() })
     );
     assert_eq!(entries(&log, "mode"), [format!("{} mode 1", id(2))]);
-    let evs: Vec<EngineEvent> = std::iter::from_fn(|| events.recv_timeout(SECOND / 5).ok()).collect();
+    let evs: Vec<EngineEvent> = std::iter::from_fn(|| events.recv_timeout(SECOND / 5).ok())
+        .filter(|ev| !matches!(ev, EngineEvent::DeviceStateChanged { id: got, .. } if *got == id(1)))
+        .collect();
     assert!(matches!(&evs[0], EngineEvent::DeviceAdded(info) if info.id == id(2)));
     assert!(matches!(&evs[1], EngineEvent::DeviceStateChanged { id: got, .. } if *got == id(2)));
 
@@ -875,6 +922,7 @@ fn hotplug_removal_drops_device_without_release() {
         fast_timing(),
     )
     .unwrap();
+    drive(&e, &log, 2);
     let events = e.subscribe();
     let location = e.device(&id(1)).unwrap().description.info.location;
     hp.inject(HotplugAction::Removed, &location.to_ascii_lowercase());
@@ -900,6 +948,7 @@ fn disabling_a_family_releases_and_drops_its_devices() {
     let a = FakeBackend::new("fam_a", vec![spec(id(1), "A", DeviceKind::Light)], &log);
     let b = FakeBackend::new("fam_b", vec![spec(id(2), "B", DeviceKind::Light)], &log);
     let e = engine(30, vec![Box::new(a), Box::new(b)]);
+    drive(&e, &log, 1);
     let events = e.subscribe();
     e.set_disabled_families(HashSet::from(["fam_a".to_string()]));
     assert_eq!(entries(&log, "release"), [format!("{} release", id(1))]);
@@ -933,8 +982,11 @@ fn shutdown_releases_active_devices_in_order_and_is_idempotent() {
         &log,
     );
     let e = engine(30, vec![Box::new(b)]);
-    let events = e.subscribe();
+    for n in 1..=3 {
+        drive(&e, &log, n);
+    }
     e.release(&id(2)).unwrap();
+    let events = e.subscribe();
     log.lock().clear();
 
     e.shutdown(SECOND);
@@ -942,7 +994,7 @@ fn shutdown_releases_active_devices_in_order_and_is_idempotent() {
     assert_eq!(
         releases,
         [format!("{} release", id(1)), format!("{} release", id(3))],
-        "active devices only, in id order"
+        "driven devices only, in id order"
     );
     e.shutdown(SECOND);
     assert_eq!(log.lock().len(), 2, "second shutdown does nothing");
@@ -964,8 +1016,32 @@ fn shutdown_with_failing_release_still_stops_everything() {
     s.behavior.lock().fail_release = true;
     let b = FakeBackend::new("f", vec![s, spec(id(2), "B", DeviceKind::Light)], &log);
     let e = engine(30, vec![Box::new(b)]);
+    drive(&e, &log, 1);
+    drive(&e, &log, 2);
     e.shutdown(SECOND);
     assert_eq!(entries(&log, "release").len(), 2);
+}
+
+#[test]
+fn shutdown_releases_never_driven_devices_but_not_handed_back_ones() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            spec(id(2), "B", DeviceKind::Light),
+        ],
+        &log,
+    );
+    let e = engine(30, vec![Box::new(b)]);
+    e.release(&id(2)).unwrap();
+    log.lock().clear();
+    e.shutdown(SECOND);
+    assert_eq!(
+        entries(&log, "release"),
+        [format!("{} release", id(1))],
+        "the driver decides what an untouched release does; a handed-back device is left alone"
+    );
 }
 
 #[test]
@@ -990,6 +1066,7 @@ fn dropping_last_handle_shuts_down() {
     let log = Log::default();
     let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
     let e = engine(30, vec![Box::new(b)]);
+    drive(&e, &log, 1);
     let e2 = e.clone();
     drop(e);
     assert!(entries(&log, "release").is_empty(), "a clone is still alive");
@@ -1123,10 +1200,14 @@ fn set_direct_during_set_mode_ends_direct_and_record_matches() {
     );
     assert_eq!(e.device(&id(1)).unwrap().setting, Some(blue.clone()));
     assert_eq!(e.current_settings()[&id(1)], blue);
-    // The mode really was applied first, so its event is correct; nothing else follows.
+    // The mode really was applied first, so its events (taken, mode) are correct; nothing else follows.
     assert!(matches!(
         events.recv_timeout(SECOND).unwrap(),
-        EngineEvent::DeviceStateChanged { .. }
+        EngineEvent::DeviceStateChanged { state: None, .. }
+    ));
+    assert!(matches!(
+        events.recv_timeout(SECOND).unwrap(),
+        EngineEvent::DeviceStateChanged { state: Some(_), .. }
     ));
     assert!(events.try_recv().is_err());
 }
@@ -1158,7 +1239,7 @@ fn rescan_replaces_a_faulted_device() {
         matches!(events.recv_timeout(SECOND).unwrap(), EngineEvent::DeviceAdded(info) if info.id == id(1))
     );
     assert_eq!(e.devices().len(), 1);
-    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Active);
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
     e.set_direct(&id(1), vec![GREEN; 7]).unwrap();
     assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting
         == Some(DeviceSetting::Direct {
@@ -1185,6 +1266,7 @@ fn shutdown_honours_budget_while_detection_is_stuck() {
         fast_timing(),
     )
     .unwrap();
+    drive(&e, &log, 1);
     let events = e.subscribe();
 
     *delay.lock() = Duration::from_millis(700);
@@ -1429,7 +1511,164 @@ fn brightness_scales_the_output_but_never_the_stored_colours() {
 }
 
 #[test]
-fn brightness_and_all_off_leave_undriven_and_released_devices_alone() {
+fn brightness_and_all_off_take_over_a_released_device_with_its_setting() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_direct(&id(1), vec![RED; 7]).unwrap();
+    assert!(shows(&log, 1, &[RED; 7]));
+    e.release(&id(1)).unwrap();
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
+    let events = e.subscribe();
+
+    // Device brightness takes it back with its last colours, dimmed.
+    e.set_device_brightness(&id(1), 50).unwrap();
+    assert!(shows(&log, 1, &[DARK_RED; 7]));
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
+        == DeviceStatus::Active));
+    assert_eq!(
+        events.recv_timeout(SECOND).unwrap(),
+        EngineEvent::DeviceStateChanged {
+            id: id(1),
+            active: true,
+            state: None
+        }
+    );
+
+    // Released again, the master brightness takes it back too.
+    e.release(&id(1)).unwrap();
+    e.set_master_brightness(50);
+    assert!(shows(&log, 1, &[DARKER_RED; 7]));
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
+        == DeviceStatus::Active));
+
+    // And All off: it fades to black and stays driven.
+    e.release(&id(1)).unwrap();
+    e.set_all_off(true);
+    assert!(shows(&log, 1, &[Rgb::BLACK; 7]));
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Active);
+    assert_eq!(
+        e.device(&id(1)).unwrap().setting,
+        Some(DeviceSetting::Direct { colors: vec![RED; 7] }),
+        "the setting is kept, only the output is dark"
+    );
+}
+
+#[test]
+fn brightness_adopts_the_hardware_readback_of_a_device_without_a_setting() {
+    let log = Log::default();
+    let with_hw = with_effects(spec(id(1), "A", DeviceKind::Light), true);
+    with_hw.behavior.lock().hardware = Some(breathing(80));
+    let b = FakeBackend::new("f", vec![with_hw, spec(id(2), "B", DeviceKind::Light)], &log);
+    let e = engine(60, vec![Box::new(b)]);
+    let v = e.device(&id(1)).unwrap();
+    assert_eq!(v.status, DeviceStatus::Released);
+    assert_eq!(v.hardware, Some(breathing(80)));
+    assert_eq!(v.setting, None);
+
+    // Device brightness 50 %: the readback becomes the setting and goes out at half its brightness,
+    // 1 + (80 - 1) * 0.5 = 40.5 -> 41.
+    e.set_device_brightness(&id(1), 50).unwrap();
+    assert!(shows_mode(&log, 1, "2 b=41"));
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
+        == DeviceStatus::Active));
+    assert_eq!(
+        e.device(&id(1)).unwrap().setting,
+        Some(DeviceSetting::Mode { state: breathing(80) })
+    );
+
+    // Without a setting or a readback there is nothing to scale: the device keeps its own lighting.
+    e.set_device_brightness(&id(2), 30).unwrap();
+    e.set_master_brightness(50);
+    // 1 + (80 - 1) * 0.25 = 20.75 -> 21
+    assert!(shows_mode(&log, 1, "2 b=21"));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(calls_since(&log, 2, 0).is_empty(), "nothing sent to device 2");
+    assert_eq!(e.device(&id(2)).unwrap().status, DeviceStatus::Released);
+    assert_eq!(e.device(&id(2)).unwrap().brightness, 30, "kept for later");
+
+    // A per-LED readback also seeds the colour buffer.
+    let log = Log::default();
+    let s = spec(id(3), "C", DeviceKind::Light);
+    let colors = vec![RED, GREEN, BLUE, RED, GREEN, BLUE, RED];
+    s.behavior.lock().hardware = Some(ModeState {
+        mode: 0,
+        speed: None,
+        brightness: None,
+        direction: None,
+        colors: colors.clone(),
+    });
+    let e = engine(60, vec![Box::new(FakeBackend::new("f", vec![s], &log))]);
+    assert_eq!(e.device(&id(3)).unwrap().colors, colors);
+}
+
+#[test]
+fn all_off_takes_over_every_visible_device_and_all_on_hands_back_those_without_a_setting() {
+    let log = Log::default();
+    let wave_hw = with_effects(spec(id(2), "B", DeviceKind::Light), true);
+    wave_hw.behavior.lock().hardware = Some(wave());
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            wave_hw,
+            spec(id(3), "C", DeviceKind::Light),
+        ],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_excluded(HashSet::from([id(3)]));
+    let events = e.subscribe();
+
+    e.set_all_off(true);
+    // No setting, no readback: held dark with black. Readback without a brightness parameter: its Off mode.
+    assert!(shows(&log, 1, &[Rgb::BLACK; 7]));
+    assert!(shows_mode(&log, 2, "4"));
+    for n in [1, 2] {
+        assert!(wait_until(SECOND, || e.device(&id(n)).unwrap().status
+            == DeviceStatus::Active));
+    }
+    assert_eq!(e.device(&id(1)).unwrap().setting, None, "black is not a setting");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        calls_since(&log, 3, 0).is_empty(),
+        "excluded devices are left alone"
+    );
+    assert_eq!(e.device(&id(3)).unwrap().status, DeviceStatus::Released);
+    let evs: Vec<EngineEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    for n in [1, 2] {
+        assert!(
+            evs.contains(&EngineEvent::DeviceStateChanged {
+                id: id(n),
+                active: true,
+                state: None
+            }),
+            "{evs:?}"
+        );
+    }
+
+    // All on: device 1 goes back to its own lighting, device 2 to the mode it showed.
+    e.set_all_off(false);
+    assert!(wait_until(SECOND, || entries(&log, "release")
+        == [format!("{} release", id(1))]));
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
+        == DeviceStatus::Released));
+    assert!(shows_mode(&log, 2, "3"));
+    assert_eq!(e.device(&id(2)).unwrap().status, DeviceStatus::Active);
+    assert_eq!(
+        e.device(&id(2)).unwrap().setting,
+        Some(DeviceSetting::Mode { state: wave() })
+    );
+    assert!(wait_until(SECOND, || events.try_iter().any(|ev| ev
+        == EngineEvent::DeviceStateChanged {
+            id: id(1),
+            active: false,
+            state: None
+        })));
+}
+
+#[test]
+fn devices_detected_while_all_off_are_held_dark_unless_excluded() {
     let log = Log::default();
     let b = FakeBackend::new(
         "f",
@@ -1439,29 +1678,20 @@ fn brightness_and_all_off_leave_undriven_and_released_devices_alone() {
         ],
         &log,
     );
-    let e = engine(60, vec![Box::new(b)]);
-    e.set_direct(&id(1), vec![RED; 7]).unwrap();
-    assert!(shows(&log, 1, &[RED; 7]));
-    e.release(&id(1)).unwrap();
-    let before = log.lock().len();
-
-    e.set_device_brightness(&id(1), 30).unwrap();
-    e.set_device_brightness(&id(2), 30).unwrap();
-    e.set_master_brightness(10);
-    e.set_all_off(true);
-    std::thread::sleep(Duration::from_millis(350));
-    assert_eq!(
-        log.lock().len(),
-        before,
-        "nothing is sent to devices the engine does not drive"
-    );
-    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
-
-    // Taking control again shows the colour at the current levels: here, off.
-    e.set_direct(&id(1), vec![BLUE; 7]).unwrap();
+    let c = EngineConfig {
+        all_off: true,
+        excluded: HashSet::from([id(2)]),
+        ..cfg(60)
+    };
+    let e = start_with(c, vec![Box::new(b)], None, fast_timing()).unwrap();
     assert!(shows(&log, 1, &[Rgb::BLACK; 7]));
     assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
         == DeviceStatus::Active));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(calls_since(&log, 2, 0).is_empty());
+    e.set_all_off(false);
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
+        == DeviceStatus::Released));
 }
 
 #[test]
@@ -1585,9 +1815,9 @@ fn hardware_mode_brightness_maps_into_the_mode_range_and_off_uses_the_off_mode()
     assert!(up.len() >= 3, "{up:?}");
     assert_eq!(e.device(&id(1)).unwrap().setting, Some(stored));
 
-    // Only the explicit mode change emitted an event, not the brightness or fade steps.
+    // Only taking the device and the explicit mode change emitted events, not the brightness or fade steps.
     let evs: Vec<EngineEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
-    assert_eq!(evs.len(), 1, "{evs:?}");
+    assert_eq!(evs.len(), 2, "{evs:?}");
 }
 
 #[test]
@@ -1658,11 +1888,15 @@ fn all_off_at_start_shows_black_without_a_coloured_frame() {
     let report = e.apply(&profile);
     assert_eq!(report.applied.len(), 2);
     assert!(shows(&log, 1, &[Rgb::BLACK; 7]));
-    assert!(wait_until(SECOND, || modes(&log, 2) == ["4"]));
+    assert!(wait_until(SECOND, || modes(&log, 2).last().map(String::as_str) == Some("4")));
     std::thread::sleep(Duration::from_millis(100));
     let all = frames(&log, 1);
     assert!(all.iter().all(|f| *f == hex(&[Rgb::BLACK; 7])), "{all:?}");
-    assert_eq!(modes(&log, 2), ["4"], "no coloured mode before All on");
+    let shown = modes(&log, 2);
+    assert!(
+        shown.iter().all(|m| m == "4"),
+        "no coloured mode before All on: {shown:?}"
+    );
     assert!(
         wait_until(SECOND, || e.current_settings() == profile),
         "the profile is applied underneath"
@@ -1787,9 +2021,11 @@ fn reassert_retries_a_failing_device_with_back_off() {
     let behavior = Arc::clone(&s.behavior);
     let b = FakeBackend::new("f", vec![s], &log);
     let e = engine(60, vec![Box::new(b)]);
-    let events = e.subscribe();
     e.set_direct(&id(1), vec![RED; 7]).unwrap();
     assert!(shows(&log, 1, &[RED; 7]));
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
+        == DeviceStatus::Active));
+    let events = e.subscribe();
 
     // USB is not back yet: the reset fails for a moment, then works.
     behavior.lock().fail_release = true;

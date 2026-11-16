@@ -1,8 +1,10 @@
 <script setup lang="ts">
 // Devices overview (ADR 0001 #18): one large tile per device with a small live preview; a tile opens the device
 // view. Tiles fill the window width (ADR 0001 #28). Right-click a tile to hide or unhide the device; hidden devices
-// are shown greyed only with "Show hidden" on (ADR 0001 #26, #27). Under the title: master brightness, All off and
-// Release all (ADR 0001 #33).
+// are shown greyed only with "Show hidden" on (ADR 0001 #26, #27). Under the title one toolbar row: master
+// brightness, All off and Release all (ADR 0001 #33) on the left, Show hidden and Rescan on the right. Each tile
+// shows the real status and what the device shows: its colours, the name of its own mode while released, empty LEDs
+// when that is unknown, dark LEDs while All off holds it.
 import { computed, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import BrightnessSlider from '../components/BrightnessSlider.vue'
@@ -21,7 +23,15 @@ import {
   type MenuItem,
 } from '../components/ui'
 import { errorText, releaseAll, setAllOff, setMasterBrightness, type DeviceView } from '../ipc'
-import { STATUS_LABEL, deviceErrorText, familyLabel, kindLabel, statusOf, zoneIndicesNamed } from '../lib/device'
+import {
+  STATUS_LABEL,
+  deviceErrorText,
+  familyLabel,
+  lightingLabel,
+  shownColors,
+  statusOf,
+  zoneIndicesNamed,
+} from '../lib/device'
 import {
   deviceState,
   findDevice,
@@ -68,7 +78,6 @@ async function toggleHidden(id: string, hidden: boolean) {
 
 // ---- brightness, All off, Release all (ADR 0001 #33) -----------------------------------------------------------
 
-const notice = ref<string | null>(null)
 const lightingBusy = ref(false)
 const releasing = ref(false)
 /** The lighting controls need a running engine. */
@@ -85,7 +94,6 @@ function lightingFailed(e: unknown) {
 
 async function onAllOff(off: boolean) {
   error.value = null
-  notice.value = null
   lightingBusy.value = true
   try {
     deviceState.lighting = await setAllOff(off)
@@ -98,13 +106,10 @@ async function onAllOff(off: boolean) {
 
 async function onReleaseAll() {
   error.value = null
-  notice.value = null
   releasing.value = true
   try {
     const failed = (await releaseAll()).filter((r) => r.error !== null)
-    if (failed.length === 0) {
-      notice.value = 'Every device is back in its own hardware mode until you change something.'
-    } else {
+    if (failed.length > 0) {
       const names = failed.map((r) => `${findDevice(r.id)?.description.info.name ?? r.id}: ${r.error}`)
       error.value = `Some devices could not be released. ${names.join('; ')}`
     }
@@ -119,7 +124,7 @@ async function onReleaseAll() {
 
 <template>
   <section class="page wide">
-    <PageHeader title="Devices" description="Choose a device to set its colours and effects.">
+    <PageHeader title="Devices">
       <template #actions>
         <Switch v-model="deviceState.showHiddenDevices" label="Show hidden" compact />
         <Button :disabled="deviceState.scanning" @click="rescanDevices">
@@ -153,7 +158,6 @@ async function onReleaseAll() {
     </Notice>
     <Notice v-if="deviceState.error" variant="error">Could not load the device list: {{ deviceState.error }}</Notice>
     <Notice v-if="error" variant="error">{{ error }}</Notice>
-    <Notice v-if="notice">{{ notice }}</Notice>
 
     <div v-if="tiles.length > 0" class="grid">
       <Tile
@@ -162,14 +166,18 @@ async function onReleaseAll() {
         :to="deviceLink(t.id)"
         :hidden="t.hidden"
         :name="t.d.description.info.name"
-        :meta="`${kindLabel(t.d.description.info.kind)} · ${t.d.description.info.vendor}`"
+        :meta="t.hidden ? undefined : (lightingLabel(t.d, deviceState.lighting.all_off) ?? undefined)"
         @contextmenu="openMenu($event, t.id, t.hidden)"
       >
         <template #badge>
           <StatusBadge v-if="t.hidden" status="hidden">Hidden</StatusBadge>
           <StatusBadge v-else :status="statusOf(t.d)">{{ STATUS_LABEL[statusOf(t.d)] }}</StatusBadge>
         </template>
-        <DevicePreview :description="t.d.description" :colors="t.d.colors" :hidden-zones="hiddenZonesOf(t.d)" />
+        <DevicePreview
+          :description="t.d.description"
+          :colors="shownColors(t.d, deviceState.lighting.all_off)"
+          :hidden-zones="hiddenZonesOf(t.d)"
+        />
       </Tile>
     </div>
 
