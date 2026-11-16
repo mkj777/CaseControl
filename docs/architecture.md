@@ -115,6 +115,7 @@ pub fn enumerate() -> Vec<HidDeviceInfo>;                       // hidapi, one p
 pub fn open(path) -> Result<Box<dyn HidTransport>>;             // hidapi default = FILE_SHARE_READ|WRITE, never exclusive
 pub struct FakeTransport { script: Vec<Exchange> }               // asserts byte-exact writes, replays reads; for tests
 pub fn watch_hotplug(tx) -> HotplugHandle;                      // windows: CM_Register_Notification(GUID_DEVINTERFACE_HID), debounced 500 ms
+pub fn power::watch(tx) -> PowerWatch;                          // windows: PowerRegisterSuspendResumeNotification, Suspend / Resume events
 pub struct NamedMutexGuard;                                     // Global\<name> acquire/release, for CorsairLink-style guards (unused in v1 drivers, present for the tier)
 ```
 
@@ -149,6 +150,20 @@ re-plug of the device while the app runs (hot-plug, profile re-association by `D
   `Faulted` and shown as such; never retried in a tight loop.
 - Shutdown: `Release` on every device, join threads with timeout, then exit. Ctrl-C/WM_CLOSE/tray Quit all funnel here.
 - Event bus (`tokio::sync::broadcast` or crossbeam) consumed by the Tauri layer and re-emitted as Tauri events.
+
+### Sleep and resume
+
+In sleep or hibernation the devices fall back to their saved or firmware lighting, and USB devices may drop off the
+bus or come back with dead handles. The engine subscribes to suspend/resume broadcasts (`cc_hid::power`,
+`PBT_APMRESUMEAUTOMATIC` and `PBT_APMRESUMESUSPEND`, no window needed) and calls `EngineHandle::reassert()`. That is
+debounced (a wake reports itself twice, a second call within 5 s does nothing) and runs on its own thread: after
+1 s for USB to settle, every driven device that is not faulted gets a reset (`release()`, which also clears the
+driver's "already sent" caches and makes it re-send its init) followed by its current output (colours or mode with
+device brightness, master brightness and All off applied); released and undriven devices are left alone. A
+device whose writes keep failing is retried with the usual back-off and faulted after 5 s. For 20 s after the
+resume the engine re-runs detection whenever a device present before the sleep (or removed just before the resume
+broadcast) is missing or faulted; such a device comes back with what it was driven with. Outside a resume a
+re-plugged device still starts undriven.
 
 ## Conflicts (`cc-conflicts`)
 
@@ -241,5 +256,5 @@ No kernel driver, no elevation except the one user-triggered elevated helper run
 no network, no telemetry, no auto-update.
 `cargo-deny` bans HTTP client crates (`reqwest`, `ureq`, `curl`; the exact list is derived from `cargo tree` after the Tauri
 scaffold exists, since Tauri may pull `hyper` transitively) and enforces a license allowlist (GPL-compatible is fine, project is private).
-All `unsafe` is confined to `cc-hid` (hot-plug FFI, named mutex), `cc-nvapi`, and the single `sys` module of
+All `unsafe` is confined to `cc-hid` (hot-plug and power notification FFI, named mutex), `cc-nvapi`, and the single `sys` module of
 `cc-conflicts` (Toolhelp, service control manager, process termination, ShellExecuteEx); each block carries a `// SAFETY:` comment.

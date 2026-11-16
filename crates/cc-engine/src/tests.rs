@@ -321,6 +321,11 @@ fn fast_timing() -> Timing {
         max_failures: 10,
         hotplug_poll: Duration::from_millis(10),
         fade: Duration::from_millis(200),
+        resume_debounce: Duration::from_millis(300),
+        resume_settle: Duration::from_millis(5),
+        resume_retry: Duration::from_millis(300),
+        resume_window: Duration::from_secs(2),
+        resume_poll: Duration::from_millis(10),
     }
 }
 
@@ -1687,4 +1692,188 @@ fn replace_brightness_resets_unlisted_devices_to_full() {
     assert!(shows(&log, 1, &[RED; 7]));
     assert!(shows(&log, 2, &[DARK_RED; 7]));
     assert_eq!(e.brightness(), BTreeMap::from([(id(2), 50), (id(9), 20)]));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Resume from sleep
+
+/// Every log line of device `n` from index `from` on, without the id prefix.
+fn calls_since(log: &Log, n: u16, from: usize) -> Vec<String> {
+    let prefix = format!("{} ", id(n));
+    log.lock()[from..]
+        .iter()
+        .filter_map(|(_, s)| s.strip_prefix(&prefix).map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn reassert_resets_and_resends_driven_devices_only_and_is_debounced() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        (1..=4).map(|n| spec(id(n), "D", DeviceKind::Light)).collect(),
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_direct(&id(1), vec![RED; 7]).unwrap();
+    e.set_device_brightness(&id(1), 50).unwrap();
+    e.set_mode(&id(2), static_red()).unwrap();
+    e.set_direct(&id(3), vec![BLUE; 7]).unwrap();
+    assert!(shows(&log, 1, &[DARK_RED; 7]));
+    assert!(shows(&log, 3, &[BLUE; 7]));
+    e.release(&id(3)).unwrap();
+    // id(4) is never driven.
+    let mark = log.lock().len();
+
+    assert!(e.reassert());
+    assert!(!e.reassert(), "a second resume broadcast is debounced");
+    let dark = format!("direct {}", hex(&[DARK_RED; 7]));
+    assert!(wait_until(SECOND, || calls_since(&log, 1, mark)
+        == ["release".to_owned(), dark.clone()]));
+    assert!(wait_until(SECOND, || calls_since(&log, 2, mark) == ["release", "mode 1"]));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        calls_since(&log, 3, mark).is_empty(),
+        "released devices are left alone"
+    );
+    assert!(
+        calls_since(&log, 4, mark).is_empty(),
+        "undriven devices are left alone"
+    );
+    assert_eq!(
+        calls_since(&log, 1, mark).len(),
+        2,
+        "exactly one reset and one frame"
+    );
+    let v = e.device(&id(1)).unwrap();
+    assert_eq!(v.status, DeviceStatus::Active);
+    assert_eq!(
+        v.setting,
+        Some(DeviceSetting::Direct { colors: vec![RED; 7] }),
+        "stored unscaled"
+    );
+    assert_eq!(e.device(&id(3)).unwrap().status, DeviceStatus::Released);
+
+    // After the debounce time a new resume works again.
+    std::thread::sleep(fast_timing().resume_debounce);
+    let mark = log.lock().len();
+    assert!(e.reassert());
+    assert!(wait_until(SECOND, || calls_since(&log, 2, mark) == ["release", "mode 1"]));
+
+    e.shutdown(SECOND);
+    assert!(!e.reassert(), "nothing after shutdown");
+}
+
+#[test]
+fn reassert_applies_all_off() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_direct(&id(1), vec![RED; 7]).unwrap();
+    e.set_all_off(true);
+    assert!(shows(&log, 1, &[Rgb::BLACK; 7]));
+    std::thread::sleep(Duration::from_millis(250)); // the fade is over
+    let mark = log.lock().len();
+    assert!(e.reassert());
+    let black = format!("direct {}", hex(&[Rgb::BLACK; 7]));
+    assert!(wait_until(SECOND, || calls_since(&log, 1, mark)
+        == ["release".to_owned(), black.clone()]));
+}
+
+#[test]
+fn reassert_retries_a_failing_device_with_back_off() {
+    let log = Log::default();
+    let s = spec(id(1), "A", DeviceKind::Light);
+    let behavior = Arc::clone(&s.behavior);
+    let b = FakeBackend::new("f", vec![s], &log);
+    let e = engine(60, vec![Box::new(b)]);
+    let events = e.subscribe();
+    e.set_direct(&id(1), vec![RED; 7]).unwrap();
+    assert!(shows(&log, 1, &[RED; 7]));
+
+    // USB is not back yet: the reset fails for a moment, then works.
+    behavior.lock().fail_release = true;
+    assert!(e.reassert());
+    assert!(wait_until(SECOND, || entries(&log, "release").len() >= 3));
+    behavior.lock().fail_release = false;
+    assert!(wait_until(SECOND, || frames(&log, 1).len() == 2));
+    let after: Vec<String> = log.lock().iter().map(|(_, s)| s.clone()).collect();
+    assert!(after.last().unwrap().contains("direct"), "{after:?}");
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Active);
+    std::thread::sleep(Duration::from_millis(100));
+    let evs: Vec<EngineEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(evs.is_empty(), "no fault, no removal: {evs:?}");
+}
+
+#[test]
+fn reassert_faults_an_unreachable_device_and_reopens_it_with_its_setting() {
+    let log = Log::default();
+    let s = spec(id(1), "A", DeviceKind::Light);
+    let behavior = Arc::clone(&s.behavior);
+    let b = FakeBackend::new("f", vec![s], &log);
+    // Many failures allowed, so the resume retry time is what faults it.
+    let timing = Timing {
+        max_failures: 1000,
+        ..fast_timing()
+    };
+    let e = start_with(cfg(60), vec![Box::new(b)], None, timing).unwrap();
+    e.set_mode(&id(1), static_red()).unwrap();
+    let events = e.subscribe();
+
+    // The old handle is dead after the sleep: every reset fails until the resume retry time is over.
+    behavior.lock().fail_release = true;
+    assert!(e.reassert());
+    match events.recv_timeout(SECOND).unwrap() {
+        EngineEvent::DeviceFaulted { id: got, error } => {
+            assert_eq!(got, id(1));
+            assert!(error.contains("after resume"), "{error}");
+        }
+        ev => panic!("unexpected {ev:?}"),
+    }
+    // A fresh handle works; the resume loop re-opens the device and gives it its mode back.
+    behavior.lock().fail_release = false;
+    assert!(
+        matches!(events.recv_timeout(SECOND).unwrap(), EngineEvent::DeviceAdded(info) if info.id == id(1))
+    );
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting
+        == Some(DeviceSetting::Mode { state: static_red() })));
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Active);
+    assert_eq!(modes(&log, 1).last().map(String::as_str), Some("1"));
+}
+
+#[test]
+fn reassert_reopens_a_device_removed_during_sleep() {
+    let log = Log::default();
+    let s = spec(id(1), "A", DeviceKind::Light);
+    let b = FakeBackend::new("f", vec![s.clone()], &log);
+    let plugged = Arc::clone(&b.plugged);
+    let hp = FakeHotplug::default();
+    let e = start_with(
+        cfg(60),
+        vec![Box::new(b)],
+        Some(Box::new(hp.clone())),
+        fast_timing(),
+    )
+    .unwrap();
+    e.set_direct(&id(1), vec![GREEN; 7]).unwrap();
+    assert!(shows(&log, 1, &[GREEN; 7]));
+    let location = e.device(&id(1)).unwrap().description.info.location;
+
+    // The removal of the sleep arrives before the resume broadcast.
+    plugged.lock().clear();
+    hp.inject(HotplugAction::Removed, &location);
+    assert!(wait_until(SECOND, || e.device(&id(1)).is_none()));
+    assert!(e.reassert());
+    std::thread::sleep(Duration::from_millis(30));
+    // USB is back: the next detection pass of the resume loop picks it up (no arrival event needed).
+    plugged.lock().push(s);
+    assert!(wait_until(SECOND, || e.device(&id(1)).is_some_and(|v| v.setting
+        == Some(DeviceSetting::Direct {
+            colors: vec![GREEN; 7]
+        }))));
+    assert_eq!(frames(&log, 1).len(), 2, "shown again on the fresh controller");
+    assert!(
+        entries(&log, "release").is_empty(),
+        "a fresh controller needs no reset"
+    );
 }

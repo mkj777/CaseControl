@@ -10,6 +10,11 @@
 //! ([`Output::stored`]). The latest-wins slot carries brightness and fade steps for hardware modes too, paced like
 //! colour frames; a mode output equal to the one the device already shows is not sent again, so a mode without a
 //! brightness parameter does not restart its effect on every fade step.
+//!
+//! Resume (after sleep or hibernate): [`Command::Reassert`] makes the worker hand the device back once (`release()`,
+//! which also clears the driver's "already sent" caches and makes it re-send its init) and then send the current
+//! output again. Reset and send are retried together with the usual back-off; if the device still does not take
+//! them when [`Timing::resume_retry`] has passed, the worker faults it so the engine re-opens it through detection.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,6 +62,9 @@ pub(crate) enum Command {
     Release { seq: u64, reply: Reply },
     /// Leave the thread, releasing first if `release` and the device is Active.
     Stop { release: bool, reply: Option<Reply> },
+    /// The system resumed: reset the device (`release()`) and send `output` (the current output, issued with
+    /// `seq`) again, retrying both with back-off for up to [`Timing::resume_retry`].
+    Reassert { seq: u64, output: Output },
 }
 
 /// Timing knobs of the error policy and acknowledgements. Tests shorten them.
@@ -74,6 +82,16 @@ pub(crate) struct Timing {
     pub hotplug_poll: Duration,
     /// Length of a full All off / on fade.
     pub fade: Duration,
+    /// Resume notifications closer together than this start only one reassert (a wake usually sends two).
+    pub resume_debounce: Duration,
+    /// Wait after a resume before the first write, so USB devices can come back.
+    pub resume_settle: Duration,
+    /// How long a worker keeps retrying the reset and re-send after a resume before it faults the device.
+    pub resume_retry: Duration,
+    /// How long after a resume the engine keeps re-opening devices that are faulted or missing.
+    pub resume_window: Duration,
+    /// First pause between those checks; it doubles up to one second.
+    pub resume_poll: Duration,
 }
 
 impl Default for Timing {
@@ -85,6 +103,11 @@ impl Default for Timing {
             max_failures: 10,
             hotplug_poll: Duration::from_millis(100),
             fade: Duration::from_millis(500),
+            resume_debounce: Duration::from_secs(5),
+            resume_settle: Duration::from_secs(1),
+            resume_retry: Duration::from_secs(5),
+            resume_window: Duration::from_secs(20),
+            resume_poll: Duration::from_millis(250),
         }
     }
 }
@@ -125,6 +148,11 @@ pub(crate) struct Worker {
     failures: u32,
     retry_at: Option<Instant>,
     next_keepalive: Option<Instant>,
+    /// A resume asked for a reset (`release()`) before the next output.
+    reset: bool,
+    /// After a resume: until when failed writes are retried before the device is faulted. Cleared by the first
+    /// successful output.
+    resume_until: Option<Instant>,
 }
 
 impl Worker {
@@ -152,6 +180,8 @@ impl Worker {
             failures: 0,
             retry_at: None,
             next_keepalive: None,
+            reset: false,
+            resume_until: None,
         }
     }
 
@@ -275,17 +305,19 @@ impl Worker {
             return;
         }
         let unchanged = self.local == Local::Active
+            && !self.reset
             && matches!(&output.out, Out::Mode(m) if self.shown_mode.as_ref() == Some(m));
         let r = if unchanged {
             Ok(())
         } else {
             self.last_frame = Some(now);
-            self.send_out(&output.out)
+            self.send_out_reset(&output.out)
         };
         match &r {
             Ok(()) => {
                 self.last_seq = seq;
                 self.took_control(now);
+                self.resumed();
                 self.shared
                     .applied(&self.id, self.generation, output.stored, false);
             }
@@ -302,6 +334,25 @@ impl Worker {
             Err(_) => {}
         }
         self.record(&r);
+    }
+
+    /// [`send_out`](Self::send_out), preceded by the reset a resume asked for (once it succeeded, not again).
+    fn send_out_reset(&mut self, out: &Out) -> Result<(), DeviceError> {
+        if self.reset {
+            self.ctrl.release()?;
+            self.reset = false;
+            self.shown_mode = None;
+            debug!(id = %self.id, "device reset after resume");
+        }
+        self.send_out(out)
+    }
+
+    /// An output went out after a resume: the device is back.
+    fn resumed(&mut self) {
+        if self.resume_until.take().is_some() {
+            debug!(id = %self.id, "device re-asserted after resume");
+            self.shared.reasserted(&self.id, self.generation);
+        }
     }
 
     /// Sends one output to the device and remembers which mode it shows.
@@ -345,7 +396,9 @@ impl Worker {
             Err(e) => {
                 self.failures += 1;
                 let timing = self.shared.timing;
-                if self.failures >= timing.max_failures {
+                if self.resume_until.is_some_and(|until| Instant::now() >= until) {
+                    self.fault(format!("not reachable after resume, last error: {e}"));
+                } else if self.failures >= timing.max_failures {
                     self.fault(format!("{} consecutive failures, last: {e}", self.failures));
                 } else {
                     let wait = timing.backoff(self.failures);
@@ -361,6 +414,8 @@ impl Worker {
         self.local = Local::Faulted;
         self.dirty = None;
         self.next_keepalive = None;
+        self.reset = false;
+        self.resume_until = None;
         self.fault_reason = reason.clone();
         self.shared.device_faulted(&self.id, self.generation, reason);
     }
@@ -379,9 +434,10 @@ impl Worker {
                 out,
                 reply,
             } => {
-                let r = self.ordered(seq, |w| w.send_out(&out));
+                let r = self.ordered(seq, |w| w.send_out_reset(&out));
                 if r == Ok(true) {
                     self.took_control(Instant::now());
+                    self.resumed();
                     self.shared.applied(
                         &self.id,
                         self.generation,
@@ -395,6 +451,8 @@ impl Worker {
                 let r = self.ordered(seq, |w| w.ctrl.release());
                 if r == Ok(true) {
                     self.mark_released();
+                    self.reset = false;
+                    self.resumed();
                 }
                 let _ = reply.send(r.map(|_| ()));
             }
@@ -417,6 +475,7 @@ impl Worker {
                 let r = self.guarded(|w| w.ctrl.save_to_hardware());
                 let _ = reply.send(r);
             }
+            Command::Reassert { seq, output } => self.reassert(seq, output),
             Command::Stop { release, reply } => {
                 let r = if release && self.local == Local::Active {
                     let r = self.ctrl.release();
@@ -454,6 +513,25 @@ impl Worker {
         self.guarded(f)?;
         self.last_seq = seq;
         Ok(true)
+    }
+
+    /// Starts the reset and re-send after a resume. Ignored while not driving the device (released or faulted) and
+    /// when something issued later was already applied.
+    fn reassert(&mut self, seq: u64, output: Output) {
+        if self.local != Local::Active || seq < self.last_seq {
+            debug!(id = %self.id, "skipping reassert");
+            return;
+        }
+        self.drop_frames_before(seq);
+        // A fresh start: the failures before the sleep say nothing about the device now.
+        self.failures = 0;
+        self.retry_at = None;
+        self.reset = true;
+        self.shown_mode = None;
+        self.resume_until = Some(Instant::now() + self.shared.timing.resume_retry);
+        if self.dirty.as_ref().is_none_or(|(s, _)| *s < seq) {
+            self.dirty = Some((seq, output));
+        }
     }
 
     fn mark_released(&mut self) {

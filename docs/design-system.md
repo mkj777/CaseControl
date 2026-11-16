@@ -162,7 +162,8 @@ Where they live: `apps/desktop/src/components/ui/`, one `.vue` file per primitiv
 re-exports them, so pages write `import { Button, Notice, StatusBadge } from '../components/ui'`. Native elements
 (`button`, `input`, `select`) keep a base style in `styles.css` so plain markup already looks right; a component
 exists where there is structure, state or accessibility wiring to share. Composite feature components
-(DevicePreview, ColorPicker, ModeControls) stay in `components/` and are built from the primitives.
+(DevicePreview, ColorPicker, ModeControls, BrightnessSlider) stay in `components/` and are built from the
+primitives.
 
 Each entry: anatomy, variants, states, rules. "States" always includes `:focus-visible` (focus ring) and disabled
 unless noted.
@@ -184,11 +185,16 @@ unless noted.
 ### Page header
 
 - **Anatomy:** optional back link (`← Devices`, `--text-muted`, hover `--text`, `--space-6` below), h1, one
-  description line in `--text-muted` up to `--measure`, actions aligned to the top right.
+  description line in `--text-muted` up to `--measure`, actions aligned to the top right (slot `actions`), and
+  optionally a row of lighting controls under the title (slot `controls`, `--space-6` above it). The controls row
+  wraps; its gap is `--space-4` between lines and `--space-8` between controls.
 - **Variants:** list page (title, description, actions), detail page (back link, title, metadata line
-  "Kind · Vendor", status badge next to the title).
+  "Kind · Vendor", status badge next to the title). Either may have the controls row: the Devices page puts the
+  master Brightness, the All off switch and Release all there, a device page its device Brightness.
 - **Rules:** at most two actions, secondary style (Rescan, Scan). The primary action of a page is in its content,
-  not in the header. `--space-10` below.
+  not in the header. `--space-10` below. The controls row is the one exception to "at most two": it holds the
+  page-wide lighting controls that act at once (BrightnessSlider, compact Switch, a secondary Button), not page
+  actions, and nothing else goes there. It shows only together with a title.
 
 ### Card and tile
 
@@ -257,6 +263,22 @@ unless noted.
 - **States:** dragging sends live (ADR #21); disabled greys out via the native control.
 - **Rules:** always show the value. Where an exact number matters (frame rate), pair it with a NumberField that
   edits the same value.
+
+### Brightness slider
+
+- **Anatomy:** a Field in the row layout with a Slider from 0 to 100 and the readout "N %"
+  (`components/BrightnessSlider.vue`, ADR #33). Props: `label`, `value` (percent), `send(percent, persist)`,
+  optional `disabled` and `hint`; emits `error`.
+- **Behaviour:** while dragging it sends live with `persist = false`, coalesced so only the newest value is in
+  flight (`latestSender`). When the drag ends it drops the queued live value, waits for the one in flight and sends
+  the final value once more with `persist = true`, which is the one that gets saved. Until that send has finished
+  it shows its own value, so a device refresh in between cannot pull the thumb back.
+- **States:** disabled (engine down, device locked, or a hardware mode without a brightness parameter; then the
+  hint says so: "This mode has no brightness setting."). A failed send is emitted as `error`; the page shows it as
+  an inline Notice.
+- **Rules:** every brightness control is this component (master brightness on the Devices page, device brightness
+  on a device page), usually in the PageHeader `controls` row. The `send` callback decides what `persist` saves;
+  the slider never saves on its own.
 
 ### Number field
 

@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 use crate::error::EngineError;
 use crate::hotplug::{HotplugRuntime, HotplugSource};
 use crate::lighting::{self, FULL, Levels, Output, Want};
+use crate::resume::ResumeRuntime;
 use crate::view::{ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView};
 use crate::worker::{Command, FrameSlot, Reply, Timing, Worker};
 
@@ -27,6 +28,11 @@ use crate::worker::{Command, FrameSlot, Reply, Timing, Worker};
 const COMMAND_CAPACITY: usize = 16;
 /// Detection failures kept for diagnostics; older ones are dropped.
 const MAX_FAILURES: usize = 64;
+/// Removals remembered for a resume; older ones are dropped.
+const MAX_REMOVED: usize = 64;
+/// A device removed this long before a resume counts as lost in the sleep (Windows may deliver the removals of a
+/// sleep shortly before the resume broadcast).
+const RESUME_LOOKBACK: Duration = Duration::from_secs(10);
 /// Bounds of the frame rate.
 const FPS_RANGE: std::ops::RangeInclusive<u32> = 1..=60;
 
@@ -41,6 +47,9 @@ pub struct EngineConfig {
     pub zone_sizes: BTreeMap<DeviceId, BTreeMap<String, usize>>,
     /// Whether to watch for HID arrivals and removals.
     pub hotplug: bool,
+    /// Whether to watch for the system resuming from sleep or hibernation and then
+    /// [`reassert`](EngineHandle::reassert) every driven device.
+    pub resume: bool,
     /// Master brightness in percent (clamped to 100), multiplied into every device (ADR 0001 #33).
     pub master_brightness: u8,
     /// Device brightness in percent per device; a device without an entry has 100.
@@ -57,6 +66,7 @@ impl Default for EngineConfig {
             disabled_families: HashSet::new(),
             zone_sizes: BTreeMap::new(),
             hotplug: true,
+            resume: true,
             master_brightness: FULL,
             brightness: BTreeMap::new(),
             all_off: false,
@@ -75,6 +85,8 @@ struct Slot {
     /// What the engine drives the device with (unscaled), or `None` while it does not drive it (never set, or
     /// released). Brightness and fade changes re-send only devices that have one.
     want: Option<Want>,
+    /// A reassert after resume was sent and the worker has not confirmed an output since.
+    resuming: bool,
     frame: FrameSlot,
     tx: Sender<Command>,
     thread: Option<JoinHandle<()>>,
@@ -102,6 +114,16 @@ impl Slot {
         }
     }
 
+    /// The unscaled setting the engine drives the device with, if it drives it.
+    fn wanted_setting(&self) -> Option<DeviceSetting> {
+        match self.want.as_ref()? {
+            Want::Direct => Some(DeviceSetting::Direct {
+                colors: self.colors.clone(),
+            }),
+            Want::Mode(state) => Some(DeviceSetting::Mode { state: state.clone() }),
+        }
+    }
+
     /// What the device is sent for its current want at `levels`, if the engine drives it.
     fn output(&self, levels: Levels) -> Option<Output> {
         self.want
@@ -122,6 +144,8 @@ struct State {
     devices: BTreeMap<DeviceId, Slot>,
     failures: Vec<DetectFailure>,
     pending: BTreeMap<DeviceId, DeviceSetting>,
+    /// Driven devices that were removed recently: when, and what they were driven with (for a resume).
+    removed: BTreeMap<DeviceId, (Instant, DeviceSetting)>,
     disabled_families: HashSet<String>,
     zone_sizes: BTreeMap<DeviceId, BTreeMap<String, usize>>,
     /// Master brightness, percent.
@@ -177,6 +201,9 @@ pub(crate) struct Shared {
     /// Serializes detection passes and shutdown.
     detect_lock: Mutex<()>,
     hotplug: Mutex<Option<HotplugRuntime>>,
+    resume: Mutex<Option<ResumeRuntime>>,
+    /// When the last reassert started (for the debounce).
+    last_reassert: Mutex<Option<Instant>>,
     next_generation: AtomicU64,
     pub(crate) timing: Timing,
 }
@@ -370,6 +397,14 @@ impl Shared {
         }
     }
 
+    /// Called by a worker whose first output after a reassert went out.
+    pub(crate) fn reasserted(&self, id: &DeviceId, generation: u64) {
+        let mut st = self.state.lock();
+        if let Some(slot) = st.devices.get_mut(id).filter(|s| s.generation == generation) {
+            slot.resuming = false;
+        }
+    }
+
     /// Called by a worker that took its device out of service.
     pub(crate) fn device_faulted(&self, id: &DeviceId, generation: u64, error: String) {
         {
@@ -378,6 +413,7 @@ impl Shared {
                 return;
             };
             slot.status = DeviceStatus::Faulted { error: error.clone() };
+            slot.resuming = false;
         }
         self.emit(EngineEvent::DeviceFaulted {
             id: id.clone(),
@@ -512,6 +548,7 @@ impl Shared {
             status: DeviceStatus::Active,
             setting: None,
             want: None,
+            resuming: false,
             frame,
             tx,
             thread: Some(thread),
@@ -527,7 +564,14 @@ impl Shared {
                 return;
             }
             let replaced = st.devices.insert(id.clone(), slot);
-            (st.pending.remove(&id), replaced)
+            st.removed.remove(&id);
+            // A device that faulted after a resume comes back with what it was driven with, unless a profile wants
+            // it otherwise.
+            let carried = replaced
+                .as_ref()
+                .filter(|_| this.resume_active())
+                .and_then(Slot::wanted_setting);
+            (st.pending.remove(&id).or(carried), replaced)
         };
         if let Some(old) = replaced {
             info!(%id, "faulted device detected again; replacing it");
@@ -634,8 +678,29 @@ impl Shared {
     }
 
     fn drop_removed(&self, id: &DeviceId) {
-        let Some(slot) = self.state.lock().devices.remove(id) else {
-            return;
+        let slot = {
+            let mut st = self.state.lock();
+            let Some(slot) = st.devices.remove(id) else {
+                return;
+            };
+            if let Some(setting) = slot.wanted_setting() {
+                // Lost after a resume: it gets what it was driven with when it comes back, unless a profile wants
+                // otherwise. Outside a resume a re-plugged device starts undriven, as before.
+                if self.resume_active() {
+                    st.pending.entry(id.clone()).or_insert_with(|| setting.clone());
+                }
+                if st.removed.len() >= MAX_REMOVED
+                    && let Some(oldest) = st
+                        .removed
+                        .iter()
+                        .min_by_key(|(_, (t, _))| *t)
+                        .map(|(k, _)| k.clone())
+                {
+                    st.removed.remove(&oldest);
+                }
+                st.removed.insert(id.clone(), (Instant::now(), setting));
+            }
+            slot
         };
         info!(%id, "device removed");
         // The worker may be blocked on the dead device; do not wait for it. Dropping the sender ends it.
@@ -952,6 +1017,143 @@ impl Shared {
         }
     }
 
+    /// Starts a reassert unless one started within the debounce time; returns whether it started. The work runs on
+    /// its own thread (`cc-resume`), so this returns at once.
+    pub(crate) fn reassert(this: &Arc<Self>) -> bool {
+        if this.is_closed() {
+            return false;
+        }
+        {
+            let mut last = this.last_reassert.lock();
+            let now = Instant::now();
+            if last.is_some_and(|t| now.duration_since(t) < this.timing.resume_debounce) {
+                debug!("reassert already running; ignoring the repeated resume");
+                return false;
+            }
+            *last = Some(now);
+        }
+        // What was there before the sleep is what should be there again: the devices present now and the driven ones
+        // removed just before the resume, which also get what they were driven with when they come back.
+        let expected: Vec<DeviceId> = {
+            let mut st = this.state.lock();
+            let recent: Vec<(DeviceId, DeviceSetting)> = st
+                .removed
+                .iter()
+                .filter(|(_, (t, _))| t.elapsed() < RESUME_LOOKBACK)
+                .map(|(id, (_, setting))| (id.clone(), setting.clone()))
+                .collect();
+            let mut expected: Vec<DeviceId> = st.devices.keys().cloned().collect();
+            for (id, setting) in recent {
+                st.pending.entry(id.clone()).or_insert(setting);
+                expected.push(id);
+            }
+            expected
+        };
+        info!(devices = expected.len(), "resumed; re-asserting device state");
+        let shared = Arc::clone(this);
+        let spawned = std::thread::Builder::new()
+            .name("cc-resume".into())
+            .spawn(move || shared.run_reassert(&expected));
+        if let Err(e) = spawned {
+            warn!(error = %e, "could not start the resume thread");
+            return false;
+        }
+        true
+    }
+
+    /// The reassert: waits for USB to settle, resets and re-sends every driven device, re-opens faulted and missing
+    /// ones, and keeps re-opening (with growing pauses) until every device in `expected` is back and confirmed or
+    /// the resume window is over.
+    fn run_reassert(self: Arc<Self>, expected: &[DeviceId]) {
+        let start = Instant::now();
+        if !self.sleep_unless_closed(self.timing.resume_settle) {
+            return;
+        }
+        self.reassert_driven();
+        Self::detect_new(&self, None);
+        let deadline = start + self.timing.resume_window;
+        let mut pause = self.timing.resume_poll;
+        loop {
+            let (missing, waiting) = self.resume_progress(expected);
+            if missing.is_empty() && waiting == 0 {
+                info!(elapsed = ?start.elapsed(), "device state re-asserted after resume");
+                return;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                warn!(?missing, waiting, "some devices did not come back after resume");
+                return;
+            }
+            if !self.sleep_unless_closed(pause.min(left)) {
+                return;
+            }
+            pause = (pause * 2).min(Duration::from_secs(1));
+            if !missing.is_empty() {
+                debug!(?missing, "re-opening devices after resume");
+                Self::detect_new(&self, None);
+            }
+        }
+    }
+
+    /// Whether a reassert started within the resume window.
+    fn resume_active(&self) -> bool {
+        self.last_reassert
+            .lock()
+            .is_some_and(|t| t.elapsed() < self.timing.resume_window)
+    }
+
+    /// Sleeps `d`; returns `false` if the engine is shutting down.
+    fn sleep_unless_closed(&self, d: Duration) -> bool {
+        std::thread::sleep(d);
+        !self.is_closed()
+    }
+
+    /// Hands every driven, usable device a reassert of its current output.
+    fn reassert_driven(&self) {
+        let mut st = self.state.lock();
+        let ids: Vec<DeviceId> = st
+            .devices
+            .iter()
+            .filter(|(_, s)| s.want.is_some() && !matches!(s.status, DeviceStatus::Faulted { .. }))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let levels = st.levels(&id);
+            let seq = self.next_seq();
+            let Some(slot) = st.devices.get_mut(&id) else {
+                continue;
+            };
+            let Some(output) = slot.output(levels) else {
+                continue;
+            };
+            match slot.tx.try_send(Command::Reassert { seq, output }) {
+                Ok(()) => slot.resuming = true,
+                Err(e) => {
+                    warn!(%id, "could not queue the reassert; sending the output without a reset");
+                    if let Command::Reassert { seq, output } = e.into_inner() {
+                        slot.push_output(seq, output);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Devices of `expected` that are missing or faulted, and how many devices still wait for their reassert.
+    fn resume_progress(&self, expected: &[DeviceId]) -> (Vec<DeviceId>, usize) {
+        let st = self.state.lock();
+        let missing = expected
+            .iter()
+            .filter(|id| {
+                st.devices
+                    .get(*id)
+                    .is_none_or(|s| matches!(s.status, DeviceStatus::Faulted { .. }))
+            })
+            .cloned()
+            .collect();
+        let waiting = st.devices.values().filter(|s| s.resuming).count();
+        (missing, waiting)
+    }
+
     fn shutdown(&self, timeout: Duration) {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
@@ -960,6 +1162,10 @@ impl Shared {
         let deadline = start + timeout;
         // From here on API calls fail, no events go out and an in-flight detection adds nothing.
         self.closed.store(true, Ordering::Release);
+        let resume = self.resume.lock().take();
+        if let Some(r) = resume {
+            r.stop();
+        }
         let hotplug = self.hotplug.lock().take();
         if let Some(h) = hotplug {
             h.stop_within(deadline.saturating_duration_since(Instant::now()));
@@ -1060,10 +1266,17 @@ pub fn start(cfg: EngineConfig, backends: Vec<Box<dyn Backend>>) -> Result<Engin
     } else {
         None
     };
-    start_with(cfg, backends, source, Timing::default())
+    let resume = cfg.resume;
+    let handle = start_with(cfg, backends, source, Timing::default())?;
+    if resume {
+        let rt = ResumeRuntime::start(handle.shared());
+        *handle.shared().resume.lock() = rt;
+    }
+    Ok(handle)
 }
 
-/// [`start`] with an explicit hot-plug source and timing (tests inject both). `cfg.hotplug` is ignored.
+/// [`start`] with an explicit hot-plug source and timing (tests inject both). `cfg.hotplug` and `cfg.resume` are
+/// ignored; tests call [`EngineHandle::reassert`] directly.
 pub(crate) fn start_with(
     cfg: EngineConfig,
     backends: Vec<Box<dyn Backend>>,
@@ -1081,6 +1294,7 @@ pub(crate) fn start_with(
             devices: BTreeMap::new(),
             failures: Vec::new(),
             pending: BTreeMap::new(),
+            removed: BTreeMap::new(),
             disabled_families: cfg.disabled_families,
             zone_sizes: cfg.zone_sizes,
             master: cfg.master_brightness.min(FULL),
@@ -1097,6 +1311,8 @@ pub(crate) fn start_with(
         next_seq: AtomicU64::new(0),
         detect_lock: Mutex::new(()),
         hotplug: Mutex::new(None),
+        resume: Mutex::new(None),
+        last_reassert: Mutex::new(None),
         next_generation: AtomicU64::new(0),
         timing,
     });
@@ -1283,6 +1499,21 @@ impl EngineHandle {
     /// (`DeviceRemoved`); re-enabled families are picked up by the next [`rescan`](Self::rescan).
     pub fn set_disabled_families(&self, families: HashSet<String>) {
         self.shared().set_disabled_families(families);
+    }
+
+    /// Re-asserts what the engine drives after the system resumed from sleep or hibernation, when devices may show
+    /// their firmware state again or have dropped off the bus. The engine calls it itself when
+    /// [`EngineConfig::resume`] is on; it is public for other triggers.
+    ///
+    /// Returns at once; the work runs on its own thread. After a short settle time every driven device that is
+    /// not faulted is reset (`release()`, which also makes the driver re-send its init) and sent its current output
+    /// again (colours or mode with device brightness, master brightness and All off applied); released and undriven
+    /// devices are left alone. Writes that fail are retried with back-off for a few seconds, after which the device
+    /// is faulted. Devices that are faulted or missing are re-opened through detection, repeatedly during the
+    /// resume window, and get back what they were driven with. Returns `false` (and does nothing) when a reassert
+    /// started within the debounce time (5 s), since a wake usually reports itself twice, or after shutdown.
+    pub fn reassert(&self) -> bool {
+        Shared::reassert(self.shared())
     }
 
     /// Runs detection again on every backend; devices already under control are skipped and left alone.
