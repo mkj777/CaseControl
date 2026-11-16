@@ -21,5 +21,13 @@ Status: accepted. Source: question rounds in the planning session; research in `
 | 15 | Visual direction | Dark and spacious: few large elements with generous spacing, the device preview is the focus. | More scrolling, less information at a glance. Details are settled with the owner when the Devices page is built. |
 | 16 | Product name | CaseControl. | Window title, tray, installer and `%APPDATA%\CaseControl`. Crate prefix `cc-` stays. |
 | 17 | RAM | The Kingston DDR5 sticks have no RGB (owner confirmed). | Nothing on this machine needs SMBus. The PawnIO tier stays a design boundary only and has no planned work. |
+| 18 | Devices page layout | Overview grid of device tiles; clicking a tile opens that device full-size in its own view with a back arrow. (2026-11-16) | Two views: overview and device detail. |
+| 19 | Colour granularity | Down to single LEDs: whole device, zones, and LEDs selected in the preview. (2026-11-16) | Engine keeps a per-LED buffer; profiles store full buffers. |
+| 20 | Colour picker | Swatches for quick clicks, a free picker (saturation/value area + hue bar + hex) that folds out below. (2026-11-16) | Custom component, no UI library. |
+| 21 | When changes reach hardware | Live while dragging, throttled to the frame rate. No apply button. (2026-11-16) | Engine coalescing is the throttle. |
+| 22 | LED selection | Click selects one LED, dragging sweeps several, Ctrl-click adds. The chosen colour applies to the selection. (2026-11-16) | |
+| 23 | Accent colour | Neutral: whites and greys only; device colours in the previews are the only colour in the UI. (2026-11-16) | |
+| 24 | Startup behaviour | The last applied profile is applied again on start. Without one, devices stay in hardware mode until the user acts. (2026-11-16) | `last_profile` in settings is set on every apply. |
+| 25 | Hardware effects in v1 | Yes: per device a mode menu with speed, brightness, direction and colours as far as the device supports them. (2026-11-16) | |
 
 No owner decisions are open. Implementation starts only after the owner's explicit go.

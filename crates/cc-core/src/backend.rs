@@ -9,18 +9,29 @@ use serde::{Deserialize, Serialize};
 use crate::controller::Controller;
 use crate::device::Bus;
 use crate::error::DeviceError;
+use crate::id::DeviceId;
 
 /// Inputs to a detection pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectContext {
     /// Family ids (see [`crate::family`]) the user turned off. Their detectors must not run.
     pub disabled_families: HashSet<String>,
+    /// Devices the engine already controls. A backend computes each candidate's [`DeviceId`] from enumeration data
+    /// alone (no I/O) and must not open, probe or return a candidate whose id is in this set, so a re-detection after
+    /// a hot-plug event never disturbs a device that is in use.
+    #[serde(default)]
+    pub skip: HashSet<DeviceId>,
 }
 
 impl DetectContext {
     /// Whether detectors of `family` may run.
     pub fn is_enabled(&self, family: &str) -> bool {
         !self.disabled_families.contains(family)
+    }
+
+    /// Whether the device `id` is already controlled and must be left alone.
+    pub fn is_skipped(&self, id: &DeviceId) -> bool {
+        self.skip.contains(id)
     }
 }
 
@@ -174,7 +185,9 @@ mod tests {
 
         let ctx = DetectContext {
             disabled_families: [family::WOOTING.to_string()].into(),
+            ..Default::default()
         };
+        assert!(!ctx.is_skipped(&DeviceId::hid(0x1462, 0x7D75, None)));
         assert!(!ctx.is_enabled(family::WOOTING));
         assert!(ctx.is_enabled(family::LOGITECH));
         assert_eq!(b.detect(&ctx).len(), 1);

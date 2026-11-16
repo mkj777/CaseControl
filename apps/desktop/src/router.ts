@@ -1,13 +1,15 @@
 import { createRouter, createWebHashHistory, type RouteRecordRaw } from 'vue-router'
 import DevicesPage from './pages/DevicesPage.vue'
+import DevicePage from './pages/DevicePage.vue'
 import ProfilesPage from './pages/ProfilesPage.vue'
 import ConflictsPage from './pages/ConflictsPage.vue'
 import SettingsPage from './pages/SettingsPage.vue'
 
-/** The four top-level pages (ADR 0001 #14), in sidebar order. */
+/** The four top-level pages (ADR 0001 #14), in sidebar order, plus the device view (ADR 0001 #18). */
 export const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/devices' },
   { path: '/devices', name: 'devices', component: DevicesPage },
+  { path: '/devices/:id', name: 'device', component: DevicePage, props: true },
   { path: '/profiles', name: 'profiles', component: ProfilesPage },
   { path: '/conflicts', name: 'conflicts', component: ConflictsPage },
   { path: '/settings', name: 'settings', component: SettingsPage },

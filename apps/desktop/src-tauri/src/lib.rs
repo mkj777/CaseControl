@@ -2,19 +2,30 @@
 //!
 //! One process (ADR 0001 #3): a window with the Devices, Profiles, Conflicts and Settings pages, a tray icon
 //! with Show / Apply profile / Release devices / Quit, close-to-tray, a single-instance guard, autostart
-//! registration (not enabled by default), file logging, and the first IPC commands (`app_info`,
-//! `show_window`, `hide_to_tray`, `quit`).
+//! registration, file logging, and the IPC commands and events the pages use.
 //!
-//! It deliberately does not talk to devices yet (Phase 2 adds the engine), has no network access and no
-//! telemetry (ADR 0001 #13), and does not enable autostart on its own (the Settings page does that in Phase 3).
+//! On start it loads settings and profiles (`cc-config`), starts the device engine (`cc-engine`) with every
+//! compiled-in driver (`cc-drivers`) and re-applies the last applied profile. Every exit path (tray Quit, the
+//! `quit` command, `RunEvent::ExitRequested`/`Exit`, which also covers Windows session end) releases the devices
+//! through [`AppState::shutdown_engine`] exactly once.
+//!
+//! It deliberately has no network access and no telemetry (ADR 0001 #13), never changes other software's autostart
+//! (ADR 0001 #12), and enables its own autostart only when the user switches it on in Settings.
 
 pub mod commands;
+pub mod conflicts;
+pub mod events;
 pub mod logging;
+pub mod prefs;
+pub mod profiles;
+pub mod state;
 pub mod tray;
 
 use std::ffi::OsStr;
 
-use tauri::{AppHandle, Manager, Runtime, WindowEvent};
+use tauri::{AppHandle, Manager, RunEvent, Runtime, WindowEvent};
+
+pub use state::AppState;
 
 /// Label of the main window as declared in `tauri.conf.json`.
 pub const MAIN_WINDOW: &str = "main";
@@ -57,10 +68,13 @@ pub fn hide_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     }
 }
 
-/// Orderly shutdown and process exit. Later phases release the devices to firmware control here before
-/// exiting; every exit path (tray Quit, the `quit` command) goes through this function.
+/// Orderly shutdown and process exit: releases every device to its hardware mode (once), then exits. Tray Quit and
+/// the `quit` command call this; the run-loop exit events call [`AppState::shutdown_engine`] directly.
 pub fn shutdown<R: Runtime>(app: &AppHandle<R>) {
     tracing::info!("shutting down");
+    if let Some(state) = app.try_state::<AppState>() {
+        state.shutdown_engine();
+    }
     app.exit(0);
 }
 
@@ -74,7 +88,7 @@ pub fn run() {
         "CaseControl starting"
     );
 
-    let result = tauri::Builder::default()
+    let app = tauri::Builder::default()
         // Must be the first plugin so a second instance exits before anything else initializes.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             tracing::info!(?args, "second instance started; focusing the main window");
@@ -91,6 +105,25 @@ pub fn run() {
             commands::show_window,
             commands::hide_to_tray,
             commands::quit,
+            commands::list_devices,
+            commands::set_direct,
+            commands::set_zone,
+            commands::set_mode,
+            commands::resize_zone,
+            commands::save_to_hardware,
+            commands::release_device,
+            commands::release_all,
+            commands::rescan,
+            commands::list_profiles,
+            commands::save_profile,
+            commands::apply_profile,
+            commands::rename_profile,
+            commands::delete_profile,
+            commands::scan_conflicts,
+            commands::terminate_process,
+            commands::stop_service,
+            commands::get_settings,
+            commands::set_settings,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event
@@ -104,19 +137,44 @@ pub fn run() {
             }
         })
         .setup(move |app| {
-            tray::create(app.handle())?;
+            let state = AppState::init();
+            let start_minimized = state.settings().start_minimized;
+            if let Ok(engine) = state.engine() {
+                events::spawn_forwarder(app.handle().clone(), engine.subscribe());
+            }
+            state.apply_last_profile();
+            let profiles = state.profile_list().unwrap_or_else(|err| {
+                tracing::warn!(%err, "cannot list profiles for the tray");
+                profiles::ProfileList {
+                    names: Vec::new(),
+                    active: None,
+                }
+            });
+            app.manage(state);
+            tray::create(app.handle(), &profiles)?;
             // The window is declared with `visible: false` so a hidden start never flashes it.
-            if !hidden {
+            if !hidden && !start_minimized {
                 show_main_window(app.handle())?;
             }
             Ok(())
         })
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!());
 
-    if let Err(err) = result {
-        tracing::error!(%err, "CaseControl failed to start");
-        panic!("error while running CaseControl: {err}");
-    }
+    let app = match app {
+        Ok(app) => app,
+        Err(err) => {
+            tracing::error!(%err, "CaseControl failed to start");
+            panic!("error while running CaseControl: {err}");
+        }
+    };
+    app.run(|app, event| {
+        // `Exit` also arrives on Windows session end (WM_ENDSESSION), where the process ends right after.
+        if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit)
+            && let Some(state) = app.try_state::<AppState>()
+        {
+            state.shutdown_engine();
+        }
+    });
 }
 
 #[cfg(test)]

@@ -1,28 +1,42 @@
-/* Neutral first-pass theme (ADR 0001 #15): dark only, spacious, system fonts, no component library.
-   Colors and spacing live in custom properties so the visual direction can change in one place. */
+/* Visual direction (ADR 0001 #15, #23): dark, spacious, few large elements, neutral greys and white only. The device
+   colours in the previews are the only colour in the UI. System font, no component library, restrained motion.
+   Colours and spacing live in custom properties so the direction can change in one place. */
 :root {
   --color-bg: #121316;
   --color-surface: #17181c;
   --color-surface-raised: #1f2126;
+  --color-surface-hover: #262830;
   --color-border: #2a2c32;
+  --color-border-strong: #3a3d45;
   --color-text: #e6e7ea;
   --color-text-muted: #9a9ca3;
-  --color-accent: #8ab4f8;
+  --color-text-faint: #6c6f77;
+  /* Neutral accent: focus rings, selection outlines, the primary button. */
+  --color-accent: #e6e7ea;
+  --color-accent-text: #121316;
+  --color-led-off: #0b0c0e;
 
   --space-1: 4px;
   --space-2: 8px;
   --space-3: 12px;
   --space-4: 16px;
+  --space-5: 20px;
   --space-6: 24px;
   --space-8: 40px;
+  --space-10: 56px;
 
   --radius: 8px;
+  --radius-lg: 14px;
   --sidebar-width: 220px;
+  --content-width: 1040px;
 
   --font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-size-sm: 13px;
   --font-size: 15px;
   --font-size-lg: 18px;
   --font-size-xl: 28px;
+
+  --transition: 120ms ease-out;
 
   color-scheme: dark;
   font-family: var(--font-family);
@@ -48,13 +62,62 @@ h1 {
   font-weight: 600;
 }
 
+h2 {
+  margin: 0 0 var(--space-4);
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+}
+
 p {
   margin: 0;
+}
+
+.page {
+  max-width: var(--content-width);
+}
+
+.page-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-6);
+  margin-bottom: var(--space-8);
 }
 
 .page-description {
   max-width: 60ch;
   color: var(--color-text-muted);
+}
+
+.section {
+  margin-top: var(--space-10);
+}
+
+.muted {
+  color: var(--color-text-muted);
+}
+
+.small {
+  font-size: var(--font-size-sm);
+}
+
+/* A plain notice block; text carries the meaning, not colour. */
+.notice {
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.notice + .notice {
+  margin-top: var(--space-3);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
 }
 
 button {
@@ -65,14 +128,79 @@ button {
   color: var(--color-text);
   background: var(--color-surface-raised);
   cursor: pointer;
+  transition:
+    border-color var(--transition),
+    background var(--transition);
 }
 
-button:hover {
+button:hover:not(:disabled) {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-hover);
+}
+
+button:disabled {
+  color: var(--color-text-faint);
+  cursor: default;
+}
+
+button.primary {
   border-color: var(--color-accent);
+  color: var(--color-accent-text);
+  background: var(--color-accent);
+}
+
+button.primary:hover:not(:disabled) {
+  background: #ffffff;
+}
+
+button.link {
+  padding: 0;
+  border: 0;
+  color: var(--color-text-muted);
+  background: none;
+}
+
+button.link:hover:not(:disabled) {
+  color: var(--color-text);
+  background: none;
+}
+
+input[type='text'],
+input[type='number'],
+select {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  font: inherit;
+  color: var(--color-text);
+  background: var(--color-surface);
+}
+
+input[type='range'] {
+  accent-color: var(--color-accent);
+}
+
+input[type='checkbox'] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--color-accent);
+}
+
+a {
+  color: var(--color-text);
 }
 
 button:focus-visible,
-a:focus-visible {
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
   outline: 2px solid var(--color-accent);
   outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --transition: 0ms;
+  }
 }

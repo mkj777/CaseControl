@@ -1,0 +1,164 @@
+//! The one managed [`AppState`]: storage locations, settings, the engine handle, the last conflict scan and the
+//! shutdown latch.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use cc_config::{Paths, ProfileStore, Settings};
+use cc_conflicts::ScanReport;
+use cc_engine::EngineHandle;
+use parking_lot::{Mutex, MutexGuard};
+
+use crate::prefs::engine_config;
+use crate::profiles::{ProfileList, profile_list};
+
+/// Time the engine gets to release every device on exit.
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Where settings and profiles live.
+#[derive(Debug)]
+pub struct Storage {
+    /// Directories.
+    pub paths: Paths,
+    /// Profile files.
+    pub profiles: ProfileStore,
+}
+
+/// Everything the commands, the tray and the exit paths share.
+#[derive(Debug)]
+pub struct AppState {
+    storage: Result<Storage, String>,
+    settings: Mutex<Settings>,
+    engine: Result<EngineHandle, String>,
+    last_scan: Mutex<Option<ScanReport>>,
+    shut_down: AtomicBool,
+}
+
+impl AppState {
+    /// Resolves and creates the storage folders, loads the settings and starts the engine with every compiled-in
+    /// backend. Never fails: a storage problem leaves the defaults in place (nothing is saved), an engine start
+    /// failure is kept as a message for the Devices page.
+    pub fn init() -> Self {
+        let storage = match Paths::from_env() {
+            Some(paths) => match paths.ensure() {
+                Ok(()) => Ok(Storage {
+                    profiles: ProfileStore::new(&paths),
+                    paths,
+                }),
+                Err(err) => Err(format!("cannot create the settings folders: {err}")),
+            },
+            None => Err("cannot determine the user's AppData folders".to_owned()),
+        };
+        let settings = match &storage {
+            Ok(s) => Settings::load(&s.paths).unwrap_or_else(|err| {
+                tracing::error!(%err, "cannot read settings; using defaults");
+                Settings::default()
+            }),
+            Err(err) => {
+                tracing::error!(%err, "no storage; settings and profiles will not be saved");
+                Settings::default()
+            }
+        };
+        let engine = cc_engine::start(engine_config(&settings), cc_drivers::all_backends()).map_err(|err| {
+            tracing::error!(%err, "engine failed to start");
+            format!("The device engine could not start: {err}")
+        });
+        Self {
+            storage,
+            settings: Mutex::new(settings),
+            engine,
+            last_scan: Mutex::new(None),
+            shut_down: AtomicBool::new(false),
+        }
+    }
+
+    /// Re-applies the last applied profile if it still exists (ADR 0001 #24). Without one, devices stay in their
+    /// hardware mode.
+    pub fn apply_last_profile(&self) {
+        let Some(name) = self.settings.lock().last_profile.clone() else {
+            return;
+        };
+        let (Ok(engine), Ok(storage)) = (&self.engine, &self.storage) else {
+            return;
+        };
+        match storage.profiles.load(&name) {
+            Ok(profile) => {
+                let report = engine.apply(&profile.devices);
+                tracing::info!(
+                    profile = %profile.name,
+                    applied = report.applied.len(),
+                    missing = report.missing.len(),
+                    failed = report.failed.len(),
+                    "last profile applied on start"
+                );
+            }
+            Err(err) => tracing::warn!(profile = %name, %err, "last profile not applied"),
+        }
+    }
+
+    /// The running engine, or why there is none.
+    pub fn engine(&self) -> Result<&EngineHandle, String> {
+        self.engine.as_ref().map_err(Clone::clone)
+    }
+
+    /// Why the engine did not start, if it did not.
+    pub fn engine_error(&self) -> Option<String> {
+        self.engine.as_ref().err().cloned()
+    }
+
+    /// Settings and profile storage, or why it is unavailable.
+    pub fn storage(&self) -> Result<&Storage, String> {
+        self.storage.as_ref().map_err(Clone::clone)
+    }
+
+    /// The current settings.
+    pub fn settings(&self) -> MutexGuard<'_, Settings> {
+        self.settings.lock()
+    }
+
+    /// Runs `change` on a copy of the settings and saves the copy; the in-memory settings only change if both
+    /// succeed. Holds the settings lock throughout, so concurrent updates do not lose each other's changes.
+    pub fn update_settings<T>(
+        &self,
+        change: impl FnOnce(&mut Settings) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let storage = self.storage()?;
+        let mut guard = self.settings.lock();
+        let mut next = guard.clone();
+        let out = change(&mut next)?;
+        next.save(&storage.paths)
+            .map_err(|err| format!("cannot save settings: {err}"))?;
+        *guard = next;
+        Ok(out)
+    }
+
+    /// The profile names with the active one.
+    pub fn profile_list(&self) -> Result<ProfileList, String> {
+        let names = self.storage()?.profiles.list().map_err(|err| err.to_string())?;
+        Ok(profile_list(names, self.settings().last_profile.as_deref()))
+    }
+
+    /// Stores the latest conflict scan (actions are checked against it).
+    pub fn set_last_scan(&self, report: ScanReport) {
+        *self.last_scan.lock() = Some(report);
+    }
+
+    /// Runs `f` on the latest conflict scan.
+    pub fn with_last_scan<T>(&self, f: impl FnOnce(&ScanReport) -> Result<T, String>) -> Result<T, String> {
+        match self.last_scan.lock().as_ref() {
+            Some(report) => f(report),
+            None => Err("no conflict scan yet; scan first".to_owned()),
+        }
+    }
+
+    /// Releases every device and stops the engine, exactly once; later calls return immediately.
+    pub fn shutdown_engine(&self) {
+        if self.shut_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Ok(engine) = &self.engine {
+            tracing::info!("releasing devices and stopping the engine");
+            engine.shutdown(SHUTDOWN_TIMEOUT);
+        }
+    }
+}
