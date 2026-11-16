@@ -3,6 +3,7 @@
 // (ADR 0001 #20). Emits every change while dragging; the caller throttles what it sends.
 import { computed, ref, watch } from 'vue'
 import { SWATCHES, hexToHsv, hsvToHex, normalizeHex, sameColor, type Hsv } from '../lib/color'
+import { Button, TextField } from './ui'
 
 const props = withDefaults(defineProps<{ modelValue: string; disabled?: boolean }>(), { disabled: false })
 const emit = defineEmits<{ 'update:modelValue': [hex: string] }>()
@@ -102,9 +103,9 @@ function onHex() {
         :disabled="disabled"
         @click="pick(s.hex)"
       />
-      <button type="button" class="link more" :aria-expanded="open" :disabled="disabled" @click="open = !open">
+      <Button variant="ghost" class="more" :aria-expanded="open" :disabled="disabled" @click="open = !open">
         {{ open ? 'Fewer options' : 'Custom colour' }}
-      </button>
+      </Button>
     </div>
 
     <div v-if="open" class="custom">
@@ -136,9 +137,10 @@ function onHex() {
       <label class="hex row">
         <span class="muted small">Hex</span>
         <span class="current-color" :style="{ backgroundColor: modelValue }" />
-        <input
+        <TextField
           v-model="hexInput"
-          type="text"
+          class="hex-input"
+          mono
           maxlength="7"
           spellcheck="false"
           :disabled="disabled"
@@ -168,21 +170,21 @@ function onHex() {
   gap: var(--space-3);
 }
 
+/* Swatches follow the LED border and selection rules. */
 .swatch {
-  width: 36px;
-  height: 36px;
+  width: var(--control-height);
   padding: 0;
-  border: 1px solid var(--color-border-strong);
-  border-radius: 50%;
+  border: 1px solid var(--led-border);
+  border-radius: var(--radius-full);
 }
 
 .swatch:hover:not(:disabled) {
-  border-color: var(--color-text-muted);
+  border-color: var(--text-muted);
 }
 
 .swatch.current {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 3px;
+  outline: 2px solid var(--selection);
+  outline-offset: 2px;
 }
 
 .more {
@@ -200,7 +202,7 @@ function onHex() {
 .area {
   position: relative;
   height: 200px;
-  border-radius: var(--radius);
+  border-radius: var(--radius-md);
   background-image:
     linear-gradient(to top, #000, rgba(0, 0, 0, 0)),
     linear-gradient(to right, #fff, rgba(255, 255, 255, 0));
@@ -211,18 +213,19 @@ function onHex() {
 .hue {
   position: relative;
   height: 16px;
-  border-radius: 8px;
+  border-radius: var(--radius-full);
   background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);
   cursor: pointer;
   touch-action: none;
 }
 
+/* The thumb sits on arbitrary colours, so it is white with a dark edge, like the native pickers. */
 .thumb {
   position: absolute;
   width: 16px;
   height: 16px;
   border: 2px solid #fff;
-  border-radius: 50%;
+  border-radius: var(--radius-full);
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
   transform: translate(-50%, -50%);
   pointer-events: none;
@@ -232,15 +235,14 @@ function onHex() {
   top: 50%;
 }
 
-.hex input {
+.hex-input {
   width: 110px;
-  font-family: ui-monospace, Consolas, monospace;
 }
 
 .current-color {
   width: 24px;
   height: 24px;
-  border: 1px solid var(--color-border-strong);
-  border-radius: 4px;
+  border: 1px solid var(--led-border);
+  border-radius: var(--radius-sm);
 }
 </style>

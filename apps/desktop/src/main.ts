@@ -1,7 +1,9 @@
+// Tokens first, then the base styles, then the components, so component styles come last in the cascade.
+import './tokens.css'
+import './styles.css'
 import { createApp } from 'vue'
 import App from './App.vue'
 import { router } from './router'
-import './styles.css'
 
 // The browser's own context menu does not belong in a desktop app; keep it only where text is edited (copy/paste).
 // In-app menus (hide/unhide) open from their own `contextmenu` handlers.

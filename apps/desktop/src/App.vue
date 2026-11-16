@@ -63,8 +63,8 @@ onMounted(() => {
   flex-direction: column;
   gap: var(--space-4);
   padding: 0 var(--space-4) var(--space-6);
-  background: var(--color-surface);
-  border-right: 1px solid var(--color-border);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
 }
 
 .brand {
@@ -75,10 +75,8 @@ onMounted(() => {
   /* Reach the sidebar's edges so the whole strip drags the window. */
   margin: 0 calc(-1 * var(--space-4));
   padding: 0 calc(var(--space-4) + var(--space-3));
-  font-size: var(--font-size-lg);
-  font-weight: 600;
-  user-select: none;
-  cursor: default;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-strong);
 }
 
 .nav {
@@ -88,19 +86,22 @@ onMounted(() => {
 }
 
 .nav-link {
-  padding: var(--space-3);
-  border-radius: var(--radius);
-  color: var(--color-text-muted);
+  display: flex;
+  align-items: center;
+  height: var(--control-height);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
   text-decoration: none;
   transition:
     color var(--transition),
-    background var(--transition);
+    background-color var(--transition);
 }
 
 .nav-link:hover,
 .nav-link.active {
-  color: var(--color-text);
-  background: var(--color-surface-raised);
+  color: var(--text);
+  background: var(--surface-raised);
 }
 
 .main {
@@ -111,17 +112,18 @@ onMounted(() => {
 }
 
 .titlebar {
+  position: relative;
+  z-index: var(--z-titlebar);
   display: flex;
   justify-content: flex-end;
   flex: none;
   height: var(--titlebar-height);
-  user-select: none;
 }
 
 .content {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: var(--space-4) var(--space-10) var(--space-8);
+  padding: var(--page-pad-top) var(--page-pad-x) var(--space-10);
 }
 </style>

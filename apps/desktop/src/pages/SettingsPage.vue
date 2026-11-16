@@ -12,6 +12,7 @@ import {
   type SettingsPatch,
   type SettingsView,
 } from '../ipc'
+import { Button, Field, KeyValueList, Notice, NumberField, PageHeader, Slider, Switch } from '../components/ui'
 import { familyLabel } from '../lib/device'
 
 const settings = ref<SettingsView | null>(null)
@@ -53,10 +54,8 @@ async function patch(p: SettingsPatch) {
   }
 }
 
-const checked = (e: Event) => (e.target as HTMLInputElement).checked
-
-function onFrameRate() {
-  const fps = Math.min(60, Math.max(1, Math.round(Number(frameRate.value) || 1)))
+/** Sends the frame rate once a drag ends or the number is committed (NumberField clamps it to 1 to 60). */
+function onFrameRate(fps: number) {
   frameRate.value = fps
   if (settings.value && fps !== settings.value.frame_rate) void patch({ frame_rate: fps })
 }
@@ -72,178 +71,124 @@ async function onHide() {
 
 <template>
   <section class="page">
-    <header class="page-header">
-      <div>
-        <h1>Settings</h1>
-        <p class="page-description">Changes are saved right away.</p>
-      </div>
-    </header>
+    <PageHeader title="Settings" description="Changes are saved right away." />
 
-    <p v-if="settings?.save_error" class="notice">{{ settings.save_error }}</p>
-    <p v-if="error && error !== settings?.save_error" class="notice">{{ error }}</p>
+    <Notice v-if="settings?.save_error" variant="error">{{ settings.save_error }}</Notice>
+    <Notice v-if="error && error !== settings?.save_error" variant="error">{{ error }}</Notice>
 
     <template v-if="settings">
       <div class="group">
         <h2>Startup</h2>
-        <label class="setting">
-          <input
-            type="checkbox"
-            :checked="settings.autostart"
-            :disabled="locked"
-            @change="patch({ autostart: checked($event) })"
-          />
-          <span>
-            Start with Windows
-            <span class="hint">CaseControl starts in the tray when you sign in.</span>
-          </span>
-        </label>
-        <label class="setting">
-          <input
-            type="checkbox"
-            :checked="settings.start_minimized"
-            :disabled="locked"
-            @change="patch({ start_minimized: checked($event) })"
-          />
-          <span>
-            Start minimized
-            <span class="hint">Open in the tray without showing this window.</span>
-          </span>
-        </label>
+        <Switch
+          :model-value="settings.autostart"
+          label="Start with Windows"
+          hint="CaseControl starts in the tray when you sign in."
+          :disabled="locked"
+          @update:model-value="patch({ autostart: $event })"
+        />
+        <Switch
+          :model-value="settings.start_minimized"
+          label="Start minimized"
+          hint="Open in the tray without showing this window."
+          :disabled="locked"
+          @update:model-value="patch({ start_minimized: $event })"
+        />
       </div>
 
       <div class="group">
         <h2>Updates</h2>
-        <div class="setting rate">
-          <span>
-            Frame rate
-            <span class="hint">How often per second a device gets new colours while you edit, 1 to 60.</span>
-          </span>
-          <span class="row">
-            <input v-model.number="frameRate" type="range" min="1" max="60" step="1" aria-label="Frame rate" :disabled="locked" @change="onFrameRate" />
-            <input v-model.number="frameRate" type="number" min="1" max="60" aria-label="Frame rate" :disabled="locked" @change="onFrameRate" />
-          </span>
-        </div>
+        <Field
+          v-slot="{ id, describedBy }"
+          label="Frame rate"
+          hint="How often per second a device gets new colours while you edit, 1 to 60."
+          layout="stacked"
+        >
+          <Slider
+            v-model="frameRate"
+            class="rate"
+            :min="1"
+            :max="60"
+            aria-label="Frame rate"
+            :aria-describedby="describedBy"
+            :disabled="locked"
+            @change="onFrameRate"
+          />
+          <NumberField
+            :id="id"
+            :model-value="frameRate"
+            :min="1"
+            :max="60"
+            :aria-describedby="describedBy"
+            :disabled="locked"
+            @update:model-value="onFrameRate"
+          />
+        </Field>
       </div>
 
       <div class="group">
         <h2>Device detectors</h2>
-        <p class="hint block">Switch a family off to leave its devices alone. CaseControl releases them right away.</p>
-        <label v-for="(on, family) in settings.detectors" :key="family" class="setting">
-          <input
-            type="checkbox"
-            :checked="on"
-            :disabled="locked"
-            @change="patch({ detectors: { [family]: checked($event) } })"
-          />
-          <span>{{ familyLabel(String(family)) }}</span>
-        </label>
+        <p class="hint">Switch a family off to leave its devices alone. CaseControl releases them right away.</p>
+        <Switch
+          v-for="(on, family) in settings.detectors"
+          :key="family"
+          :model-value="on"
+          :label="familyLabel(String(family))"
+          :disabled="locked"
+          @update:model-value="patch({ detectors: { [family]: $event } })"
+        />
       </div>
 
       <div class="group">
         <h2>Conflicts</h2>
-        <label class="setting">
-          <input
-            type="checkbox"
-            :checked="settings.check_openrgb_port"
-            :disabled="locked"
-            @change="patch({ check_openrgb_port: checked($event) })"
-          />
-          <span>
-            Check for a running OpenRGB server
-            <span class="hint">Scans try a local connection to port 6742. This is the only connection CaseControl ever opens.</span>
-          </span>
-        </label>
+        <Switch
+          :model-value="settings.check_openrgb_port"
+          label="Check for a running OpenRGB server"
+          hint="Scans try a local connection to port 6742. This is the only connection CaseControl ever opens."
+          :disabled="locked"
+          @update:model-value="patch({ check_openrgb_port: $event })"
+        />
       </div>
     </template>
 
     <div class="group">
       <h2>About</h2>
-      <dl v-if="info" class="info">
+      <KeyValueList v-if="info">
         <dt>Name</dt>
         <dd>{{ info.name }}</dd>
         <dt>Version</dt>
         <dd>{{ info.version }}</dd>
         <dt>Build</dt>
         <dd>{{ info.profile }}</dd>
-      </dl>
-      <button type="button" @click="onHide">Hide to tray</button>
+      </KeyValueList>
+      <div>
+        <Button @click="onHide">Hide to tray</Button>
+      </div>
     </div>
   </section>
 </template>
 
 <style scoped>
-.notice {
-  margin-bottom: var(--space-6);
-}
-
 .group {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
-  margin-bottom: var(--space-10);
+}
+
+.group + .group {
+  margin-top: var(--space-14);
 }
 
 .group h2 {
   margin-bottom: 0;
 }
 
-.setting {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--space-4);
-  max-width: 640px;
-  cursor: pointer;
-}
-
-.setting input[type='checkbox'] {
-  flex: none;
-  margin: 3px 0 0;
-}
-
-.setting > span {
-  display: flex;
-  flex-direction: column;
-}
-
-.setting.rate {
-  flex-direction: column;
-  gap: var(--space-3);
-  cursor: default;
-}
-
-.rate input[type='range'] {
-  width: 280px;
-}
-
-.rate input[type='number'] {
-  width: 80px;
-}
-
 .hint {
-  font-size: var(--font-size-sm);
-  color: var(--color-text-muted);
+  max-width: var(--row-max-width);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
-.block {
-  max-width: 640px;
-}
-
-.info {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: var(--space-2) var(--space-6);
-  margin: 0 0 var(--space-4);
-}
-
-.info dt {
-  color: var(--color-text-muted);
-}
-
-.info dd {
-  margin: 0;
-}
-
-.group > button {
-  align-self: flex-start;
+.rate {
+  width: var(--control-max-width);
 }
 </style>

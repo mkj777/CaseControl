@@ -2,7 +2,16 @@
 // Profiles: what every device shows, saved under a name. The active profile is the one applied last; it is applied
 // again when CaseControl starts (ADR 0001 #24).
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import ConfirmDialog from '../components/ConfirmDialog.vue'
+import {
+  Button,
+  ConfirmDialog,
+  EmptyState,
+  ListRow,
+  Notice,
+  PageHeader,
+  StatusBadge,
+  TextField,
+} from '../components/ui'
 import {
   applyProfile,
   deleteProfile,
@@ -136,54 +145,48 @@ async function onDelete() {
 
 <template>
   <section class="page">
-    <header class="page-header">
-      <div>
-        <h1>Profiles</h1>
-        <p class="page-description">
-          A profile remembers what every device shows. The active profile is applied again when CaseControl starts.
-        </p>
-      </div>
-    </header>
+    <PageHeader
+      title="Profiles"
+      description="A profile remembers what every device shows. The active profile is applied again when CaseControl starts."
+    />
 
     <form class="save row" @submit.prevent="onSaveAs">
-      <input v-model="newName" type="text" placeholder="Profile name" maxlength="64" aria-label="Profile name" />
-      <button type="submit" class="primary" :disabled="busy || !newName.trim() || !hasDevices">Save current as…</button>
+      <TextField v-model="newName" class="name-input" placeholder="Profile name" maxlength="64" aria-label="Profile name" />
+      <Button type="submit" variant="primary" :disabled="busy || !newName.trim() || !hasDevices">Save current as…</Button>
       <span v-if="!hasDevices" class="muted small">Connect a device first.</span>
     </form>
 
-    <p v-if="error" class="notice">{{ error }}</p>
-    <p v-if="message" class="notice">{{ message }}</p>
+    <Notice v-if="error" variant="error">{{ error }}</Notice>
+    <Notice v-if="message">{{ message }}</Notice>
 
-    <ul v-if="list.names.length > 0" class="list">
-      <li v-for="name in list.names" :key="name" class="item" :class="{ active: isActive(name) }">
-        <template v-if="renaming === name">
-          <form class="row grow" @submit.prevent="onRename">
-            <input v-model="renameTo" type="text" maxlength="64" aria-label="New name" />
-            <button type="submit" class="primary" :disabled="busy || !renameTo.trim()">Rename</button>
-            <button type="button" :disabled="busy" @click="renaming = null">Cancel</button>
+    <ul v-if="list.names.length > 0">
+      <template v-for="name in list.names" :key="name">
+        <ListRow v-if="renaming === name">
+          <form class="row rename" @submit.prevent="onRename">
+            <TextField v-model="renameTo" class="name-input" maxlength="64" aria-label="New name" />
+            <Button type="submit" size="sm" :disabled="busy || !renameTo.trim()">Rename</Button>
+            <Button variant="ghost" size="sm" :disabled="busy" @click="renaming = null">Cancel</Button>
           </form>
-        </template>
-        <template v-else>
-          <div class="grow">
-            <span class="name">{{ name }}</span>
-            <span v-if="isActive(name)" class="marker small">Active</span>
-          </div>
-          <div class="row">
-            <button type="button" :disabled="busy" @click="onApply(name)">Apply</button>
-            <button type="button" class="link" :disabled="busy" @click="startRename(name)">Rename</button>
-            <button type="button" class="link" :disabled="busy" @click="deleting = name">Delete</button>
-          </div>
-        </template>
-      </li>
+        </ListRow>
+        <ListRow v-else :name="name">
+          <StatusBadge v-if="isActive(name)" status="current">Active</StatusBadge>
+          <template #actions>
+            <Button size="sm" :disabled="busy" @click="onApply(name)">Apply</Button>
+            <Button variant="ghost" size="sm" :disabled="busy" @click="startRename(name)">Rename</Button>
+            <Button variant="danger" size="sm" :disabled="busy" @click="deleting = name">Delete</Button>
+          </template>
+        </ListRow>
+      </template>
     </ul>
-    <p v-else-if="loaded" class="empty muted">
-      No profiles yet. Set up your devices, then save the result here under a name.
-    </p>
+    <EmptyState v-else-if="loaded" title="No profiles yet">
+      Set up your devices, then save the result here under a name.
+    </EmptyState>
 
     <ConfirmDialog
       :open="deleting !== null"
       title="Delete profile?"
       confirm-label="Delete"
+      danger
       :busy="busy"
       @confirm="onDelete"
       @cancel="deleting = null"
@@ -206,57 +209,14 @@ async function onDelete() {
 
 <style scoped>
 .save {
-  margin-bottom: var(--space-8);
+  margin-bottom: var(--space-10);
 }
 
-.save input {
-  width: 280px;
+.name-input {
+  width: var(--control-max-width);
 }
 
-.notice {
-  margin-bottom: var(--space-6);
-}
-
-.list {
-  display: flex;
-  flex-direction: column;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-  border-top: 1px solid var(--color-border);
-}
-
-.item {
-  display: flex;
-  align-items: center;
-  gap: var(--space-6);
-  min-height: 72px;
-  padding: var(--space-4) var(--space-2);
-  border-bottom: 1px solid var(--color-border);
-}
-
-.grow {
+.rename {
   flex: 1;
-  display: flex;
-  align-items: center;
-  gap: var(--space-4);
-}
-
-.name {
-  font-size: var(--font-size-lg);
-}
-
-.marker {
-  padding: 2px var(--space-2);
-  border: 1px solid var(--color-text);
-  border-radius: 999px;
-}
-
-.row .link {
-  margin-left: var(--space-2);
-}
-
-.empty {
-  padding: var(--space-8) 0;
 }
 </style>

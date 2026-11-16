@@ -8,12 +8,26 @@
 // are queued or in flight, the page shows its own latest intent instead of the store, so a refresh that raced an
 // edit cannot roll the controls back; the intent is dropped once the sender is idle and a fresh reload has landed.
 import { computed, ref, watch } from 'vue'
-import { RouterLink } from 'vue-router'
 import ColorPicker from '../components/ColorPicker.vue'
-import ConfirmDialog from '../components/ConfirmDialog.vue'
-import ContextMenu, { type MenuItem } from '../components/ContextMenu.vue'
 import DevicePreview from '../components/DevicePreview.vue'
 import ModeControls from '../components/ModeControls.vue'
+import {
+  Button,
+  Card,
+  ConfirmDialog,
+  ContextMenu,
+  EmptyState,
+  Field,
+  KeyValueList,
+  Notice,
+  NumberField,
+  PageHeader,
+  Select,
+  StatusBadge,
+  Switch,
+  menuPoint,
+  type MenuItem,
+} from '../components/ui'
 import {
   errorText,
   releaseDevice,
@@ -239,7 +253,7 @@ function onZoneMenu(index: number, e: MouseEvent) {
   menuItems.value = [
     { label: hidden ? 'Unhide zone' : 'Hide zone', action: () => void setZoneHiddenTo(zone.name, !hidden) },
   ]
-  menuAt.value = { x: e.clientX, y: e.clientY }
+  menuAt.value = menuPoint(e)
 }
 
 async function setZoneHiddenTo(zoneName: string, hidden: boolean) {
@@ -259,14 +273,9 @@ async function setZoneHiddenTo(zoneName: string, hidden: boolean) {
   }
 }
 
-async function onResize(zone: Zone, index: number, raw: string) {
-  const r = zone.resizable
-  const len = Math.round(Number(raw))
-  if (!r || !Number.isFinite(len) || len === zone.len) return
-  if (len < r.start || len > r.end) {
-    error.value = `${zone.name} takes ${r.start} to ${r.end} LEDs.`
-    return
-  }
+/** `len` is already clamped to the zone's range by the NumberField. */
+async function onResize(zone: Zone, index: number, len: number) {
+  if (!zone.resizable || len === zone.len) return
   busy.value = true
   error.value = null
   try {
@@ -328,43 +337,43 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
 
 <template>
   <section class="page wide">
-    <RouterLink to="/devices" class="back">← Devices</RouterLink>
-
     <template v-if="device && desc">
-      <header class="head">
-        <div>
-          <h1>{{ desc.info.name }}</h1>
-          <p class="muted">
-            {{ kindLabel(desc.info.kind) }} · {{ desc.info.vendor }} ·
-            {{ deviceHidden ? 'Hidden' : STATUS_LABEL[statusOf(device)] }}
-          </p>
-        </div>
-        <label class="row toggle">
-          <input v-model="deviceState.showHiddenZones" type="checkbox" />
-          <span>Show hidden</span>
-        </label>
-      </header>
+      <PageHeader
+        :title="desc.info.name"
+        :meta="`${kindLabel(desc.info.kind)} · ${desc.info.vendor}`"
+        :back="{ to: '/devices', label: 'Devices' }"
+      >
+        <template #badge>
+          <StatusBadge v-if="deviceHidden" status="hidden">Hidden</StatusBadge>
+          <StatusBadge v-else :status="statusOf(device)">{{ STATUS_LABEL[statusOf(device)] }}</StatusBadge>
+        </template>
+        <template #actions>
+          <Switch v-model="deviceState.showHiddenZones" label="Show hidden" compact />
+        </template>
+      </PageHeader>
 
-      <div v-if="deviceHidden" class="notice">
-        <p>This device is hidden, so CaseControl does not control it.</p>
-        <p class="muted small">To unhide it, turn on Show hidden on the Devices page and right-click the device.</p>
-      </div>
+      <Notice v-if="deviceHidden">
+        This device is hidden, so CaseControl does not control it.
+        <template #details>
+          To unhide it, turn on Show hidden on the Devices page and right-click the device.
+        </template>
+      </Notice>
 
-      <div v-if="device.status.state === 'faulted'" class="notice">
-        <p>CaseControl stopped talking to this device after an error: {{ device.status.error }}</p>
-        <p class="muted small">
+      <Notice v-if="device.status.state === 'faulted'" variant="error">
+        CaseControl stopped talking to this device after an error: {{ device.status.error }}
+        <template #details>
           Close other software that uses it or re-plug it, then press Rescan on the Devices page to retry.
-        </p>
-      </div>
+        </template>
+      </Notice>
 
       <div v-if="editingStatic" class="row selection">
         <span>{{ selectionText }}</span>
-        <button type="button" class="link" :disabled="locked" @click="selectAll">All</button>
-        <button type="button" class="link" :disabled="locked" @click="onSelect(EMPTY)">None</button>
+        <Button variant="ghost" size="sm" :disabled="locked" @click="selectAll">All</Button>
+        <Button variant="ghost" size="sm" :disabled="locked" @click="onSelect(EMPTY)">None</Button>
         <span class="muted small">Click an LED, drag across several, Ctrl-click to add. Right-click a zone to hide it.</span>
       </div>
 
-      <div class="stage">
+      <Card padding="lg">
         <DevicePreview
           variant="stage"
           :description="desc"
@@ -376,22 +385,17 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
           @select="onSelect"
           @zone-menu="onZoneMenu"
         />
-      </div>
+      </Card>
 
       <div class="panel">
-        <label class="mode row">
-          <span class="muted">Mode</span>
-          <select
-            :value="menuValue"
-            :disabled="locked || busy"
-            @change="onMenu(($event.target as HTMLSelectElement).value)"
-          >
+        <Field v-slot="{ id }" label="Mode">
+          <Select :id="id" :model-value="menuValue" :disabled="locked || busy" @update:model-value="onMenu">
             <option v-if="menuValue === DEFAULT" :value="DEFAULT" disabled>Device default</option>
             <option v-if="menuValue === RELEASED" :value="RELEASED" disabled>Hardware (released)</option>
             <option v-if="hasDirect" :value="STATIC">Static (per LED)</option>
             <option v-for="m in modes" :key="m.id" :value="String(m.id)">{{ m.name }}</option>
-          </select>
-        </label>
+          </Select>
+        </Field>
 
         <p v-if="menuValue === DEFAULT || menuValue === RELEASED" class="muted">
           The device shows its own hardware mode until you pick a colour or a mode here.
@@ -408,50 +412,54 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
         />
       </div>
 
-      <p v-if="error" class="notice">{{ error }}</p>
-      <p v-if="notice" class="notice">{{ notice }}</p>
+      <Notice v-if="error" variant="error">{{ error }}</Notice>
+      <Notice v-if="notice">{{ notice }}</Notice>
 
       <div v-if="resizable.length > 0" class="section">
         <h2>LED count</h2>
-        <p class="muted block">Set how many LEDs are connected to each header.</p>
+        <p class="muted intro">Set how many LEDs are connected to each header.</p>
         <div class="zones">
-          <label v-for="z in resizable" :key="z.index" class="zone row" :class="{ hidden: z.hidden }">
-            <span class="zone-name">{{ z.zone.name }}</span>
-            <input
-              type="number"
-              :min="z.zone.resizable?.start"
-              :max="z.zone.resizable?.end"
-              :value="z.zone.len"
+          <Field
+            v-for="z in resizable"
+            v-slot="{ id }"
+            :key="z.index"
+            :label="z.zone.name"
+            :class="{ 'hidden-zone': z.hidden }"
+          >
+            <NumberField
+              :id="id"
+              :model-value="z.zone.len"
+              :min="z.zone.resizable?.start ?? 0"
+              :max="z.zone.resizable?.end ?? 0"
               :disabled="locked || busy || z.hidden"
-              @change="onResize(z.zone, z.index, ($event.target as HTMLInputElement).value)"
+              @update:model-value="onResize(z.zone, z.index, $event)"
             />
-            <span class="muted small">{{ z.zone.resizable?.start }} to {{ z.zone.resizable?.end }}</span>
-            <span v-if="z.hidden" class="muted small">Hidden</span>
-          </label>
+            <StatusBadge v-if="z.hidden" status="hidden">Hidden</StatusBadge>
+          </Field>
         </div>
       </div>
 
       <div class="section">
         <h2>Device</h2>
         <div class="row">
-          <button type="button" :disabled="locked || busy" @click="onRelease">Release</button>
-          <button v-if="saveable" type="button" :disabled="locked || busy" @click="confirmSave = true">
+          <Button :disabled="locked || busy" @click="onRelease">Release</Button>
+          <Button v-if="saveable" variant="danger" :disabled="locked || busy" @click="confirmSave = true">
             Save to device
-          </button>
+          </Button>
         </div>
-        <p class="muted small block">
+        <p class="muted small intro">
           Release hands the device back to its own hardware mode. CaseControl does this for every device when it quits.
         </p>
-        <dl class="details small">
+        <KeyValueList class="small">
           <dt>Id</dt>
-          <dd>{{ desc.info.id }}</dd>
+          <dd class="mono">{{ desc.info.id }}</dd>
           <template v-if="desc.info.firmware">
             <dt>Firmware</dt>
-            <dd>{{ desc.info.firmware }}</dd>
+            <dd class="mono">{{ desc.info.firmware }}</dd>
           </template>
           <dt>LEDs</dt>
-          <dd>{{ desc.leds.length }}</dd>
-        </dl>
+          <dd class="count">{{ desc.leds.length }}</dd>
+        </KeyValueList>
       </div>
 
       <ContextMenu :at="menuAt" :items="menuItems" @close="menuAt = null" />
@@ -460,6 +468,7 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
         :open="confirmSave"
         title="Save to device?"
         confirm-label="Save to device"
+        danger
         :busy="busy"
         @confirm="onSave"
         @cancel="confirmSave = false"
@@ -469,67 +478,29 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
       </ConfirmDialog>
     </template>
 
-    <div v-else-if="deviceState.loaded" class="gone">
-      <h1>Device not found</h1>
-      <p class="muted">This device is not connected any more, or its detector is switched off in Settings.</p>
-    </div>
+    <template v-else-if="deviceState.loaded">
+      <PageHeader :back="{ to: '/devices', label: 'Devices' }" />
+      <EmptyState title="Device not found" :level="1">
+        This device is not connected any more, or its detector is switched off in Settings.
+      </EmptyState>
+    </template>
   </section>
 </template>
 
 <style scoped>
-.back {
-  display: inline-block;
-  margin-bottom: var(--space-6);
-  color: var(--color-text-muted);
-  text-decoration: none;
-}
-
-.back:hover {
-  color: var(--color-text);
-}
-
-.head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--space-6);
-  margin-bottom: var(--space-8);
-}
-
-.toggle {
-  gap: var(--space-2);
-  color: var(--color-text-muted);
-  cursor: pointer;
-}
-
-.notice {
-  margin-bottom: var(--space-6);
-}
-
-.stage {
-  padding: var(--space-8);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  background: var(--color-surface);
+.selection {
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
 }
 
 .panel {
   display: flex;
   flex-direction: column;
   gap: var(--space-6);
-  margin: var(--space-8) 0;
+  margin: var(--space-10) 0;
 }
 
-.mode select {
-  min-width: 240px;
-}
-
-.selection {
-  gap: var(--space-4);
-  margin-bottom: var(--space-4);
-}
-
-.block {
+.intro {
   margin: var(--space-3) 0 var(--space-5);
 }
 
@@ -539,32 +510,11 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
   gap: var(--space-3);
 }
 
-.zone-name {
-  min-width: 140px;
+.hidden-zone {
+  opacity: 0.45;
 }
 
-.zone input {
-  width: 96px;
-}
-
-.zone.hidden {
-  opacity: 0.5;
-}
-
-.details {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: var(--space-1) var(--space-6);
-  margin: var(--space-6) 0 0;
-  color: var(--color-text-muted);
-}
-
-.details dd {
-  margin: 0;
-  font-family: ui-monospace, Consolas, monospace;
-}
-
-.gone {
-  padding: var(--space-8) 0;
+.count {
+  font-variant-numeric: tabular-nums;
 }
 </style>

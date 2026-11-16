@@ -5,8 +5,10 @@
 // (ADR 0001 #22) and where a right-click on a zone opens its menu (ADR 0001 #26).
 import { computed, onBeforeUnmount, ref } from 'vue'
 import type { DeviceDescription, Zone } from '../ipc'
+import { BLACK } from '../lib/color'
 import { matrixCells } from '../lib/device'
 import { beginSweep, selectZone, sweepOver, zoneIndices, EMPTY, type Selection, type SweepMode } from '../lib/selection'
+import { Button, StatusBadge } from './ui'
 
 const props = withDefaults(
   defineProps<{
@@ -53,7 +55,11 @@ const layout = computed<ZoneLayout[]>(() =>
   }),
 )
 
-const color = (led: number) => props.colors[led] ?? '#000000'
+/** The fill is exactly the device colour; an LED that is off is drawn as --led-off so it stays visible. */
+function color(led: number): string {
+  const c = props.colors[led] ?? BLACK
+  return c.toUpperCase() === BLACK ? 'var(--led-off)' : c
+}
 const isSelected = (leds: number[]) => leds.length > 0 && leds.every((i) => props.selection.has(i))
 const selectable = (z: ZoneLayout) => props.interactive && !z.hidden
 
@@ -117,17 +123,18 @@ onBeforeUnmount(endSweep)
       @contextmenu="onMenu($event, z)"
     >
       <div v-if="stage" class="zone-head">
-        <button
+        <Button
           v-if="selectable(z)"
-          type="button"
-          class="zone-name link"
+          variant="ghost"
+          size="sm"
+          class="zone-name"
           :title="`Select ${z.zone.name} (Ctrl-click to add)`"
           @click="onZoneName($event, z)"
         >
           {{ z.zone.name }}
-        </button>
+        </Button>
         <span v-else class="zone-name">{{ z.zone.name }}</span>
-        <span v-if="z.hidden" class="hidden-label">Hidden</span>
+        <StatusBadge v-if="z.hidden" status="hidden">Hidden</StatusBadge>
       </div>
 
       <div
@@ -177,8 +184,9 @@ onBeforeUnmount(endSweep)
 </template>
 
 <style scoped>
-/* Sizes follow the preview's width (container query units): a row of n dots shares the width, clamped between a
-   readable minimum (long zones wrap) and a cap (short zones do not balloon). */
+/* LED preview (docs/design-system.md, "LED and key preview"). Sizes follow the preview's width (container query
+   units): a row of n dots shares the width, clamped between a readable minimum (long zones wrap) and a cap (short
+   zones do not balloon). LED fills never transition: they mirror the hardware. */
 .preview {
   container-type: inline-size;
   display: flex;
@@ -187,18 +195,23 @@ onBeforeUnmount(endSweep)
 }
 
 .preview.stage {
-  --gap: 8px;
+  --gap: var(--space-2);
+  --key-gap: var(--space-1);
   --dot-min: 14px;
-  --dot-max: 36px;
+  --dot-max: 28px;
   --key-max: 56px;
+  --key-radius: var(--radius-sm);
   gap: var(--space-6);
 }
 
+/* The compact tile preview keeps 2 px keys: 6 px would turn its small keys into dots. */
 .preview.tile {
   --gap: 3px;
+  --key-gap: 2px;
   --dot-min: 6px;
-  --dot-max: 18px;
+  --dot-max: 8px;
   --key-max: 22px;
+  --key-radius: 2px;
   gap: var(--space-2);
 }
 
@@ -209,58 +222,51 @@ onBeforeUnmount(endSweep)
 }
 
 .zone.hidden {
-  opacity: 0.4;
+  opacity: 0.45;
 }
 
 .zone-head {
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  font-size: var(--font-size-sm);
+  font-size: var(--text-sm);
 }
 
-.zone-name {
-  color: var(--color-text-muted);
+.zone-head .zone-name {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
-.hidden-label {
-  padding: 0 var(--space-2);
-  border: 1px solid var(--color-border-strong);
-  border-radius: 999px;
-  color: var(--color-text-muted);
+.zone-head .zone-name:hover:not(:disabled) {
+  color: var(--text);
 }
 
 .led {
-  border: 1px solid var(--color-border-strong);
-  transition: background-color var(--transition);
+  border: 1px solid var(--led-border);
 }
 
 .interactive .zone:not(.hidden) .led {
   cursor: pointer;
 }
 
+.interactive .zone:not(.hidden) .led:hover {
+  border-color: var(--text-muted);
+}
+
 .led.selected {
-  outline: 2px solid var(--color-accent);
+  outline: 2px solid var(--selection);
   outline-offset: 2px;
 }
 
 .matrix {
   display: grid;
-  gap: 4px;
+  gap: var(--key-gap);
   max-width: calc(var(--w) * var(--key-max));
-}
-
-.tile .matrix {
-  gap: 2px;
 }
 
 .cell {
   aspect-ratio: 1;
-  border-radius: 4px;
-}
-
-.tile .cell {
-  border-radius: 2px;
+  border-radius: var(--key-radius);
 }
 
 .cell.empty {
@@ -277,19 +283,19 @@ onBeforeUnmount(endSweep)
   flex: none;
   width: clamp(var(--dot-min), calc((100cqi - (var(--n) - 1) * var(--gap)) / var(--n)), var(--dot-max));
   aspect-ratio: 1;
-  border-radius: 50%;
+  border-radius: var(--radius-full);
 }
 
+/* Single zones: up to 160 x 80 on the stage, 32 x 16 on a tile. */
 .swatch {
   display: block;
-  width: clamp(96px, 24cqi, 220px);
-  aspect-ratio: 16 / 9;
-  border-radius: var(--radius);
+  width: clamp(96px, 24cqi, 160px);
+  aspect-ratio: 2 / 1;
+  border-radius: var(--radius-md);
 }
 
 .tile .swatch {
-  width: clamp(32px, 16cqi, 72px);
-  aspect-ratio: 2 / 1;
-  border-radius: 4px;
+  width: 32px;
+  border-radius: 2px;
 }
 </style>
