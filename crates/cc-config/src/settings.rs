@@ -15,6 +15,8 @@ use crate::paths::Paths;
 pub const DEFAULT_FRAME_RATE: u32 = 30;
 /// Allowed frame rates; values outside are clamped on load.
 pub const FRAME_RATE_RANGE: std::ops::RangeInclusive<u32> = 1..=60;
+/// Full brightness in percent: the default of the master and every device brightness (ADR 0001 #33).
+pub const FULL_BRIGHTNESS: u8 = 100;
 
 /// Application settings.
 ///
@@ -37,6 +39,17 @@ pub struct Settings {
     pub conflicts: ConflictSettings,
     /// Name of the profile applied last, re-applied on start.
     pub last_profile: Option<String>,
+    /// Master brightness in percent, multiplied into every device (ADR 0001 #33). Clamped to 0..=100 on load;
+    /// written only when it is not 100.
+    #[serde(
+        deserialize_with = "clamped_percent",
+        skip_serializing_if = "is_full_brightness"
+    )]
+    pub master_brightness: u8,
+    /// All off is on: devices are kept black and fade back in when it is switched off (ADR 0001 #33). Written only
+    /// when `true`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub all_off: bool,
     /// Per-device overrides, keyed by device id.
     pub devices: BTreeMap<DeviceId, DeviceOverrides>,
     /// Unknown top-level keys, preserved across a load/save cycle.
@@ -53,6 +66,8 @@ impl Default for Settings {
             detectors: BTreeMap::new(),
             conflicts: ConflictSettings::default(),
             last_profile: None,
+            master_brightness: FULL_BRIGHTNESS,
+            all_off: false,
             devices: BTreeMap::new(),
             extra: toml::Table::new(),
         }
@@ -92,6 +107,18 @@ pub struct DeviceOverrides {
     /// not empty.
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub hidden_zones: BTreeSet<String>,
+    /// Device brightness in percent set since the last profile apply or save (ADR 0001 #33).
+    ///
+    /// The rule: a profile carries the device brightness it was saved with. Changing a device's brightness writes it
+    /// here; applying a profile clears every entry (the profile's values are then current), and saving the profile
+    /// that is `last_profile` clears them too (they are now in that profile). On start the device brightness is
+    /// `last_profile`'s value overlaid with these entries (100 where neither has one). Clamped to 0..=100 on load;
+    /// written only when set.
+    #[serde(
+        deserialize_with = "clamped_percent_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub brightness: Option<u8>,
     /// Unknown keys of this device's table.
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -107,6 +134,26 @@ fn clamped_frame_rate<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<u3
         tracing::warn!(raw, clamped, "frame_rate out of range, clamped");
     }
     Ok(u32::try_from(clamped).unwrap_or(DEFAULT_FRAME_RATE))
+}
+
+fn is_full_brightness(v: &u8) -> bool {
+    *v == FULL_BRIGHTNESS
+}
+
+fn clamp_percent(raw: i64, key: &str) -> u8 {
+    let clamped = raw.clamp(0, i64::from(FULL_BRIGHTNESS));
+    if clamped != raw {
+        tracing::warn!(raw, clamped, key, "brightness out of range, clamped");
+    }
+    u8::try_from(clamped).unwrap_or(FULL_BRIGHTNESS)
+}
+
+fn clamped_percent<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<u8, D::Error> {
+    Ok(clamp_percent(i64::deserialize(d)?, "master_brightness"))
+}
+
+fn clamped_percent_opt<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<u8>, D::Error> {
+    Ok(Option::<i64>::deserialize(d)?.map(|raw| clamp_percent(raw, "brightness")))
 }
 
 impl Settings {
@@ -426,6 +473,63 @@ check_openrgb_port = true
         let text = std::fs::read_to_string(paths.config_file()).expect("read");
         assert!(!text.contains("dont_ask"), "{text}");
         assert_eq!(Settings::load(&paths).expect("reload"), s);
+    }
+
+    #[test]
+    fn brightness_and_all_off_round_trip() {
+        let (_tmp, paths) = temp_paths();
+        let id = DeviceId::hid(0x1462, 0x7D75, None);
+        let mut s = full_settings();
+        s.master_brightness = 35;
+        s.all_off = true;
+        s.devices.entry(id.clone()).or_default().brightness = Some(0);
+        let text = s.to_toml().expect("serialize");
+        assert!(text.contains("master_brightness = 35"), "{text}");
+        assert!(text.contains("all_off = true"), "{text}");
+        assert!(text.contains("brightness = 0"), "{text}");
+        assert_eq!(Settings::from_toml(&text).expect("parse"), s);
+        s.save(&paths).expect("save");
+        assert_eq!(Settings::load(&paths).expect("load"), s);
+
+        // Back to the defaults: the keys leave the file again.
+        s.master_brightness = FULL_BRIGHTNESS;
+        s.all_off = false;
+        s.devices.get_mut(&id).expect("device entry").brightness = None;
+        s.save(&paths).expect("save");
+        let text = std::fs::read_to_string(paths.config_file()).expect("read");
+        assert!(!text.contains("brightness"), "{text}");
+        assert!(!text.contains("all_off"), "{text}");
+        assert_eq!(Settings::load(&paths).expect("reload"), s);
+    }
+
+    #[test]
+    fn defaults_write_no_brightness_keys_and_old_files_load() {
+        let text = Settings::default().to_toml().expect("serialize");
+        assert!(!text.contains("brightness"), "{text}");
+        assert!(!text.contains("all_off"), "{text}");
+        let s = Settings::from_toml(
+            "autostart = true
+",
+        )
+        .expect("parse");
+        assert_eq!(s.master_brightness, 100);
+        assert!(!s.all_off);
+    }
+
+    #[test]
+    fn brightness_is_clamped_on_load() {
+        let s = Settings::from_toml(
+            "master_brightness = 250
+[devices.\"hid:1462:7d75\"]
+brightness = -4
+",
+        )
+        .expect("parse");
+        assert_eq!(s.master_brightness, 100);
+        assert_eq!(
+            s.devices[&DeviceId::hid(0x1462, 0x7D75, None)].brightness,
+            Some(0)
+        );
     }
 
     #[test]

@@ -12,6 +12,9 @@
 //!   error mark the device `Faulted`, after which its thread no longer talks to it.
 //! - Hot-plug: one HID watcher; arrivals trigger detection of HID backends with every open device skipped, removals
 //!   drop the matching device without releasing it.
+//! - Brightness (ADR 0001 #33): a device brightness per device and a master brightness scale what goes to the device
+//!   (colours, or a hardware mode's brightness); All off fades every driven device to black and holds it there. The
+//!   stored settings stay unscaled, so `current_settings()` and profiles never see dimmed colours.
 //! - [`EngineHandle::shutdown`] (or dropping the last handle) releases every active device and joins the threads.
 //!
 //! What this crate deliberately does not do: no device protocols (that is `cc-drivers`), no file I/O or profile
@@ -22,6 +25,7 @@
 mod engine;
 mod error;
 mod hotplug;
+mod lighting;
 mod view;
 mod worker;
 
@@ -31,4 +35,4 @@ mod tests;
 pub use cc_config::DeviceSetting;
 pub use engine::{EngineConfig, EngineHandle, start};
 pub use error::EngineError;
-pub use view::{ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView};
+pub use view::{ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView};

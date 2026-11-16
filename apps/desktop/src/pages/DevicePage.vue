@@ -8,6 +8,7 @@
 // are queued or in flight, the page shows its own latest intent instead of the store, so a refresh that raced an
 // edit cannot roll the controls back; the intent is dropped once the sender is idle and a fresh reload has landed.
 import { computed, ref, watch } from 'vue'
+import BrightnessSlider from '../components/BrightnessSlider.vue'
 import ColorPicker from '../components/ColorPicker.vue'
 import DevicePreview from '../components/DevicePreview.vue'
 import ModeControls from '../components/ModeControls.vue'
@@ -33,6 +34,7 @@ import {
   releaseDevice,
   resizeZone,
   saveToHardware,
+  setDeviceBrightness,
   setDirect,
   setMode,
   type ModeState,
@@ -44,6 +46,7 @@ import {
   canSaveToHardware,
   currentHardwareMode,
   hardwareModes,
+  hasCap,
   kindLabel,
   ledsOfZones,
   stateFor,
@@ -233,6 +236,21 @@ function onMenu(value: string) {
   if (mode) sendMode(stateFor(d, mode))
 }
 
+// ---- brightness (ADR 0001 #33) ---------------------------------------------------------------------------------
+
+/** In a hardware mode without a brightness parameter the device brightness has no effect. */
+const brightnessUnsupported = computed(() => activeMode.value !== undefined && !hasCap(activeMode.value, 'BRIGHTNESS'))
+
+async function sendBrightness(percent: number, persist: boolean) {
+  await setDeviceBrightness(props.id, percent, persist)
+  if (persist) await refreshDevices()
+}
+
+function brightnessFailed(e: unknown) {
+  error.value = errorText(e)
+  void refreshDevices()
+}
+
 // ---- zones -----------------------------------------------------------------------------------------------------
 
 const resizable = computed(() =>
@@ -349,6 +367,16 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
         </template>
         <template #actions>
           <Switch v-model="deviceState.showHiddenZones" label="Show hidden" compact />
+        </template>
+        <template #controls>
+          <BrightnessSlider
+            label="Brightness"
+            :value="device.brightness"
+            :send="sendBrightness"
+            :disabled="locked || brightnessUnsupported"
+            :hint="brightnessUnsupported ? 'This mode has no brightness setting.' : undefined"
+            @error="brightnessFailed"
+          />
         </template>
       </PageHeader>
 

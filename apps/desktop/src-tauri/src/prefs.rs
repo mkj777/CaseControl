@@ -1,9 +1,14 @@
 //! The Settings page's view of `cc_config::Settings`, the patch the page sends back, and the pure functions that
-//! apply both (plus zone-size persistence and the engine configuration derived from settings).
+//! apply both (plus zone-size and brightness persistence and the engine configuration derived from settings).
+//!
+//! Device brightness persistence (ADR 0001 #33, rule documented on `cc_config::DeviceOverrides::brightness`): a
+//! profile stores the device brightness it was saved with; a change since the last profile apply or save is kept per
+//! device in the settings; applying a profile clears those, saving the active profile (`last_profile`) clears them
+//! too; on start the device brightness is `last_profile`'s map overlaid with them.
 
 use std::collections::BTreeMap;
 
-use cc_config::{FRAME_RATE_RANGE, Settings};
+use cc_config::{DeviceOverrides, FRAME_RATE_RANGE, FULL_BRIGHTNESS, Profile, Settings};
 use cc_core::{DeviceId, family};
 use cc_engine::EngineConfig;
 use serde::{Deserialize, Serialize};
@@ -125,7 +130,37 @@ pub fn record_zone_size(settings: &mut Settings, id: &DeviceId, zone_name: &str,
         .insert(zone_name.to_owned(), len);
 }
 
-/// The engine configuration for `settings`: frame rate, disabled families, remembered zone sizes, hot-plug on.
+/// Remembers that device `id` was set to `percent` brightness since the last profile apply or save.
+pub fn record_brightness(settings: &mut Settings, id: &DeviceId, percent: u8) {
+    settings.devices.entry(id.clone()).or_default().brightness = Some(percent.min(FULL_BRIGHTNESS));
+}
+
+/// Forgets every per-device brightness change (a profile was applied, or the active one saved). Device entries
+/// left with nothing in them are removed. Returns whether anything changed.
+pub fn clear_brightness_overrides(settings: &mut Settings) -> bool {
+    let mut changed = false;
+    for ov in settings.devices.values_mut() {
+        changed |= ov.brightness.take().is_some();
+    }
+    settings.devices.retain(|_, ov| *ov != DeviceOverrides::default());
+    changed
+}
+
+/// Device brightness at start: the map of `last_profile` (if it loaded) overlaid with the per-device changes made
+/// since. Devices in neither have 100.
+pub fn start_brightness(last_profile: Option<&Profile>, settings: &Settings) -> BTreeMap<DeviceId, u8> {
+    let mut map = last_profile.map(|p| p.brightness.clone()).unwrap_or_default();
+    for (id, ov) in &settings.devices {
+        if let Some(b) = ov.brightness {
+            map.insert(id.clone(), b);
+        }
+    }
+    map
+}
+
+/// The engine configuration for `settings`: frame rate, disabled families, remembered zone sizes, master
+/// brightness, All off, the per-device brightness changes (the last profile's own map is laid underneath when it is
+/// re-applied), hot-plug on.
 pub fn engine_config(settings: &Settings) -> EngineConfig {
     EngineConfig {
         frame_rate: settings
@@ -139,6 +174,9 @@ pub fn engine_config(settings: &Settings) -> EngineConfig {
             .map(|(id, ov)| (id.clone(), ov.zone_sizes.clone()))
             .collect(),
         hotplug: true,
+        master_brightness: settings.master_brightness.min(FULL_BRIGHTNESS),
+        brightness: start_brightness(None, settings),
+        all_off: settings.all_off,
     }
 }
 
@@ -269,5 +307,52 @@ mod tests {
         );
         assert_eq!(cfg.zone_sizes.len(), 1, "devices without zone sizes are left out");
         assert_eq!(cfg.zone_sizes[&msi()]["JRAINBOW1"], 60);
+        assert_eq!(cfg.master_brightness, 100);
+        assert!(!cfg.all_off);
+        assert!(cfg.brightness.is_empty());
+
+        s.master_brightness = 40;
+        s.all_off = true;
+        record_brightness(&mut s, &msi(), 70);
+        let cfg = engine_config(&s);
+        assert_eq!(cfg.master_brightness, 40);
+        assert!(cfg.all_off);
+        assert_eq!(cfg.brightness, BTreeMap::from([(msi(), 70)]));
+    }
+
+    #[test]
+    fn start_brightness_overlays_changes_on_the_last_profile() {
+        let other = DeviceId::hid(0x31E3, 0x1310, None);
+        let third = DeviceId::hid(0x046D, 0xC33C, None);
+        let profile = Profile {
+            name: "Evening".into(),
+            devices: BTreeMap::new(),
+            brightness: BTreeMap::from([(msi(), 20), (other.clone(), 60)]),
+        };
+        let mut s = Settings::default();
+        record_brightness(&mut s, &other, 90);
+        record_brightness(&mut s, &third, 150);
+        assert_eq!(
+            start_brightness(Some(&profile), &s),
+            BTreeMap::from([(msi(), 20), (other.clone(), 90), (third.clone(), 100)])
+        );
+        assert_eq!(
+            start_brightness(None, &s),
+            BTreeMap::from([(other, 90), (third, 100)])
+        );
+    }
+
+    #[test]
+    fn clearing_brightness_keeps_other_overrides_and_drops_empty_entries() {
+        let mut s = Settings::default();
+        record_zone_size(&mut s, &msi(), "JRAINBOW1", 60);
+        record_brightness(&mut s, &msi(), 50);
+        let lamp = DeviceId::hid(0x31E3, 0x1310, None);
+        record_brightness(&mut s, &lamp, 10);
+        assert!(clear_brightness_overrides(&mut s));
+        assert_eq!(s.devices.len(), 1, "the brightness-only entry is gone");
+        assert_eq!(s.devices[&msi()].brightness, None);
+        assert_eq!(s.devices[&msi()].zone_sizes["JRAINBOW1"], 60);
+        assert!(!clear_brightness_overrides(&mut s), "nothing left to clear");
     }
 }

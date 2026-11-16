@@ -9,7 +9,7 @@ use cc_conflicts::ScanReport;
 use cc_engine::{ApplyReport, EngineHandle};
 use parking_lot::{Mutex, MutexGuard};
 
-use crate::prefs::engine_config;
+use crate::prefs::{engine_config, start_brightness};
 use crate::profiles::{ProfileList, profile_list};
 
 /// Time the engine gets to release every device on exit.
@@ -87,8 +87,9 @@ impl AppState {
         }
     }
 
-    /// Re-applies the last applied profile if it still exists (ADR 0001 #24). Without one, devices stay in their
-    /// hardware mode.
+    /// Re-applies the last applied profile if it still exists (ADR 0001 #24), with its device brightness overlaid by
+    /// the changes made since (ADR 0001 #33). Without one, devices stay in their hardware mode. With All off saved,
+    /// the engine already holds every device dark, so the profile is applied underneath without a coloured frame.
     pub fn apply_last_profile(&self) {
         let Some(name) = self.settings.lock().last_profile.clone() else {
             return;
@@ -98,6 +99,8 @@ impl AppState {
         };
         match storage.profiles.load(&name) {
             Ok(profile) => {
+                let brightness = start_brightness(Some(&profile), &self.settings());
+                engine.replace_brightness(brightness);
                 let report = self.apply_visible(engine, &profile);
                 tracing::info!(
                     profile = %profile.name,

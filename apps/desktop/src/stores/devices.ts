@@ -14,6 +14,7 @@ import {
   type DeviceList,
   type DeviceView,
   type HiddenEntry,
+  type LightingView,
 } from '../ipc'
 
 interface DeviceState {
@@ -22,6 +23,8 @@ interface DeviceState {
   engineError: string | null
   /** What the user hid, by device id. */
   hidden: Record<DeviceId, HiddenEntry>
+  /** Master brightness and All off (ADR 0001 #33). */
+  lighting: LightingView
   /** Session-only "Show hidden" toggles (ADR 0001 #27): overview (devices) and device view (zones). */
   showHiddenDevices: boolean
   showHiddenZones: boolean
@@ -36,6 +39,7 @@ export const deviceState = reactive<DeviceState>({
   failures: [],
   engineError: null,
   hidden: {},
+  lighting: { master_brightness: 100, all_off: false },
   showHiddenDevices: false,
   showHiddenZones: false,
   error: null,
@@ -48,6 +52,7 @@ function take(list: DeviceList) {
   deviceState.failures = list.failures
   deviceState.engineError = list.engine_error
   deviceState.hidden = list.hidden
+  deviceState.lighting = list.lighting
   deviceState.error = null
   deviceState.loaded = true
 }
