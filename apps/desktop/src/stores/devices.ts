@@ -32,27 +32,33 @@ function take(list: DeviceList) {
 }
 
 let pending: Promise<void> | null = null
-let again = false
+let next: Promise<void> | null = null
 
-/** Reloads the device list; overlapping calls collapse into one extra reload. */
+function load(): Promise<void> {
+  return listDevices().then(take, (e) => {
+    deviceState.error = errorText(e)
+    deviceState.loaded = true
+  })
+}
+
+/**
+ * Reloads the device list. The returned promise resolves after a load that started no earlier than this call, so
+ * its data reflects every command that completed before the call. Overlapping calls share one follow-up load.
+ */
 export function refreshDevices(): Promise<void> {
-  if (pending) {
-    again = true
+  if (!pending) {
+    pending = load().finally(() => {
+      pending = null
+    })
     return pending
   }
-  pending = listDevices()
-    .then(take, (e) => {
-      deviceState.error = errorText(e)
-      deviceState.loaded = true
+  if (!next) {
+    next = pending.then(() => {
+      next = null
+      return refreshDevices()
     })
-    .finally(() => {
-      pending = null
-      if (again) {
-        again = false
-        void refreshDevices()
-      }
-    })
-  return pending
+  }
+  return next
 }
 
 export async function rescanDevices(): Promise<void> {

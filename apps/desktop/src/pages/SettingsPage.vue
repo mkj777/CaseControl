@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Settings: startup, update rate, device detectors, the OpenRGB port check and information about this build.
 // Every change is saved and applied right away.
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import {
   appInfo,
   errorText,
@@ -19,6 +19,8 @@ const info = ref<AppInfo | null>(null)
 const error = ref<string | null>(null)
 const saving = ref(false)
 const frameRate = ref(30)
+/** Controls are off while saving, or for the whole session when settings cannot be saved. */
+const locked = computed(() => saving.value || settings.value?.save_error != null)
 
 onMounted(async () => {
   try {
@@ -77,7 +79,8 @@ async function onHide() {
       </div>
     </header>
 
-    <p v-if="error" class="notice">{{ error }}</p>
+    <p v-if="settings?.save_error" class="notice">{{ settings.save_error }}</p>
+    <p v-if="error && error !== settings?.save_error" class="notice">{{ error }}</p>
 
     <template v-if="settings">
       <div class="group">
@@ -86,7 +89,7 @@ async function onHide() {
           <input
             type="checkbox"
             :checked="settings.autostart"
-            :disabled="saving"
+            :disabled="locked"
             @change="patch({ autostart: checked($event) })"
           />
           <span>
@@ -98,7 +101,7 @@ async function onHide() {
           <input
             type="checkbox"
             :checked="settings.start_minimized"
-            :disabled="saving"
+            :disabled="locked"
             @change="patch({ start_minimized: checked($event) })"
           />
           <span>
@@ -116,8 +119,8 @@ async function onHide() {
             <span class="hint">How often per second a device gets new colours while you edit, 1 to 60.</span>
           </span>
           <span class="row">
-            <input v-model.number="frameRate" type="range" min="1" max="60" step="1" aria-label="Frame rate" :disabled="saving" @change="onFrameRate" />
-            <input v-model.number="frameRate" type="number" min="1" max="60" aria-label="Frame rate" :disabled="saving" @change="onFrameRate" />
+            <input v-model.number="frameRate" type="range" min="1" max="60" step="1" aria-label="Frame rate" :disabled="locked" @change="onFrameRate" />
+            <input v-model.number="frameRate" type="number" min="1" max="60" aria-label="Frame rate" :disabled="locked" @change="onFrameRate" />
           </span>
         </div>
       </div>
@@ -129,7 +132,7 @@ async function onHide() {
           <input
             type="checkbox"
             :checked="on"
-            :disabled="saving"
+            :disabled="locked"
             @change="patch({ detectors: { [family]: checked($event) } })"
           />
           <span>{{ familyLabel(String(family)) }}</span>
@@ -142,7 +145,7 @@ async function onHide() {
           <input
             type="checkbox"
             :checked="settings.check_openrgb_port"
-            :disabled="saving"
+            :disabled="locked"
             @change="patch({ check_openrgb_port: checked($event) })"
           />
           <span>

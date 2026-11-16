@@ -1,39 +1,52 @@
 //! The per-device worker thread: owns one [`Controller`], paces colour frames, sends keepalives and applies the error
 //! policy (exponential back-off, `Faulted` after too many consecutive failures or on a fatal error).
+//!
+//! Ordering: every colour frame, mode change, release and resize carries a sequence number taken when the caller
+//! issued it. The worker applies them in sequence order and skips anything older than what it last applied, so the
+//! device always ends up showing the most recently issued request. The worker, not the caller, records what was
+//! actually applied (setting, `DeviceStateChanged`, resized description), so the engine's record matches the device.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cc_core::{Controller, DeviceDescription, DeviceError, DeviceId, ModeState, Rgb};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use cc_core::{Controller, DeviceError, DeviceId, ModeState, Rgb};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
 use crate::engine::Shared;
 use crate::view::DeviceStatus;
 
+/// A colour frame and the sequence number it was issued with.
+pub(crate) type Frame = (u64, Vec<Rgb>);
+
 /// Where the latest coalesced colour frame waits for the worker. Latest wins: a newer frame replaces an unsent one.
-pub(crate) type FrameSlot = Arc<Mutex<Option<Vec<Rgb>>>>;
+pub(crate) type FrameSlot = Arc<Mutex<Option<Frame>>>;
 
 /// Reply channel of an acknowledged command.
-pub(crate) type Reply<T = ()> = Sender<Result<T, DeviceError>>;
+pub(crate) type Reply = Sender<Result<(), DeviceError>>;
 
 /// Messages to a worker thread.
 pub(crate) enum Command {
     /// A new frame is in the [`FrameSlot`].
     Wake,
     /// Switch to a hardware mode.
-    SetMode(ModeState, Reply),
-    /// Resize a zone; replies with the new description.
+    SetMode {
+        seq: u64,
+        state: ModeState,
+        reply: Reply,
+    },
+    /// Resize a zone.
     Resize {
+        seq: u64,
         zone: usize,
         len: usize,
-        reply: Reply<DeviceDescription>,
+        reply: Reply,
     },
     /// Persist the current mode to flash.
     Save(Reply),
     /// Hand the device back to its hardware mode.
-    Release(Reply),
+    Release { seq: u64, reply: Reply },
     /// Leave the thread, releasing first if `release` and the device is Active.
     Stop { release: bool, reply: Option<Reply> },
 }
@@ -84,15 +97,17 @@ enum Local {
 
 /// State owned by one worker thread.
 pub(crate) struct Worker {
-    pub id: DeviceId,
-    pub generation: u64,
-    pub ctrl: Box<dyn Controller>,
-    pub rx: Receiver<Command>,
-    pub frame: FrameSlot,
-    pub shared: Arc<Shared>,
+    id: DeviceId,
+    generation: u64,
+    ctrl: Box<dyn Controller>,
+    rx: Receiver<Command>,
+    frame: FrameSlot,
+    shared: Arc<Shared>,
     local: Local,
     fault_reason: String,
-    dirty: Option<Vec<Rgb>>,
+    dirty: Option<Frame>,
+    /// Sequence number of the last frame, mode or release that was applied (or superseded everything before it).
+    last_seq: u64,
     last_frame: Option<Instant>,
     failures: u32,
     retry_at: Option<Instant>,
@@ -118,6 +133,7 @@ impl Worker {
             local: Local::Active,
             fault_reason: String::new(),
             dirty: None,
+            last_seq: 0,
             last_frame: None,
             failures: 0,
             retry_at: None,
@@ -128,10 +144,20 @@ impl Worker {
     /// The thread body. Returns when told to stop or when the engine dropped the command channel.
     pub(crate) fn run(mut self) {
         debug!(id = %self.id, "device thread started");
-        loop {
-            if let Some(f) = self.frame.lock().take() {
-                self.dirty = Some(f);
+        'outer: loop {
+            // Queued commands first, so a command issued before a frame is not overtaken by it.
+            loop {
+                match self.rx.try_recv() {
+                    Ok(cmd) => {
+                        if !self.handle(cmd) {
+                            break 'outer;
+                        }
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break 'outer,
+                }
             }
+            self.take_frame();
             self.do_due_work(Instant::now());
             let msg = match self.next_deadline() {
                 Some(deadline) => self.rx.recv_deadline(deadline),
@@ -150,8 +176,27 @@ impl Worker {
         debug!(id = %self.id, "device thread stopped");
     }
 
-    fn frame_interval(&self) -> Duration {
-        self.shared.frame_interval()
+    fn take_frame(&mut self) {
+        if let Some(f) = self.frame.lock().take()
+            && self.dirty.as_ref().is_none_or(|(seq, _)| f.0 > *seq)
+        {
+            self.dirty = Some(f);
+        }
+    }
+
+    /// Drops pending frames issued before `seq`; returns whether one was dropped.
+    fn drop_frames_before(&mut self, seq: u64) -> bool {
+        let mut dropped = false;
+        if self.dirty.as_ref().is_some_and(|(s, _)| *s < seq) {
+            self.dirty = None;
+            dropped = true;
+        }
+        let mut slot = self.frame.lock();
+        if slot.as_ref().is_some_and(|(s, _)| *s < seq) {
+            *slot = None;
+            dropped = true;
+        }
+        dropped
     }
 
     fn not_before(&self) -> Option<Instant> {
@@ -160,7 +205,7 @@ impl Worker {
 
     fn frame_due(&self) -> Option<Instant> {
         self.dirty.as_ref()?;
-        let paced = self.last_frame.map(|t| t + self.frame_interval());
+        let paced = self.last_frame.map(|t| t + self.shared.frame_interval());
         max_opt(paced, self.not_before()).or(Some(Instant::now()))
     }
 
@@ -187,9 +232,9 @@ impl Worker {
             return;
         }
         if self.frame_due().is_some_and(|due| now >= due)
-            && let Some(colors) = self.dirty.take()
+            && let Some(frame) = self.dirty.take()
         {
-            self.send_frame(colors, now);
+            self.send_frame(frame, now);
         }
         if self.local == Local::Active
             && self.keepalive_due().is_some_and(|due| now >= due)
@@ -204,7 +249,11 @@ impl Worker {
         }
     }
 
-    fn send_frame(&mut self, colors: Vec<Rgb>, now: Instant) {
+    fn send_frame(&mut self, (seq, colors): Frame, now: Instant) {
+        if seq < self.last_seq {
+            debug!(id = %self.id, "dropping superseded frame");
+            return;
+        }
         if colors.len() != self.ctrl.description().led_count() {
             debug!(id = %self.id, "dropping frame with stale length");
             return;
@@ -212,7 +261,11 @@ impl Worker {
         self.last_frame = Some(now);
         let r = self.ctrl.set_direct(&colors);
         match &r {
-            Ok(()) => self.took_control(now),
+            Ok(()) => {
+                self.last_seq = seq;
+                self.took_control(now);
+                self.shared.direct_applied(&self.id, self.generation, colors);
+            }
             Err(DeviceError::InvalidArgument(msg)) => {
                 warn!(id = %self.id, %msg, "driver rejected frame");
             }
@@ -220,7 +273,7 @@ impl Worker {
                 warn!(id = %self.id, error = %e, "frame write failed");
                 // Retry after the back-off, with whatever frame is newest by then.
                 if self.dirty.is_none() {
-                    self.dirty = Some(colors);
+                    self.dirty = Some((seq, colors));
                 }
             }
             Err(_) => {}
@@ -282,35 +335,38 @@ impl Worker {
     fn handle(&mut self, cmd: Command) -> bool {
         match cmd {
             Command::Wake => {}
-            Command::SetMode(state, reply) => {
-                let r = self.guarded(|w| {
-                    // A mode supersedes any colour frame that has not gone out yet.
-                    w.dirty = None;
-                    w.ctrl.set_mode(&state)
-                });
-                if r.is_ok() {
+            Command::SetMode { seq, state, reply } => {
+                let r = self.ordered(seq, |w| w.ctrl.set_mode(&state));
+                if r == Ok(true) {
                     self.took_control(Instant::now());
+                    self.shared.mode_applied(&self.id, self.generation, state);
                 }
-                let _ = reply.send(r);
+                let _ = reply.send(r.map(|_| ()));
             }
-            Command::Resize { zone, len, reply } => {
-                let r = self
-                    .guarded(|w| w.ctrl.resize_zone(zone, len))
-                    .map(|()| self.ctrl.description().clone());
+            Command::Release { seq, reply } => {
+                let r = self.ordered(seq, |w| w.ctrl.release());
+                if r == Ok(true) {
+                    self.mark_released();
+                }
+                let _ = reply.send(r.map(|_| ()));
+            }
+            Command::Resize {
+                seq,
+                zone,
+                len,
+                reply,
+            } => {
+                let dropped = self.local != Local::Faulted && self.drop_frames_before(seq);
+                let r = self.guarded(|w| w.ctrl.resize_zone(zone, len));
+                if r.is_ok() {
+                    let desc = self.ctrl.description().clone();
+                    self.shared
+                        .resized(&self.id, self.generation, zone, desc, dropped);
+                }
                 let _ = reply.send(r);
             }
             Command::Save(reply) => {
                 let r = self.guarded(|w| w.ctrl.save_to_hardware());
-                let _ = reply.send(r);
-            }
-            Command::Release(reply) => {
-                let r = self.guarded(|w| {
-                    w.dirty = None;
-                    w.ctrl.release()
-                });
-                if r.is_ok() {
-                    self.mark_released();
-                }
                 let _ = reply.send(r);
             }
             Command::Stop { release, reply } => {
@@ -330,6 +386,26 @@ impl Worker {
             }
         }
         true
+    }
+
+    /// Runs a sequenced call (mode or release): skipped with `Ok(false)` if something issued later was already
+    /// applied, otherwise drops older pending frames, runs it and returns `Ok(true)` on success.
+    fn ordered(
+        &mut self,
+        seq: u64,
+        f: impl FnOnce(&mut Self) -> Result<(), DeviceError>,
+    ) -> Result<bool, DeviceError> {
+        if self.local == Local::Faulted {
+            return Err(self.faulted_error());
+        }
+        if seq < self.last_seq {
+            debug!(id = %self.id, "skipping superseded command");
+            return Ok(false);
+        }
+        self.drop_frames_before(seq);
+        self.guarded(f)?;
+        self.last_seq = seq;
+        Ok(true)
     }
 
     fn mark_released(&mut self) {

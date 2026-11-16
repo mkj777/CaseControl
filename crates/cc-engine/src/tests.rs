@@ -38,6 +38,8 @@ struct Behavior {
     fatal_direct: bool,
     /// How long `set_mode` blocks.
     mode_delay: Duration,
+    /// How long `resize_zone` blocks.
+    resize_delay: Duration,
     /// `release` fails with a transport error.
     fail_release: bool,
 }
@@ -88,6 +90,8 @@ impl Controller for FakeCtrl {
     }
 
     fn resize_zone(&mut self, zone: usize, len: usize) -> Result<(), DeviceError> {
+        let delay = self.behavior.lock().resize_delay;
+        std::thread::sleep(delay);
         self.log(format!("resize {zone} {len}"));
         let old = self.desc.zones[zone].len;
         self.desc.zones[zone].len = len;
@@ -193,6 +197,8 @@ struct FakeBackend {
     failures: Vec<(String, DeviceError)>,
     log: Log,
     contexts: Arc<Mutex<Vec<DetectContext>>>,
+    /// How long `detect` blocks.
+    delay: Arc<Mutex<Duration>>,
 }
 
 impl FakeBackend {
@@ -204,6 +210,7 @@ impl FakeBackend {
             failures: Vec::new(),
             log: Arc::clone(log),
             contexts: Arc::default(),
+            delay: Arc::default(),
         }
     }
 }
@@ -219,6 +226,8 @@ impl Backend for FakeBackend {
 
     fn detect(&self, ctx: &DetectContext) -> Vec<Detected> {
         self.contexts.lock().push(ctx.clone());
+        let delay = *self.delay.lock();
+        std::thread::sleep(delay);
         if !ctx.is_enabled(self.family) {
             return Vec::new();
         }
@@ -388,6 +397,7 @@ fn detection_produces_sorted_views_and_failures() {
     let f = e.failures();
     assert_eq!(f.len(), 1);
     assert_eq!(f[0].family, "fam_a");
+    assert!(e.devices().iter().all(|v| v.family == "fam_a"));
     assert_eq!(f[0].location, "HID: broken");
     assert_eq!(f[0].error, DeviceError::Timeout);
 
@@ -731,13 +741,15 @@ fn resize_zone_updates_description_buffer_and_config_sizes_apply_at_detection() 
     let v = e.device(&id(1)).unwrap();
     assert_eq!(v.description.led_count(), 9);
     assert_eq!(v.description.zones[2].start, 6);
-    assert_eq!(v.colors, vec![RED, GREEN, GREEN, BLUE, BLUE, BLUE, RED, RED, RED]);
-    assert_eq!(
-        v.setting,
-        Some(DeviceSetting::Direct {
-            colors: v.colors.clone()
-        })
-    );
+    let want = vec![RED, GREEN, GREEN, BLUE, BLUE, BLUE, RED, RED, RED];
+    assert_eq!(v.colors, want);
+    // The carried-over buffer goes out as a new frame, after which it is the recorded setting.
+    let hex = want.iter().map(Rgb::to_string).collect::<Vec<_>>().join(",");
+    assert!(wait_until(SECOND, || entries(&log, "direct")
+        .last()
+        .is_some_and(|s| s.ends_with(&hex))));
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting
+        == Some(DeviceSetting::Direct { colors: want.clone() })));
 
     assert!(matches!(
         e.resize_zone(&id(1), 0, 2),
@@ -1067,4 +1079,199 @@ fn apply_truncates_long_direct_buffers() {
     let report = e.apply(&BTreeMap::from([(id(1), DeviceSetting::Direct { colors: long })]));
     assert_eq!(report.applied, [id(1)]);
     assert_eq!(e.device(&id(1)).unwrap().colors, vec![RED; 7]);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Regression tests for the review findings
+
+/// A colour edit issued while a mode change is in flight must win, and the record must say so.
+#[test]
+fn set_direct_during_set_mode_ends_direct_and_record_matches() {
+    let log = Log::default();
+    let s = spec(id(1), "A", DeviceKind::Light);
+    s.behavior.lock().mode_delay = Duration::from_millis(200);
+    let b = FakeBackend::new("f", vec![s], &log);
+    let e = engine(60, vec![Box::new(b)]);
+    let events = e.subscribe();
+
+    let e2 = e.clone();
+    let mode = std::thread::spawn(move || e2.set_mode(&id(1), static_red()));
+    std::thread::sleep(Duration::from_millis(50)); // the worker is inside set_mode now
+    e.set_direct(&id(1), vec![BLUE; 7]).unwrap();
+    assert_eq!(mode.join().unwrap(), Ok(()));
+
+    let blue = DeviceSetting::Direct {
+        colors: vec![BLUE; 7],
+    };
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting == Some(blue.clone())));
+    std::thread::sleep(Duration::from_millis(100));
+    let all: Vec<String> = log.lock().iter().map(|(_, s)| s.clone()).collect();
+    assert_eq!(all.len(), 2, "{all:?}");
+    assert!(all[0].ends_with("mode 1"));
+    assert!(
+        all[1].contains("direct"),
+        "device ends showing the later colour edit"
+    );
+    assert_eq!(e.device(&id(1)).unwrap().setting, Some(blue.clone()));
+    assert_eq!(e.current_settings()[&id(1)], blue);
+    // The mode really was applied first, so its event is correct; nothing else follows.
+    assert!(matches!(
+        events.recv_timeout(SECOND).unwrap(),
+        EngineEvent::DeviceStateChanged { .. }
+    ));
+    assert!(events.try_recv().is_err());
+}
+
+/// Rescan (and therefore hot-plug arrival, which uses the same pass) retries a faulted device.
+#[test]
+fn rescan_replaces_a_faulted_device() {
+    let log = Log::default();
+    let s = spec(id(1), "A", DeviceKind::Light);
+    s.behavior.lock().fatal_direct = true;
+    let behavior = Arc::clone(&s.behavior);
+    let b = FakeBackend::new("f", vec![s], &log);
+    let contexts = Arc::clone(&b.contexts);
+    let e = engine(60, vec![Box::new(b)]);
+    let events = e.subscribe();
+    e.set_direct(&id(1), vec![RED; 7]).unwrap();
+    assert!(matches!(
+        events.recv_timeout(SECOND).unwrap(),
+        EngineEvent::DeviceFaulted { .. }
+    ));
+
+    behavior.lock().fatal_direct = false;
+    e.rescan();
+    assert!(
+        contexts.lock().last().unwrap().skip.is_empty(),
+        "faulted ids are not skipped"
+    );
+    assert!(
+        matches!(events.recv_timeout(SECOND).unwrap(), EngineEvent::DeviceAdded(info) if info.id == id(1))
+    );
+    assert_eq!(e.devices().len(), 1);
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Active);
+    e.set_direct(&id(1), vec![GREEN; 7]).unwrap();
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting
+        == Some(DeviceSetting::Direct {
+            colors: vec![GREEN; 7]
+        })));
+
+    // A healthy device is still skipped.
+    e.rescan();
+    assert_eq!(contexts.lock().last().unwrap().skip, HashSet::from([id(1)]));
+}
+
+/// A detection pass stuck in a backend must not hold shutdown past its budget, and adds nothing afterwards.
+#[test]
+fn shutdown_honours_budget_while_detection_is_stuck() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+    let plugged = Arc::clone(&b.plugged);
+    let delay = Arc::clone(&b.delay);
+    let hp = FakeHotplug::default();
+    let e = start_with(
+        cfg(30),
+        vec![Box::new(b)],
+        Some(Box::new(hp.clone())),
+        fast_timing(),
+    )
+    .unwrap();
+    let events = e.subscribe();
+
+    *delay.lock() = Duration::from_millis(700);
+    plugged.lock().push(spec(id(2), "B", DeviceKind::Light));
+    hp.inject(HotplugAction::Arrived, r"\\?\hid#new");
+    std::thread::sleep(Duration::from_millis(60)); // hot-plug thread is inside detect, holding the detect lock
+
+    let t = Instant::now();
+    e.shutdown(Duration::from_millis(200));
+    assert!(t.elapsed() < Duration::from_millis(450), "{:?}", t.elapsed());
+    assert_eq!(entries(&log, "release"), [format!("{} release", id(1))]);
+
+    std::thread::sleep(Duration::from_millis(900)); // the stuck detection finishes
+    assert!(e.devices().is_empty(), "nothing added after shutdown");
+    assert!(
+        entries(&log, &id(2).to_string()).is_empty(),
+        "late device never driven"
+    );
+    assert!(events.recv_timeout(SECOND / 10).is_err());
+}
+
+/// Shutdown asks the worker to release based on the worker's own state, not the engine's possibly stale copy.
+#[test]
+fn shutdown_releases_a_device_that_took_control_again() {
+    for _ in 0..20 {
+        let log = Log::default();
+        let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+        let e = engine(60, vec![Box::new(b)]);
+        e.release(&id(1)).unwrap();
+        e.set_direct(&id(1), vec![RED; 7]).unwrap();
+        assert!(wait_until(SECOND, || !entries(&log, "direct").is_empty()));
+        e.shutdown(SECOND);
+        let all: Vec<String> = log.lock().iter().map(|(_, s)| s.clone()).collect();
+        assert_eq!(all.len(), 3, "{all:?}");
+        assert!(all[2].ends_with("release"), "{all:?}");
+    }
+}
+
+/// A resize that outlives its ack timeout still updates the engine's description once it happens.
+#[test]
+fn late_resize_keeps_description_consistent() {
+    let log = Log::default();
+    let s = spec(id(1), "A", DeviceKind::Light);
+    s.behavior.lock().resize_delay = Duration::from_millis(200);
+    let b = FakeBackend::new("f", vec![s], &log);
+    let timing = Timing {
+        ack_timeout: Duration::from_millis(50),
+        ..fast_timing()
+    };
+    let e = start_with(cfg(60), vec![Box::new(b)], None, timing).unwrap();
+    assert_eq!(e.resize_zone(&id(1), 1, 5), Err(EngineError::Timeout));
+    assert!(wait_until(SECOND, || e
+        .device(&id(1))
+        .unwrap()
+        .description
+        .led_count()
+        == 9));
+    assert_eq!(e.device(&id(1)).unwrap().colors.len(), 9);
+    e.set_direct(&id(1), vec![GREEN; 9]).unwrap();
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting
+        == Some(DeviceSetting::Direct {
+            colors: vec![GREEN; 9]
+        })));
+}
+
+/// A late result from a removed device's old thread must not land on the re-plugged device.
+#[test]
+fn late_result_does_not_touch_a_replugged_device() {
+    let log = Log::default();
+    let s = spec(id(1), "A", DeviceKind::Light);
+    s.behavior.lock().mode_delay = Duration::from_millis(250);
+    let behavior = Arc::clone(&s.behavior);
+    let b = FakeBackend::new("f", vec![s], &log);
+    let hp = FakeHotplug::default();
+    let timing = Timing {
+        ack_timeout: Duration::from_millis(50),
+        ..fast_timing()
+    };
+    let e = start_with(cfg(60), vec![Box::new(b)], Some(Box::new(hp.clone())), timing).unwrap();
+    let location = e.device(&id(1)).unwrap().description.info.location;
+    assert_eq!(e.set_mode(&id(1), static_red()), Err(EngineError::Timeout));
+
+    let events = e.subscribe();
+    hp.inject(HotplugAction::Removed, &location);
+    assert!(wait_until(SECOND, || e.device(&id(1)).is_none()));
+    hp.inject(HotplugAction::Arrived, &location);
+    assert!(wait_until(SECOND, || e.device(&id(1)).is_some()));
+    behavior.lock().mode_delay = Duration::ZERO;
+
+    std::thread::sleep(Duration::from_millis(350)); // the old thread finishes its set_mode
+    assert_eq!(entries(&log, "mode").len(), 1, "old controller did apply it");
+    assert_eq!(e.device(&id(1)).unwrap().setting, None);
+    let evs: Vec<EngineEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(
+        !evs.iter()
+            .any(|ev| matches!(ev, EngineEvent::DeviceStateChanged { .. })),
+        "{evs:?}"
+    );
 }

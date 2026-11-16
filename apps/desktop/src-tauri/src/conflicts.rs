@@ -2,7 +2,8 @@
 //! finding it came from (so the frontend cannot ask to end an arbitrary pid or stop an arbitrary service).
 
 use cc_conflicts::{AFFECTS_ALL, Evidence, Finding, ScanReport};
-use cc_core::{DeviceId, DeviceInfo, family};
+use cc_core::DeviceId;
+use cc_engine::DeviceView;
 use serde::Serialize;
 
 /// One of our devices a finding may interfere with.
@@ -33,30 +34,33 @@ pub struct ConflictScan {
     pub errors: Vec<String>,
 }
 
-/// The device family a device id belongs to, derived from the id's bus and vendor id.
-///
-/// The engine's `DeviceView` does not carry the family, so this maps the v1 vendors: MSI `1462`, Wooting `31e3`,
-/// Logitech `046d` on HID, and every NvAPI device to NVIDIA Illumination.
-pub fn family_of(id: &DeviceId) -> Option<&'static str> {
-    let s = id.as_str();
-    if s.starts_with("nvapi:") {
-        return Some(family::NVIDIA_ILLUMINATION);
-    }
-    let vid = s.strip_prefix("hid:")?.get(..4)?;
-    match vid {
-        "1462" => Some(family::MSI_MYSTIC_LIGHT),
-        "31e3" => Some(family::WOOTING),
-        "046d" => Some(family::LOGITECH),
-        _ => None,
+/// A device under our control, as far as conflict matching needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownDevice {
+    /// Device id.
+    pub id: DeviceId,
+    /// Display name.
+    pub name: String,
+    /// Family id of the backend that detected it (`DeviceView::family`).
+    pub family: String,
+}
+
+impl From<&DeviceView> for KnownDevice {
+    fn from(view: &DeviceView) -> Self {
+        Self {
+            id: view.description.info.id.clone(),
+            name: view.description.info.name.clone(),
+            family: view.family.clone(),
+        }
     }
 }
 
 /// The devices in `devices` that `finding` affects.
-pub fn affected_devices(finding: &Finding, devices: &[DeviceInfo]) -> Vec<AffectedDevice> {
+pub fn affected_devices(finding: &Finding, devices: &[KnownDevice]) -> Vec<AffectedDevice> {
     let all = finding.affects.iter().any(|a| a == AFFECTS_ALL);
     devices
         .iter()
-        .filter(|d| all || family_of(&d.id).is_some_and(|f| finding.affects.iter().any(|a| a == f)))
+        .filter(|d| all || finding.affects.contains(&d.family))
         .map(|d| AffectedDevice {
             id: d.id.clone(),
             name: d.name.clone(),
@@ -65,7 +69,7 @@ pub fn affected_devices(finding: &Finding, devices: &[DeviceInfo]) -> Vec<Affect
 }
 
 /// Builds the frontend view of a scan report.
-pub fn scan_view(report: &ScanReport, devices: &[DeviceInfo]) -> ConflictScan {
+pub fn scan_view(report: &ScanReport, devices: &[KnownDevice]) -> ConflictScan {
     ConflictScan {
         findings: report
             .findings
@@ -115,20 +119,15 @@ pub fn check_service(report: &ScanReport, entry_id: &str, name: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use cc_conflicts::{Access, Category, ServiceKind, ServiceState, Severity};
-    use cc_core::{Bus, DeviceKind};
+    use cc_core::family;
 
     use super::*;
 
-    fn device(id: DeviceId, name: &str) -> DeviceInfo {
-        DeviceInfo {
+    fn device(id: DeviceId, name: &str, family: &str) -> KnownDevice {
+        KnownDevice {
             id,
             name: name.into(),
-            vendor: "v".into(),
-            kind: DeviceKind::Unknown,
-            bus: Bus::Hid,
-            location: String::new(),
-            serial: None,
-            firmware: None,
+            family: family.into(),
         }
     }
 
@@ -160,33 +159,20 @@ mod tests {
         }
     }
 
-    fn devices() -> Vec<DeviceInfo> {
+    fn devices() -> Vec<KnownDevice> {
         vec![
-            device(DeviceId::hid(0x046D, 0x0A78, None), "G560"),
-            device(DeviceId::hid(0x31E3, 0x1310, Some("X")), "Wooting"),
-            device(DeviceId::nvapi(0x2C02_10DE, 0x2095_10DE), "RTX 5080"),
+            device(DeviceId::hid(0x046D, 0x0A78, None), "G560", family::LOGITECH),
+            device(
+                DeviceId::hid(0x31E3, 0x1310, Some("X")),
+                "Wooting",
+                family::WOOTING,
+            ),
+            device(
+                DeviceId::nvapi(0x2C02_10DE, 0x2095_10DE),
+                "RTX 5080",
+                family::NVIDIA_ILLUMINATION,
+            ),
         ]
-    }
-
-    #[test]
-    fn families_from_ids() {
-        assert_eq!(
-            family_of(&DeviceId::hid(0x1462, 0x7D75, None)),
-            Some(family::MSI_MYSTIC_LIGHT)
-        );
-        assert_eq!(
-            family_of(&DeviceId::hid(0x31E3, 0x1310, Some("A"))),
-            Some(family::WOOTING)
-        );
-        assert_eq!(
-            family_of(&DeviceId::hid(0x046D, 0xC539, None).with_ordinal(1)),
-            Some(family::LOGITECH)
-        );
-        assert_eq!(
-            family_of(&DeviceId::nvapi(0x2C02_10DE, 0x2095_10DE)),
-            Some(family::NVIDIA_ILLUMINATION)
-        );
-        assert_eq!(family_of(&DeviceId::hid(0x1234, 0x0001, None)), None);
     }
 
     #[test]

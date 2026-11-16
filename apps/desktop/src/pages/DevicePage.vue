@@ -1,6 +1,10 @@
 <script setup lang="ts">
 // Device view (ADR 0001 #18-#22, #25): a large preview where LEDs are selected, the mode menu, the colour picker
 // (static mode) or the mode's controls (hardware modes), zone sizes and the device actions.
+//
+// Every colour and mode change goes through one ordered sender, so the last user action always wins. While changes
+// are queued or in flight, the page shows its own latest intent instead of the store, so a refresh that raced an
+// edit cannot roll the controls back; the intent is dropped once the sender is idle and a fresh reload has landed.
 import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import ColorPicker from '../components/ColorPicker.vue'
@@ -43,13 +47,52 @@ const error = ref<string | null>(null)
 const notice = ref<string | null>(null)
 const busy = ref(false)
 
+// ---- the ordered write path ------------------------------------------------------------------------------------
+
+type Write = { kind: 'direct'; colors: string[] } | { kind: 'mode'; state: ModeState }
+
+/** What the user asked for last, while it may not be reflected in the store yet. */
+const intent = ref<Write | null>(null)
+let intentToken = 0
+
+function dropIntent() {
+  intent.value = null
+  intentToken++
+}
+
 function fail(e: unknown) {
   error.value = errorText(e)
+  dropIntent()
   void refreshDevices()
 }
 
-const directSender = latestSender<string[]>((colors) => setDirect(props.id, colors), fail)
-const modeSender = latestSender<ModeState>((state) => setMode(props.id, state), fail)
+/** After the last write: reload, and drop the local intent if nothing newer happened meanwhile. */
+async function settle() {
+  const token = intentToken
+  await refreshDevices()
+  if (token === intentToken && sender.idle()) intent.value = null
+}
+
+const sender = latestSender<Write>(
+  (w) => (w.kind === 'direct' ? setDirect(props.id, w.colors) : setMode(props.id, w.state)),
+  fail,
+  () => void settle(),
+)
+
+function write(w: Write) {
+  error.value = null
+  notice.value = null
+  intent.value = w
+  intentToken++
+  if (w.kind === 'direct') echoColors(props.id, w.colors)
+  else if (device.value) device.value.setting = { kind: 'mode', state: w.state }
+  sender.push(w)
+}
+
+/** Colours to show and paint on: the latest local edit, else the engine's buffer. */
+const colors = computed<readonly string[]>(() =>
+  intent.value?.kind === 'direct' ? intent.value.colors : (device.value?.colors ?? []),
+)
 
 // ---- selection and colour --------------------------------------------------------------------------------------
 
@@ -57,7 +100,7 @@ const selection = ref<Selection>(EMPTY)
 const pickerColor = ref('#FFFFFF')
 
 function syncPicker() {
-  if (device.value) pickerColor.value = selectionColor(device.value.colors, selection.value, '#FFFFFF')
+  if (device.value) pickerColor.value = selectionColor(colors.value, selection.value, '#FFFFFF')
 }
 
 function onSelect(sel: Selection) {
@@ -68,6 +111,8 @@ function onSelect(sel: Selection) {
 watch(
   () => props.id,
   () => {
+    sender.cancel()
+    dropIntent()
     selection.value = EMPTY
     error.value = null
     notice.value = null
@@ -87,57 +132,54 @@ const selectionText = computed(() => {
 })
 
 function onColor(hex: string) {
-  const d = device.value
-  if (!d) return
+  if (!device.value) return
   pickerColor.value = hex
-  error.value = null
-  const colors = paint(d.colors, selection.value, hex)
-  echoColors(props.id, colors)
-  directSender.push(colors)
+  write({ kind: 'direct', colors: paint(colors.value, selection.value, hex) })
 }
 
 // ---- mode menu -------------------------------------------------------------------------------------------------
 
 const STATIC = 'static'
 const DEFAULT = ''
+const RELEASED = 'released'
 
-/** `'static'`, a hardware mode id, or `''` while the device shows its own hardware mode. */
+/**
+ * `'static'`, a hardware mode id, `'released'` after a release, or `''` while the device shows its own hardware
+ * mode and was never set. Any real choice differs from `'released'` and `''`, so it always takes control.
+ */
 const menuValue = computed(() => {
+  const w = intent.value
+  if (w) return w.kind === 'direct' ? STATIC : String(w.state.mode)
   const d = device.value
   if (!d) return DEFAULT
+  if (d.status.state === 'released') return RELEASED
   const hw = currentHardwareMode(d)
   if (hw !== null) return String(hw)
   return d.setting ? STATIC : DEFAULT
 })
 
-/** Colour editing is shown in static mode, and also while the device shows its own mode (a colour takes control). */
-const editingStatic = computed(
-  () => hasDirect.value && (menuValue.value === STATIC || menuValue.value === DEFAULT),
-)
+/** Colour editing is shown in static mode, and also while the device runs on its own (a colour takes control). */
+const editingStatic = computed(() => hasDirect.value && [STATIC, DEFAULT, RELEASED].includes(menuValue.value))
 
 const activeMode = computed(() => modes.value.find((m) => String(m.id) === menuValue.value))
-const activeState = computed(() =>
-  device.value && activeMode.value ? stateFor(device.value, activeMode.value) : null,
-)
+/** The state the mode controls edit: the latest local one while edits are pending, else the device's. */
+const activeState = computed(() => {
+  const w = intent.value
+  if (w?.kind === 'mode' && activeMode.value && w.state.mode === activeMode.value.id) return w.state
+  return device.value && activeMode.value ? stateFor(device.value, activeMode.value) : null
+})
 
 function sendMode(state: ModeState) {
-  const d = device.value
-  if (!d) return
-  error.value = null
-  d.setting = { kind: 'mode', state }
-  modeSender.push(state)
+  write({ kind: 'mode', state })
 }
 
 function onMenu(value: string) {
   const d = device.value
   if (!d || value === menuValue.value) return
-  error.value = null
   if (value === STATIC) {
     // A device that was never set has an all-black buffer; start from white so "Static" does not look like "off".
     const fresh = d.setting === null && d.colors.every((c) => c === BLACK)
-    const colors = fresh ? d.colors.map(() => '#FFFFFF') : [...d.colors]
-    echoColors(props.id, colors)
-    directSender.push(colors)
+    write({ kind: 'direct', colors: fresh ? d.colors.map(() => '#FFFFFF') : [...colors.value] })
     syncPicker()
     return
   }
@@ -162,8 +204,9 @@ async function onResize(zone: Zone, index: number, raw: string) {
   busy.value = true
   error.value = null
   try {
-    await directSender.flush()
+    await sender.flush()
     const view = await resizeZone(props.id, index, len)
+    dropIntent()
     replaceDevice(view)
     selection.value = clampSelection(selection.value, view.description.leds.length)
   } catch (e) {
@@ -183,8 +226,10 @@ async function onRelease() {
   error.value = null
   notice.value = null
   try {
-    await directSender.flush()
-    await modeSender.flush()
+    // Release is the newest action: drop queued edits instead of sending them first.
+    sender.cancel()
+    await sender.flush()
+    dropIntent()
     await releaseDevice(props.id)
     notice.value = 'The device is back in its own hardware mode until you change something here.'
   } catch (e) {
@@ -200,8 +245,7 @@ async function onSave() {
   error.value = null
   notice.value = null
   try {
-    await directSender.flush()
-    await modeSender.flush()
+    await sender.flush()
     await saveToHardware(props.id)
     notice.value = 'Saved to the device.'
     confirmSave.value = false
@@ -230,13 +274,15 @@ const selectAll = () => device.value && onSelect(new Set(range(0, device.value.d
 
       <div v-if="device.status.state === 'faulted'" class="notice">
         <p>CaseControl stopped talking to this device after an error: {{ device.status.error }}</p>
-        <p class="muted small">Re-plug it, or close other software that uses it, then rescan on the Devices page.</p>
+        <p class="muted small">
+          Close other software that uses it or re-plug it, then press Rescan on the Devices page to retry.
+        </p>
       </div>
 
       <div class="stage">
         <DevicePreview
           :description="desc"
-          :colors="device.colors"
+          :colors="colors"
           :selection="selection"
           :interactive="editingStatic && !faulted"
           @select="onSelect"
@@ -252,12 +298,13 @@ const selectAll = () => device.value && onSelect(new Set(range(0, device.value.d
             @change="onMenu(($event.target as HTMLSelectElement).value)"
           >
             <option v-if="menuValue === DEFAULT" :value="DEFAULT" disabled>Device default</option>
+            <option v-if="menuValue === RELEASED" :value="RELEASED" disabled>Hardware (released)</option>
             <option v-if="hasDirect" :value="STATIC">Static (per LED)</option>
             <option v-for="m in modes" :key="m.id" :value="String(m.id)">{{ m.name }}</option>
           </select>
         </label>
 
-        <p v-if="menuValue === DEFAULT" class="muted">
+        <p v-if="menuValue === DEFAULT || menuValue === RELEASED" class="muted">
           The device shows its own hardware mode until you pick a colour or a mode here.
         </p>
 

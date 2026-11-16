@@ -139,6 +139,8 @@ export interface DeviceView {
   setting: DeviceSetting | null
   /** The engine's colour buffer, one entry per LED. */
   colors: Rgb[]
+  /** Family id of the backend that detected the device (e.g. `"wooting"`). */
+  family: string
 }
 
 export interface DetectFailure {
@@ -244,6 +246,8 @@ export interface SettingsView {
   detectors: Record<string, boolean>
   check_openrgb_port: boolean
   last_profile: string | null
+  /** Why settings are not saved this session (unreadable settings file); changes are refused while set. */
+  save_error: string | null
 }
 
 export interface SettingsPatch {

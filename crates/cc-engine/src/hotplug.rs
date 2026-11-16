@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use cc_core::{HotplugAction, HotplugHandle, HotplugSender};
 use tracing::{debug, warn};
@@ -48,6 +49,7 @@ pub(crate) struct HotplugRuntime {
     handle: Box<dyn HotplugHandle>,
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
+    done: crossbeam_channel::Receiver<()>,
 }
 
 impl HotplugRuntime {
@@ -65,6 +67,7 @@ impl HotplugRuntime {
         let thread_stop = Arc::clone(&stop);
         let weak = Arc::downgrade(shared);
         let poll = shared.timing.hotplug_poll;
+        let (done_tx, done) = crossbeam_channel::bounded(1);
         let spawned = std::thread::Builder::new()
             .name("cc-hotplug".into())
             .spawn(move || {
@@ -81,9 +84,15 @@ impl HotplugRuntime {
                         HotplugAction::Removed => shared.handle_removal(&ev, source.as_ref()),
                     }
                 }
+                let _ = done_tx.send(());
             });
         match spawned {
-            Ok(thread) => Some(Self { handle, stop, thread }),
+            Ok(thread) => Some(Self {
+                handle,
+                stop,
+                thread,
+                done,
+            }),
             Err(e) => {
                 warn!(error = %e, "could not start hot-plug thread");
                 handle.stop();
@@ -92,12 +101,21 @@ impl HotplugRuntime {
         }
     }
 
-    /// Stops the subscription and joins the event thread.
-    pub(crate) fn stop(self) {
+    /// Stops the subscription and joins the event thread if it ends within `timeout`; otherwise (it is inside a
+    /// detection pass) it is left to finish on its own.
+    pub(crate) fn stop_within(self, timeout: Duration) {
         self.stop.store(true, Ordering::Release);
         self.handle.stop();
-        if self.thread.join().is_err() {
-            warn!("hot-plug thread panicked");
+        // Disconnected means the thread ended without signalling (it panicked); joining is then immediate.
+        if !matches!(
+            self.done.recv_timeout(timeout),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout)
+        ) {
+            if self.thread.join().is_err() {
+                warn!("hot-plug thread panicked");
+            }
+        } else {
+            warn!("hot-plug thread did not stop in time; leaving it behind");
         }
     }
 }
