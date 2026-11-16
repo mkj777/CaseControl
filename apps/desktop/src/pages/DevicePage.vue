@@ -4,6 +4,11 @@
 // the window and the selection controls sit above it (ADR 0001 #28). Right-click a zone to hide or unhide it; hidden
 // zones stay black and are drawn (greyed) only with "Show hidden" on (ADR 0001 #26, #27).
 //
+// The status badge is the engine's real status. While released the preview shows the device's own lighting (its
+// colours if they can be read, else empty LEDs) and the mode menu names its own mode; every control still works and
+// takes the device over. While All off holds the device dark the preview is dark and a notice offers to turn the
+// lights back on.
+//
 // Every colour and mode change goes through one ordered sender, so the last user action always wins. While changes
 // are queued or in flight, the page shows its own latest intent instead of the store, so a refresh that raced an
 // edit cannot roll the controls back; the intent is dropped once the sender is idle and a fresh reload has landed.
@@ -34,6 +39,7 @@ import {
   releaseDevice,
   resizeZone,
   saveToHardware,
+  setAllOff,
   setDeviceBrightness,
   setDirect,
   setMode,
@@ -43,12 +49,16 @@ import {
 import { BLACK } from '../lib/color'
 import {
   STATUS_LABEL,
+  brightnessMode,
+  canDim,
   canSaveToHardware,
   currentHardwareMode,
   hardwareModes,
   hasCap,
   kindLabel,
   ledsOfZones,
+  ownLighting,
+  shownColors,
   stateFor,
   statusOf,
   visibleLeds,
@@ -131,10 +141,19 @@ function write(w: Write) {
   sender.push(w)
 }
 
-/** Colours to show and paint on: the latest local edit, else the engine's buffer. */
+/** Colours to paint on: the latest local edit, else the engine's buffer. */
 const colors = computed<readonly string[]>(() =>
   intent.value?.kind === 'direct' ? intent.value.colors : (device.value?.colors ?? []),
 )
+
+/** All off holds this device dark. */
+const heldOff = computed(() => deviceState.lighting.all_off && device.value?.status.state === 'active')
+
+/** What the preview shows: the latest local edit, else what the device shows (`null`: its own, unknown lighting). */
+const previewColors = computed<readonly string[] | null>(() => {
+  if (intent.value?.kind === 'direct') return heldOff.value ? intent.value.colors.map(() => BLACK) : intent.value.colors
+  return device.value ? shownColors(device.value, deviceState.lighting.all_off) : []
+})
 
 // ---- selection and colour --------------------------------------------------------------------------------------
 
@@ -192,8 +211,8 @@ const DEFAULT = ''
 const RELEASED = 'released'
 
 /**
- * `'static'`, a hardware mode id, `'released'` after a release, or `''` while the device shows its own hardware
- * mode and was never set. Any real choice differs from `'released'` and `''`, so it always takes control.
+ * `'static'`, a hardware mode id, `'released'` while the device shows its own lighting, or `''` while All off holds
+ * it dark without a setting. Any real choice differs from `'released'` and `''`, so it always takes control.
  */
 const menuValue = computed(() => {
   const w = intent.value
@@ -204,6 +223,12 @@ const menuValue = computed(() => {
   const hw = currentHardwareMode(d)
   if (hw !== null) return String(hw)
   return d.setting ? STATIC : DEFAULT
+})
+
+/** The menu entry for the device's own lighting, with its mode when that is known. */
+const releasedLabel = computed(() => {
+  const mode = device.value ? ownLighting(device.value).mode : null
+  return mode ? `Own lighting (${mode.name})` : 'Own lighting'
 })
 
 /** Colour editing is shown in static mode, and also while the device runs on its own (a colour takes control). */
@@ -238,8 +263,22 @@ function onMenu(value: string) {
 
 // ---- brightness (ADR 0001 #33) ---------------------------------------------------------------------------------
 
+/** The hardware mode a brightness change acts on (the one being set, driven, or taken over with), if any. */
+const dimMode = computed(() => {
+  if (intent.value) return activeMode.value ?? null
+  return device.value ? brightnessMode(device.value) : null
+})
 /** In a hardware mode without a brightness parameter the device brightness has no effect. */
-const brightnessUnsupported = computed(() => activeMode.value !== undefined && !hasCap(activeMode.value, 'BRIGHTNESS'))
+const brightnessUnsupported = computed(() => dimMode.value !== null && !hasCap(dimMode.value, 'BRIGHTNESS'))
+/** A released device whose own lighting is unknown and that has no setting: there is nothing to dim. */
+const nothingToDim = computed(() => intent.value === null && device.value !== undefined && !canDim(device.value))
+const brightnessHint = computed(() =>
+  nothingToDim.value
+    ? 'Set a colour or mode first.'
+    : brightnessUnsupported.value
+      ? 'This mode has no brightness setting.'
+      : undefined,
+)
 
 async function sendBrightness(percent: number, persist: boolean) {
   await setDeviceBrightness(props.id, percent, persist)
@@ -249,6 +288,23 @@ async function sendBrightness(percent: number, persist: boolean) {
 function brightnessFailed(e: unknown) {
   error.value = errorText(e)
   void refreshDevices()
+}
+
+// ---- All off (ADR 0001 #33) ------------------------------------------------------------------------------------
+
+const turningOn = ref(false)
+
+async function onAllOn() {
+  error.value = null
+  turningOn.value = true
+  try {
+    deviceState.lighting = await setAllOff(false)
+  } catch (e) {
+    error.value = errorText(e)
+  } finally {
+    turningOn.value = false
+    void refreshDevices()
+  }
 }
 
 // ---- zones -----------------------------------------------------------------------------------------------------
@@ -324,7 +380,6 @@ async function onRelease() {
     await sender.flush()
     dropIntent()
     await releaseDevice(props.id)
-    notice.value = 'The device is back in its own hardware mode until you change something here.'
   } catch (e) {
     error.value = errorText(e)
   } finally {
@@ -356,11 +411,7 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
 <template>
   <section class="page wide">
     <template v-if="device && desc">
-      <PageHeader
-        :title="desc.info.name"
-        :meta="`${kindLabel(desc.info.kind)} · ${desc.info.vendor}`"
-        :back="{ to: '/devices', label: 'Devices' }"
-      >
+      <PageHeader :title="desc.info.name" :back="{ to: '/devices', label: 'Devices' }">
         <template #badge>
           <StatusBadge v-if="deviceHidden" status="hidden">Hidden</StatusBadge>
           <StatusBadge v-else :status="statusOf(device)">{{ STATUS_LABEL[statusOf(device)] }}</StatusBadge>
@@ -373,8 +424,8 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
             label="Brightness"
             :value="device.brightness"
             :send="sendBrightness"
-            :disabled="locked || brightnessUnsupported"
-            :hint="brightnessUnsupported ? 'This mode has no brightness setting.' : undefined"
+            :disabled="locked || brightnessUnsupported || nothingToDim"
+            :hint="brightnessHint"
             @error="brightnessFailed"
           />
         </template>
@@ -384,6 +435,13 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
         This device is hidden, so CaseControl does not control it.
         <template #details>
           To unhide it, turn on Show hidden on the Devices page and right-click the device.
+        </template>
+      </Notice>
+
+      <Notice v-if="heldOff && !deviceHidden">
+        All lights are off.
+        <template #details>
+          <div><Button size="sm" :disabled="turningOn" @click="onAllOn">Turn on</Button></div>
         </template>
       </Notice>
 
@@ -405,7 +463,7 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
         <DevicePreview
           variant="stage"
           :description="desc"
-          :colors="colors"
+          :colors="previewColors"
           :selection="selection"
           :interactive="editingStatic && !locked"
           :hidden-zones="hiddenZones"
@@ -418,16 +476,12 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
       <div class="panel">
         <Field v-slot="{ id }" label="Mode">
           <Select :id="id" :model-value="menuValue" :disabled="locked || busy" @update:model-value="onMenu">
-            <option v-if="menuValue === DEFAULT" :value="DEFAULT" disabled>Device default</option>
-            <option v-if="menuValue === RELEASED" :value="RELEASED" disabled>Hardware (released)</option>
+            <option v-if="menuValue === DEFAULT" :value="DEFAULT" disabled>Off</option>
+            <option v-if="menuValue === RELEASED" :value="RELEASED" disabled>{{ releasedLabel }}</option>
             <option v-if="hasDirect" :value="STATIC">Static (per LED)</option>
             <option v-for="m in modes" :key="m.id" :value="String(m.id)">{{ m.name }}</option>
           </Select>
         </Field>
-
-        <p v-if="menuValue === DEFAULT || menuValue === RELEASED" class="muted">
-          The device shows its own hardware mode until you pick a colour or a mode here.
-        </p>
 
         <ColorPicker v-if="editingStatic" :model-value="pickerColor" :disabled="locked" @update:model-value="onColor" />
 
@@ -445,7 +499,6 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
 
       <div v-if="resizable.length > 0" class="section">
         <h2>LED count</h2>
-        <p class="muted intro">Set how many LEDs are connected to each header.</p>
         <div class="zones">
           <Field
             v-for="z in resizable"
@@ -475,10 +528,11 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
             Save to device
           </Button>
         </div>
-        <p class="muted small intro">
-          Release hands the device back to its own hardware mode. CaseControl does this for every device when it quits.
-        </p>
-        <KeyValueList class="small">
+        <KeyValueList class="small facts">
+          <dt>Kind</dt>
+          <dd>{{ kindLabel(desc.info.kind) }}</dd>
+          <dt>Vendor</dt>
+          <dd>{{ desc.info.vendor }}</dd>
           <dt>Id</dt>
           <dd class="mono">{{ desc.info.id }}</dd>
           <template v-if="desc.info.firmware">
@@ -528,8 +582,8 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
   margin: var(--space-10) 0;
 }
 
-.intro {
-  margin: var(--space-3) 0 var(--space-5);
+.facts {
+  margin-top: var(--space-6);
 }
 
 .zones {

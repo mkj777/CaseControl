@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use cc_core::DeviceError;
+use cc_core::{DeviceError, Rgb};
 use cc_hid::{HidError, HidTransport};
 
 /// Logitech USB vendor id.
@@ -423,6 +423,79 @@ pub fn restore_params(state: &ZoneEffectState, zone: &ZoneInfo) -> Option<[u8; 1
     Some(params)
 }
 
+/// A zone's GetEffect readback decoded with the SetZoneEffect parameter layout of its effect (the HID++ 2.0
+/// controller's `SetZoneEffect` table, the inverse of [`super::g560::effect_params`]). Parameters the effect does
+/// not have are `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedEffect {
+    /// The effect slot named in byte 1.
+    pub effect: EffectInfo,
+    /// The effect's colour.
+    pub color: Option<Rgb>,
+    /// The effect's period in milliseconds (or the raw period value for the ripple effects).
+    pub period: Option<u16>,
+    /// The effect's brightness byte.
+    pub brightness: Option<u8>,
+    /// The wave effects' direction code.
+    pub direction: Option<u8>,
+}
+
+/// Decodes a zone's readback under the same checks as [`restore_params`] (zone echo, an effect the zone reported,
+/// a known parameter layout); `None` otherwise.
+pub fn decode_effect(state: &ZoneEffectState, zone: &ZoneInfo) -> Option<DecodedEffect> {
+    let p = restore_params(state, zone)?;
+    let fx = zone.effect_by_index(p[1])?;
+    let rgb = |o: usize| Some(Rgb::new(p[o], p[o + 1], p[o + 2]));
+    let be = |o: usize| Some(u16::from_be_bytes([p[o], p[o + 1]]));
+    let mut d = DecodedEffect {
+        effect: fx,
+        color: None,
+        period: None,
+        brightness: None,
+        direction: None,
+    };
+    match fx.id {
+        effect::STATIC => d.color = rgb(2),
+        effect::BREATHING => {
+            d.color = rgb(2);
+            d.period = be(5);
+            d.brightness = Some(p[8]);
+        }
+        effect::CYCLE | effect::SIGNATURE1 | effect::SIGNATURE2 => {
+            d.period = be(7);
+            d.brightness = Some(p[9]);
+        }
+        effect::AUDIO => {
+            d.color = if p[2] == 0x01 { Some(Rgb::BLACK) } else { rgb(3) };
+            d.period = be(7);
+        }
+        effect::WAVE => {
+            d.period = Some(u16::from_be_bytes([p[11], p[8]]));
+            d.direction = Some(p[9]);
+            d.brightness = Some(p[10]);
+        }
+        effect::RIPPLE => {
+            d.color = rgb(2);
+            d.period = be(6);
+        }
+        effect::DECOMPOSITION | effect::CYCLE_SAT => {
+            d.period = be(8);
+            d.brightness = Some(p[10]);
+        }
+        effect::WAVE_SAT => {
+            d.period = be(8);
+            d.brightness = Some(p[10]);
+            d.direction = Some(p[11]);
+        }
+        effect::RIPPLE_SAT => {
+            d.color = rgb(2);
+            d.period = be(8);
+        }
+        _ => {}
+    }
+    Some(d)
+}
+
 /// Upper bound for counts read from the device; anything larger is treated as a garbled reply.
 const MAX_ZONES: u8 = 32;
 const MAX_EFFECTS: u8 = 32;
@@ -796,6 +869,62 @@ pub(crate) mod tests {
         assert_eq!(restore_params(&st(unknown), &zone), None);
         assert_eq!(
             restore_params(&ZoneEffectState { zone: 1, raw: None }, &zone),
+            None
+        );
+    }
+
+    #[test]
+    fn decode_effect_reads_the_setzoneeffect_layout() {
+        let fx = |index, id| EffectInfo {
+            index,
+            id,
+            caps: 0,
+            period: 0,
+        };
+        let zone = ZoneInfo {
+            index: 0,
+            location: 1,
+            effects: vec![
+                fx(0, effect::OFF),
+                fx(1, effect::STATIC),
+                fx(2, effect::BREATHING),
+                fx(3, effect::WAVE),
+                fx(4, 0x0042),
+            ],
+        };
+        let st = |raw: [u8; 16]| ZoneEffectState {
+            zone: 0,
+            raw: Some(raw),
+        };
+        // Breathing: colour @2..5, period 0x1388 (5000 ms) @5..7, brightness @8.
+        let b = decode_effect(
+            &st([0, 2, 9, 8, 7, 0x13, 0x88, 0, 50, 0, 0, 0, 0, 0, 0, 0]),
+            &zone,
+        )
+        .expect("breathing decodes");
+        assert_eq!(b.effect.id, effect::BREATHING);
+        assert_eq!(b.color, Some(Rgb::new(9, 8, 7)));
+        assert_eq!(b.period, Some(5000));
+        assert_eq!(b.brightness, Some(50));
+        assert_eq!(b.direction, None);
+        // Wave: period low @8, high @11, direction @9, brightness @10.
+        let w = decode_effect(
+            &st([0, 3, 0, 0, 0, 0, 0, 0, 0x88, 6, 80, 0x13, 0, 0, 0, 0]),
+            &zone,
+        )
+        .expect("wave decodes");
+        assert_eq!(
+            (w.period, w.direction, w.brightness),
+            (Some(5000), Some(6), Some(80))
+        );
+        assert_eq!(w.color, None);
+        // Static: colour only. Off: nothing. Unknown layout: not decoded.
+        let s = decode_effect(&st([0, 1, 1, 2, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), &zone).expect("static");
+        assert_eq!((s.color, s.period), (Some(Rgb::new(1, 2, 3)), None));
+        let o = decode_effect(&st([0; 16]), &zone).expect("off");
+        assert_eq!((o.effect.id, o.color), (effect::OFF, None));
+        assert_eq!(
+            decode_effect(&st([0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), &zone),
             None
         );
     }

@@ -114,10 +114,7 @@ async function onDontAsk(f: Finding, value: boolean) {
 
 <template>
   <section class="page">
-    <PageHeader
-      title="Conflicts"
-      description="Other software that can control the same devices. When two programs drive a device, colours flicker or fall back. You can close these programs and stop them from starting with Windows; autostart can be turned back on here."
-    >
+    <PageHeader title="Conflicts" description="Other software that can drive the same devices, so colours flicker or fall back.">
       <template #actions>
         <Button :disabled="scanning" @click="runScan">{{ scanning ? 'Scanning…' : 'Scan' }}</Button>
       </template>
@@ -215,7 +212,6 @@ async function onDontAsk(f: Finding, value: boolean) {
             v-if="f.class === 'suite'"
             :model-value="f.dont_ask"
             label="Don't ask again at start"
-            hint="CaseControl no longer offers to close this program when it starts."
             @update:model-value="(v: boolean) => onDontAsk(f, v)"
           />
         </Card>

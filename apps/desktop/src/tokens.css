@@ -134,6 +134,7 @@
   --switch-height: 22px;
   --control-max-width: 320px; /* widest a text field, select or slider grows (Field control column) */
   --row-max-width: 640px; /* settings rows, switch rows, stacked fields */
+  --toolbar-control-width: 200px; /* the slider of an inline Field in a page toolbar (brightness) */
 
   --titlebar-height: 32px;
   --window-button-width: 46px;

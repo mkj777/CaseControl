@@ -279,6 +279,46 @@ fn layout_zones(board: &Board, lens: &[usize]) -> (Vec<Zone>, Vec<Led>) {
     (zones, leds)
 }
 
+/// The mode the board shows on its own, decoded from configuration `config` (`GetMode` of the first zone with LEDs,
+/// as `RGBController_MSIMotherboard185` reads the active mode): its effect as one of `desc`'s hardware modes, speed and
+/// brightness clamped to the mode's ranges, and for per-LED colour modes each zone's first colour on all its LEDs.
+/// `None` for the per-LED (direct) effect, "disabled" and effects without a mode, since their colours are unknown.
+fn hardware_state(config: &ConfigPacket, board: &Board, desc: &DeviceDescription) -> Option<ModeState> {
+    let mixed = board.layout.mixed_mode;
+    let (first, _) = board
+        .config
+        .zones
+        .iter()
+        .zip(&desc.zones)
+        .find(|(_, z)| z.len > 0)?;
+    let zs = config.zone_state(*first, mixed)?;
+    let mode = desc
+        .modes
+        .iter()
+        .find(|m| m.id == u32::from(zs.effect) && desc.direct_mode != Some(m.id))?;
+    let clamp = |v: u8, r: &Option<std::ops::RangeInclusive<u32>>| {
+        r.as_ref().map(|r| u32::from(v).clamp(*r.start(), *r.end()))
+    };
+    let colors = if mode.color_mode == ColorMode::PerLed {
+        let mut out = Vec::with_capacity(desc.led_count());
+        for (msi, zone) in board.config.zones.iter().zip(&desc.zones) {
+            let color = config.zone_state(*msi, mixed).map_or(Rgb::BLACK, |z| z.color);
+            out.extend(std::iter::repeat_n(color, zone.len));
+        }
+        out
+    } else {
+        Vec::new()
+    };
+    let state = ModeState {
+        mode: mode.id,
+        speed: clamp(zs.speed, &mode.speed),
+        brightness: clamp(zs.brightness, &mode.brightness),
+        direction: None,
+        colors,
+    };
+    desc.validate_state(&state).is_ok().then_some(state)
+}
+
 fn hid_err(e: HidError) -> DeviceError {
     DeviceError::from(e)
 }
@@ -812,5 +852,10 @@ impl Controller for MysticLight185 {
         self.send(&original)?;
         self.touched = false;
         Ok(())
+    }
+
+    /// The mode in the configuration read at open, which is also what `release()` restores.
+    fn hardware_mode(&self) -> Option<ModeState> {
+        hardware_state(&self.original, &self.board, &self.desc)
     }
 }

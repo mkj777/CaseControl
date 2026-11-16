@@ -11,6 +11,10 @@
 //! colour frames; a mode output equal to the one the device already shows is not sent again, so a mode without a
 //! brightness parameter does not restart its effect on every fade step.
 //!
+//! Status: a device starts released (it shows its own lighting) and becomes active with the first output that goes
+//! out; an explicit release makes it released again. The worker reports both changes to the engine, which emits
+//! `DeviceStateChanged`.
+//!
 //! Resume (after sleep or hibernate): [`Command::Reassert`] makes the worker hand the device back once (`release()`,
 //! which also clears the driver's "already sent" caches and makes it re-send its init) and then send the current
 //! output again. Reset and send are retried together with the usual back-off; if the device still does not take
@@ -60,7 +64,8 @@ pub(crate) enum Command {
     Save(Reply),
     /// Hand the device back to its hardware mode.
     Release { seq: u64, reply: Reply },
-    /// Leave the thread, releasing first if `release` and the device is Active.
+    /// Leave the thread, releasing first if `release` and the device was not handed back since it was opened or last
+    /// written to.
     Stop { release: bool, reply: Option<Reply> },
     /// The system resumed: reset the device (`release()`) and send `output` (the current output, issued with
     /// `seq`) again, retrying both with back-off for up to [`Timing::resume_retry`].
@@ -122,6 +127,8 @@ impl Timing {
     }
 }
 
+/// The worker's own view of its device. A device starts `Released`: it shows its own lighting until the first
+/// output goes out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Local {
     Active,
@@ -142,6 +149,11 @@ pub(crate) struct Worker {
     dirty: Option<Frame>,
     /// The mode the device was last sent and still shows (cleared by a colour frame or a release).
     shown_mode: Option<ModeState>,
+    /// The device was not handed back since it was opened or last written to (also a write that failed, which may
+    /// have taken effect), so stopping releases it. True from the start, as before the status became truthful:
+    /// drivers make a release of an untouched device a no-op, except where the reference resets on purpose
+    /// (Wooting cleans up after a crashed earlier run).
+    needs_release: bool,
     /// Sequence number of the last frame, mode or release that was applied (or superseded everything before it).
     last_seq: u64,
     last_frame: Option<Instant>,
@@ -171,10 +183,11 @@ impl Worker {
             rx,
             frame,
             shared,
-            local: Local::Active,
+            local: Local::Released,
             fault_reason: String::new(),
             dirty: None,
             shown_mode: None,
+            needs_release: true,
             last_seq: 0,
             last_frame: None,
             failures: 0,
@@ -318,8 +331,9 @@ impl Worker {
                 self.last_seq = seq;
                 self.took_control(now);
                 self.resumed();
-                self.shared
-                    .applied(&self.id, self.generation, output.stored, false);
+                if let Some(stored) = output.stored {
+                    self.shared.applied(&self.id, self.generation, stored, false);
+                }
             }
             Err(DeviceError::InvalidArgument(msg)) => {
                 warn!(id = %self.id, %msg, "driver rejected frame");
@@ -357,6 +371,7 @@ impl Worker {
 
     /// Sends one output to the device and remembers which mode it shows.
     fn send_out(&mut self, out: &Out) -> Result<(), DeviceError> {
+        self.needs_release = true;
         let r = match out {
             Out::Direct(colors) => self.ctrl.set_direct(colors),
             Out::Mode(state) => self.ctrl.set_mode(state),
@@ -450,6 +465,7 @@ impl Worker {
             Command::Release { seq, reply } => {
                 let r = self.ordered(seq, |w| w.ctrl.release());
                 if r == Ok(true) {
+                    self.needs_release = false;
                     self.mark_released();
                     self.reset = false;
                     self.resumed();
@@ -466,18 +482,20 @@ impl Worker {
                 let r = self.guarded(|w| w.ctrl.resize_zone(zone, len));
                 if r.is_ok() {
                     let desc = self.ctrl.description().clone();
+                    let hardware = self.ctrl.hardware_mode();
                     self.shared
-                        .resized(&self.id, self.generation, zone, desc, dropped);
+                        .resized(&self.id, self.generation, zone, desc, hardware, dropped);
                 }
                 let _ = reply.send(r);
             }
             Command::Save(reply) => {
+                self.needs_release = true;
                 let r = self.guarded(|w| w.ctrl.save_to_hardware());
                 let _ = reply.send(r);
             }
             Command::Reassert { seq, output } => self.reassert(seq, output),
             Command::Stop { release, reply } => {
-                let r = if release && self.local == Local::Active {
+                let r = if release && self.needs_release && self.local != Local::Faulted {
                     let r = self.ctrl.release();
                     if let Err(e) = &r {
                         warn!(id = %self.id, error = %e, "release on stop failed");
@@ -538,6 +556,8 @@ impl Worker {
         self.local = Local::Released;
         self.shown_mode = None;
         self.next_keepalive = None;
+        self.shared
+            .set_hardware(&self.id, self.generation, self.ctrl.hardware_mode());
         self.shared
             .set_status(&self.id, self.generation, DeviceStatus::Released);
     }

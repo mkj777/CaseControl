@@ -131,14 +131,17 @@ export type DeviceError =
 
 export type DeviceSetting = { kind: 'direct'; colors: Rgb[] } | { kind: 'mode'; state: ModeState }
 
+/** `active`: CaseControl drives the device. `released`: it shows its own lighting (also before it was ever driven). */
 export type DeviceStatus = { state: 'active' } | { state: 'released' } | { state: 'faulted'; error: string }
 
 export interface DeviceView {
   description: DeviceDescription
   status: DeviceStatus
   setting: DeviceSetting | null
-  /** The engine's colour buffer, one entry per LED. */
+  /** The engine's colour buffer, one entry per LED (seeded with the device's own colours where they are known). */
   colors: Rgb[]
+  /** What the device shows on its own, as its driver read it; `null` when that is unknown. */
+  hardware: ModeState | null
   /** Family id of the backend that detected the device (e.g. `"wooting"`). */
   family: string
   /** Device brightness in percent (ADR 0001 #33); `colors` and `setting` are unscaled. */
@@ -427,7 +430,8 @@ export interface EventPayloads {
   'device-added': DeviceInfo
   'device-removed': { id: DeviceId }
   'device-faulted': { id: DeviceId; error: string }
-  'device-state-changed': { id: DeviceId; state: ModeState }
+  /** Taken under control (`active`), handed back, or switched to a hardware mode (`state`). */
+  'device-state-changed': { id: DeviceId; active: boolean; state: ModeState | null }
   /** Tray actions changed device colours or status. */
   'devices-changed': null
   'profiles-changed': ProfileList

@@ -15,6 +15,12 @@
 //! - Brightness (ADR 0001 #33): a device brightness per device and a master brightness scale what goes to the device
 //!   (colours, or a hardware mode's brightness); All off fades every driven device to black and holds it there. The
 //!   stored settings stay unscaled, so `current_settings()` and profiles never see dimmed colours.
+//! - Control status (phase 3 brief 05): a device is `Active` only while the engine outputs something to it and
+//!   `Released` while it shows its own lighting, which includes "never taken since it was detected";
+//!   `DeviceStateChanged` is emitted on every change. Every lighting control takes over an undriven device that is
+//!   not excluded: colours and modes directly; brightness and All off with the device's last setting, else the mode
+//!   its driver read back from the hardware (`DeviceView::hardware`), else (All off only) held dark until All on
+//!   hands it back.
 //! - Resume (sleep, hibernation): on Windows the engine subscribes to suspend/resume broadcasts and then calls
 //!   [`EngineHandle::reassert`]: debounced, it resets and re-sends every driven device's current output, retries
 //!   failed writes with back-off for a few seconds and re-opens devices that faulted or vanished during sleep.

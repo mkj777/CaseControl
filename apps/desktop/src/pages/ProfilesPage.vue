@@ -145,10 +145,7 @@ async function onDelete() {
 
 <template>
   <section class="page">
-    <PageHeader
-      title="Profiles"
-      description="A profile remembers what every device shows. The active profile is applied again when CaseControl starts."
-    />
+    <PageHeader title="Profiles" />
 
     <form class="save row" @submit.prevent="onSaveAs">
       <TextField v-model="newName" class="name-input" placeholder="Profile name" maxlength="64" aria-label="Profile name" />

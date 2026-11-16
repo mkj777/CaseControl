@@ -131,6 +131,58 @@ pub fn raw_speed(speed: u32) -> u16 {
 /// Default UI speed (raw `LOGITECH_G_PRO_WIRELESS_SPEED_NORMAL`).
 pub const DEFAULT_SPEED: u32 = SPEED_MIN + SPEED_MAX - RAW_SPEED_NORMAL as u32;
 
+/// The mode the device shows on its own, from each zone's open-time readback: the first zone whose readback decodes
+/// names the mode (its effect index, or "Off"), speed (from the raw period, the inverse of [`raw_speed`]) and
+/// brightness; per-LED colours come from every zone (black where a zone's readback has none). `None` when no zone
+/// decodes or the result is not a valid state of `desc`.
+pub fn hardware_state(
+    desc: &DeviceDescription,
+    zones: &[ZoneInfo],
+    initial: &[ZoneEffectState],
+) -> Option<ModeState> {
+    let decoded: Vec<Option<hidpp::DecodedEffect>> = zones
+        .iter()
+        .map(|z| {
+            initial
+                .iter()
+                .find(|s| s.zone == z.index)
+                .and_then(|s| hidpp::decode_effect(s, z))
+        })
+        .collect();
+    let first = decoded.iter().flatten().next()?;
+    let id = if first.effect.id == effect::OFF {
+        OFF_MODE
+    } else {
+        u32::from(first.effect.index)
+    };
+    let mode = desc.mode(id).filter(|_| desc.direct_mode != Some(id))?;
+    let has = |c| mode.caps.contains(c);
+    let speed = first.period.filter(|_| has(ModeCaps::SPEED)).map(|p| {
+        (SPEED_MIN + SPEED_MAX)
+            .saturating_sub(u32::from(p / 100))
+            .clamp(SPEED_MIN, SPEED_MAX)
+    });
+    let brightness = first
+        .brightness
+        .filter(|_| has(ModeCaps::BRIGHTNESS))
+        .map(|b| u32::from(b).clamp(BRIGHTNESS_MIN, BRIGHTNESS_MAX));
+    let colors = match mode.color_mode {
+        ColorMode::PerLed => decoded
+            .iter()
+            .map(|d| d.and_then(|d| d.color).unwrap_or(Rgb::BLACK))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let state = ModeState {
+        mode: id,
+        speed,
+        brightness,
+        direction: None,
+        colors,
+    };
+    desc.validate_state(&state).is_ok().then_some(state)
+}
+
 /// The 16 `setMode` parameter bytes for feature 0x8070 (`logitech_device::setMode`, fp8070 branch): zone, effect
 /// index, R, G, B, then per effect type: Spectrum period (raw * 100, BE) at 7..9 and brightness at 9; Breathing
 /// period at 5..7 and brightness at 8. Byte 12 (persistence) is 0.
@@ -599,6 +651,11 @@ impl Controller for LightspeedController {
         self.link
             .restore_effects(self.feature, &self.zones, &self.initial)
     }
+
+    /// The open-time readback, which is also what `release()` replays.
+    fn hardware_mode(&self) -> Option<ModeState> {
+        hardware_state(&self.desc, &self.zones, &self.initial)
+    }
 }
 
 #[cfg(test)]
@@ -677,6 +734,24 @@ pub(crate) mod tests {
         );
         desc.validate().expect("valid description");
         (LightspeedController::new(link, p, desc), fake)
+    }
+
+    #[test]
+    fn hardware_mode_from_the_open_time_readback() {
+        // Zone 0 read back Static (index 1) in red; zone 1 echoed the wrong zone, so its LED is black. Static has no
+        // brightness byte in its layout, so none is reported.
+        let (c, fake) = controller(ScriptBuilder::new());
+        assert_eq!(
+            c.hardware_mode(),
+            Some(ModeState {
+                mode: 1,
+                speed: None,
+                brightness: None,
+                direction: None,
+                colors: vec![Rgb::new(0xFF, 0, 0), Rgb::BLACK],
+            })
+        );
+        fake.finish().expect("script consumed");
     }
 
     fn set_effect(params: [u8; 16]) -> Vec<u8> {

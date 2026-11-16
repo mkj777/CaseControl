@@ -141,6 +141,64 @@ pub fn describe(id: DeviceId, name: &str, location: String, zones: &[ZoneKind]) 
     }
 }
 
+/// The lighting `params` (a `GetControl` result) shows, as a state of `desc`: "Direct" when every zone with a known
+/// type is in manual mode, with each zone's colour scaled by its brightness relative to the brightest zone and that
+/// brightness as the mode's brightness (so sending it back reproduces every zone), or "Off" when every such zone is
+/// dark. `None` while any zone runs an animation (piecewise linear), whose look this driver cannot express.
+#[must_use]
+pub fn readback_state(desc: &DeviceDescription, params: &ZoneControlParams) -> Option<ModeState> {
+    let mut zones = Vec::with_capacity(params.zones.len());
+    for zone in &params.zones {
+        if matches!(zone.kind, ZoneKind::Invalid | ZoneKind::Other(_)) {
+            zones.push(None);
+            continue;
+        }
+        if zone.mode != cc_nvapi::CtrlMode::Manual {
+            return None;
+        }
+        zones.push(Some(mapping::current_color(zone)?));
+    }
+    let max = zones
+        .iter()
+        .flatten()
+        .filter(|(c, _)| *c != Rgb::BLACK)
+        .map(|(_, b)| *b)
+        .max()
+        .unwrap_or(0);
+    let state = if max == 0 {
+        ModeState {
+            mode: MODE_OFF,
+            speed: None,
+            brightness: None,
+            direction: None,
+            colors: Vec::new(),
+        }
+    } else {
+        let colors = zones
+            .iter()
+            .map(|z| match z {
+                Some((c, b)) => {
+                    // In 0..=255: channel * b / max with b <= max.
+                    let ch = |v: u8| {
+                        u8::try_from((u32::from(v) * u32::from(*b) + u32::from(max) / 2) / u32::from(max))
+                            .unwrap_or(v)
+                    };
+                    Rgb::new(ch(c.r), ch(c.g), ch(c.b))
+                }
+                None => Rgb::BLACK,
+            })
+            .collect();
+        ModeState {
+            mode: MODE_DIRECT,
+            speed: None,
+            brightness: Some(u32::from(max.min(mapping::MAX_BRIGHTNESS))),
+            direction: None,
+            colors,
+        }
+    };
+    desc.validate_state(&state).is_ok().then_some(state)
+}
+
 /// NVIDIA Illumination V1 controller.
 ///
 /// Lifecycle: constructed from the params of a successful `GetControl` (the hardware state to restore). The first
@@ -163,6 +221,8 @@ pub struct IllumController<A> {
     dirty: bool,
     /// Brightness of the "Direct" mode.
     brightness: u8,
+    /// The lighting the GPU showed on its own when control was last taken (what `release()` writes back).
+    hardware: Option<ModeState>,
 }
 
 impl<A: IllumApi> IllumController<A> {
@@ -185,7 +245,9 @@ impl<A: IllumApi> IllumController<A> {
         let desc = describe(id, name, location, &kinds);
         desc.validate()
             .map_err(|e| DeviceError::Protocol(format!("invalid description: {e}")))?;
+        let hardware = readback_state(&desc, &current);
         Ok(Self {
+            hardware,
             desc,
             api,
             kinds,
@@ -217,6 +279,7 @@ impl<A: IllumApi> IllumController<A> {
                 self.kinds
             )));
         }
+        self.hardware = readback_state(&self.desc, &current);
         self.working = current.clone();
         self.initial = Some(current);
         self.last_sent = None;
@@ -313,6 +376,10 @@ impl<A: IllumApi + Send> Controller for IllumController<A> {
         self.dirty = false;
         Ok(())
     }
+
+    fn hardware_mode(&self) -> Option<ModeState> {
+        self.hardware.clone()
+    }
 }
 
 #[cfg(test)]
@@ -390,6 +457,32 @@ mod tests {
 
     fn single(brightness: u8) -> ZoneControl {
         ZoneControl::new(ZoneKind::SingleColor, ZoneColor::Single { brightness })
+    }
+
+    #[test]
+    fn hardware_mode_reads_the_manual_zones() {
+        // Single-colour zones at 50, 60, 60: Direct at brightness 60; zone 0 white scaled by 50 / 60 (255 * 50 / 60 =
+        // 212.5 -> 213), which the driver maps back to brightness (213 * 60 * 2 + 255) / 510 = 50.
+        let fake = Fake::with_state(rtx5080_params());
+        let c = controller(&fake);
+        let state = c.hardware_mode().expect("manual zones decode");
+        assert_eq!(state.mode, MODE_DIRECT);
+        assert_eq!(state.brightness, Some(60));
+        assert_eq!(
+            state.colors,
+            vec![Rgb::new(213, 213, 213), Rgb::WHITE, Rgb::WHITE]
+        );
+        assert_eq!(mapping::scaled_brightness(state.colors[0], 60), 50);
+
+        // All dark: Off.
+        let dark = ZoneControlParams::new(false, vec![single(0), single(0), single(0)]);
+        let off = readback_state(c.description(), &dark).expect("dark decodes");
+        assert_eq!(off.mode, MODE_OFF);
+
+        // An animated zone: unknown.
+        let mut animated = rtx5080_params();
+        animated.zones[1].mode = CtrlMode::PiecewiseLinear;
+        assert_eq!(readback_state(c.description(), &animated), None);
     }
 
     #[test]

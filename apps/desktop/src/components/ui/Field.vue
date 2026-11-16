@@ -1,7 +1,8 @@
 <script setup lang="ts">
 // A labelled control (docs/design-system.md, "Field"): label, control, optional hint and inline error. `row` puts
 // the label in a 120 px column, the control in up to 320 px and the `value` slot (a readout) in 48 px; `stacked`
-// puts the label above. The default slot receives `id` (for the control), `describedBy` and `invalid` to wire up.
+// puts the label above; `inline` sizes the label to its text and the control to --toolbar-control-width, for a
+// toolbar. The default slot receives `id` (for the control), `describedBy` and `invalid` to wire up.
 // `group` is for a set of controls (colour chips): the label then names a role="group" instead of one control.
 import { computed, useId } from 'vue'
 
@@ -10,7 +11,7 @@ const props = withDefaults(
     label: string
     hint?: string
     error?: string | null
-    layout?: 'row' | 'stacked'
+    layout?: 'row' | 'stacked' | 'inline'
     group?: boolean
   }>(),
   { hint: undefined, error: null, layout: 'row', group: false },
@@ -62,6 +63,11 @@ const describedBy = computed(
   max-width: var(--row-max-width);
 }
 
+.inline {
+  grid-template-columns: auto var(--toolbar-control-width) auto;
+  column-gap: var(--space-3);
+}
+
 .label {
   color: var(--text-muted);
 }
@@ -74,7 +80,8 @@ const describedBy = computed(
 }
 
 .row .control > :deep(select),
-.row .control > :deep(input[type='range']) {
+.row .control > :deep(input[type='range']),
+.inline .control > :deep(input[type='range']) {
   width: 100%;
 }
 
@@ -89,7 +96,9 @@ const describedBy = computed(
 }
 
 .row .hint,
-.row .error {
+.row .error,
+.inline .hint,
+.inline .error {
   grid-column: 2 / 4;
 }
 

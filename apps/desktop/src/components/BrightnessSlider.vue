@@ -2,6 +2,7 @@
 // A brightness slider (ADR 0001 #33): a labelled Slider with a percent readout. While dragging it sends live
 // (coalesced, `persist = false`); when the drag ends it sends the final value once more with `persist = true`. Until
 // that last send has finished it shows its own value, so a device refresh in between cannot pull the thumb back.
+// It sits in a page toolbar, so it uses the inline Field layout.
 import { computed, ref } from 'vue'
 import { latestSender } from '../lib/throttle'
 import { Field, Slider } from './ui'
@@ -49,7 +50,7 @@ async function onChange(v: number) {
 </script>
 
 <template>
-  <Field :label="label" :hint="hint">
+  <Field :label="label" :hint="hint" layout="inline">
     <template #default="{ id, describedBy }">
       <Slider
         :id="id"

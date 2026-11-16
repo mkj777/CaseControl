@@ -71,7 +71,7 @@ async function onHide() {
 
 <template>
   <section class="page">
-    <PageHeader title="Settings" description="Changes are saved right away." />
+    <PageHeader title="Settings" />
 
     <Notice v-if="settings?.save_error" variant="error">{{ settings.save_error }}</Notice>
     <Notice v-if="error && error !== settings?.save_error" variant="error">{{ error }}</Notice>
@@ -89,7 +89,6 @@ async function onHide() {
         <Switch
           :model-value="settings.start_minimized"
           label="Start minimized"
-          hint="Open in the tray without showing this window."
           :disabled="locked"
           @update:model-value="patch({ start_minimized: $event })"
         />
