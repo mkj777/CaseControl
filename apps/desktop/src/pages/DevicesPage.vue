@@ -1,9 +1,11 @@
 <script setup lang="ts">
 // Devices overview (ADR 0001 #18): one large tile per device with a small live preview; a tile opens the device
 // view. Tiles fill the window width (ADR 0001 #28). Right-click a tile to hide or unhide the device; hidden devices
-// are shown greyed only with "Show hidden" on (ADR 0001 #26, #27).
+// are shown greyed only with "Show hidden" on (ADR 0001 #26, #27). Under the title: master brightness, All off and
+// Release all (ADR 0001 #33).
 import { computed, ref } from 'vue'
 import { RouterLink } from 'vue-router'
+import BrightnessSlider from '../components/BrightnessSlider.vue'
 import DevicePreview from '../components/DevicePreview.vue'
 import {
   Button,
@@ -18,9 +20,17 @@ import {
   menuPoint,
   type MenuItem,
 } from '../components/ui'
-import { errorText, type DeviceView } from '../ipc'
+import { errorText, releaseAll, setAllOff, setMasterBrightness, type DeviceView } from '../ipc'
 import { STATUS_LABEL, deviceErrorText, familyLabel, kindLabel, statusOf, zoneIndicesNamed } from '../lib/device'
-import { deviceState, hiddenZoneNames, hideDevice, isDeviceHidden, rescanDevices } from '../stores/devices'
+import {
+  deviceState,
+  findDevice,
+  hiddenZoneNames,
+  hideDevice,
+  isDeviceHidden,
+  refreshDevices,
+  rescanDevices,
+} from '../stores/devices'
 
 const deviceLink = (id: string) => ({ name: 'device', params: { id } })
 
@@ -55,6 +65,56 @@ async function toggleHidden(id: string, hidden: boolean) {
     error.value = errorText(e)
   }
 }
+
+// ---- brightness, All off, Release all (ADR 0001 #33) -----------------------------------------------------------
+
+const notice = ref<string | null>(null)
+const lightingBusy = ref(false)
+const releasing = ref(false)
+/** The lighting controls need a running engine. */
+const engineDown = computed(() => !deviceState.loaded || deviceState.engineError !== null)
+
+async function sendMaster(percent: number, persist: boolean) {
+  deviceState.lighting = await setMasterBrightness(percent, persist)
+}
+
+function lightingFailed(e: unknown) {
+  error.value = errorText(e)
+  void refreshDevices()
+}
+
+async function onAllOff(off: boolean) {
+  error.value = null
+  notice.value = null
+  lightingBusy.value = true
+  try {
+    deviceState.lighting = await setAllOff(off)
+  } catch (e) {
+    lightingFailed(e)
+  } finally {
+    lightingBusy.value = false
+  }
+}
+
+async function onReleaseAll() {
+  error.value = null
+  notice.value = null
+  releasing.value = true
+  try {
+    const failed = (await releaseAll()).filter((r) => r.error !== null)
+    if (failed.length === 0) {
+      notice.value = 'Every device is back in its own hardware mode until you change something.'
+    } else {
+      const names = failed.map((r) => `${findDevice(r.id)?.description.info.name ?? r.id}: ${r.error}`)
+      error.value = `Some devices could not be released. ${names.join('; ')}`
+    }
+  } catch (e) {
+    error.value = errorText(e)
+  } finally {
+    releasing.value = false
+    void refreshDevices()
+  }
+}
 </script>
 
 <template>
@@ -66,6 +126,25 @@ async function toggleHidden(id: string, hidden: boolean) {
           {{ deviceState.scanning ? 'Scanning…' : 'Rescan' }}
         </Button>
       </template>
+      <template #controls>
+        <BrightnessSlider
+          label="Brightness"
+          :value="deviceState.lighting.master_brightness"
+          :send="sendMaster"
+          :disabled="engineDown"
+          @error="lightingFailed"
+        />
+        <Switch
+          :model-value="deviceState.lighting.all_off"
+          label="All off"
+          compact
+          :disabled="engineDown || lightingBusy"
+          @update:model-value="onAllOff"
+        />
+        <Button :disabled="engineDown || lightingBusy || releasing" @click="onReleaseAll">
+          {{ releasing ? 'Releasing…' : 'Release all' }}
+        </Button>
+      </template>
     </PageHeader>
 
     <Notice v-if="deviceState.engineError" variant="error">
@@ -74,6 +153,7 @@ async function toggleHidden(id: string, hidden: boolean) {
     </Notice>
     <Notice v-if="deviceState.error" variant="error">Could not load the device list: {{ deviceState.error }}</Notice>
     <Notice v-if="error" variant="error">{{ error }}</Notice>
+    <Notice v-if="notice">{{ notice }}</Notice>
 
     <div v-if="tiles.length > 0" class="grid">
       <Tile

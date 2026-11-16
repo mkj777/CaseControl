@@ -48,3 +48,5 @@ Families: `msi_mystic_light` (pass JRAINBOW1/2 LED counts as arguments if they d
 | 2026-11-16 | app: start, window, tray, overview | pass | debug exe (`tauri build --debug --no-bundle`), 5 devices |
 | 2026-11-16 | app: Mystic Light whole device, live picker, single LEDs (click/drag/Ctrl) | pass | only JRAINBOW1 has visible LEDs (20, confirmed); JRGB1/2 and JRAINBOW2 are empty headers |
 | 2026-11-16 | app: Mystic Light hardware mode (Rainbow wave, speed/brightness), Release | pass | |
+| 2026-11-16 | app: start dialog Proceed (SignalRGB + OpenRGB, turn off autostart) | pass | one UAC prompt; `OpenRGB` and `SignalRgb.Service` now Manual |
+| 2026-11-16 | app: hide zones JRGB1/JRGB2/JRAINBOW2 | pass | |

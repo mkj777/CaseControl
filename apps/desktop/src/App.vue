@@ -80,20 +80,24 @@ const hintNames = computed(() => {
 .sidebar {
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
-  padding: 0 var(--space-4) var(--space-6);
+  /* Brand strip to nav: the section gap of a group, so the name does not crowd the first item. */
+  gap: var(--space-6);
+  padding: 0 var(--space-3) var(--space-6);
   background: var(--surface);
   border-right: 1px solid var(--border);
 }
 
+/* The app name sits in the sidebar's part of the title strip: exactly as high as the content's title strip
+   (--titlebar-height), so both strips form one band with the window controls, and inset by --space-6, the same
+   inset as the nav item text below (sidebar --space-3 + item --space-3). */
 .brand {
   display: flex;
   align-items: center;
   flex: none;
   height: var(--titlebar-height);
   /* Reach the sidebar's edges so the whole strip drags the window. */
-  margin: 0 calc(-1 * var(--space-4));
-  padding: 0 calc(var(--space-4) + var(--space-3));
+  margin: 0 calc(-1 * var(--space-3));
+  padding: 0 var(--space-6);
   font-size: var(--text-lg);
   font-weight: var(--weight-strong);
 }

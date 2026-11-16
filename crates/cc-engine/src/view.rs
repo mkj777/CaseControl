@@ -32,6 +32,17 @@ pub struct DeviceView {
     pub colors: Vec<Rgb>,
     /// Family id of the backend that detected the device (`Backend::name()`).
     pub family: String,
+    /// Device brightness in percent (ADR 0001 #33); `colors` and `setting` are unscaled.
+    pub brightness: u8,
+}
+
+/// Master brightness and the All off state (ADR 0001 #33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LightingView {
+    /// Master brightness in percent.
+    pub master_brightness: u8,
+    /// All off is on (also while the fade to black is still running).
+    pub all_off: bool,
 }
 
 /// One device a backend found but could not bring up.

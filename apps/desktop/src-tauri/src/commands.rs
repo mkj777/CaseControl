@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cc_config::Profile;
 use cc_core::{DeviceId, ModeState, Rgb};
-use cc_engine::{ApplyReport, DetectFailure, DeviceSetting, DeviceStatus, DeviceView, EngineHandle};
+use cc_engine::{
+    ApplyReport, DetectFailure, DeviceSetting, DeviceStatus, DeviceView, EngineHandle, LightingView,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_autostart::ManagerExt as _;
@@ -24,8 +26,10 @@ use crate::hidden::{
     HiddenEntry, hidden_device_error, hidden_view, hidden_zones, is_device_hidden, mask_hidden_zones,
     zone_write,
 };
-use crate::prefs::{SettingsPatch, SettingsView, apply_patch, record_zone_size};
-use crate::profiles::{clears_last, last_after_rename};
+use crate::prefs::{
+    SettingsPatch, SettingsView, apply_patch, clear_brightness_overrides, record_brightness, record_zone_size,
+};
+use crate::profiles::{clears_last, last_after_rename, same_name};
 use crate::startup::{
     CloseTarget, ResolveRequest, StartupConflicts, plan_autostart, plan_close, plan_resolve,
 };
@@ -74,6 +78,8 @@ pub struct DeviceList {
     pub engine_error: Option<String>,
     /// What the user hid, by device id (also for devices that are not connected now).
     pub hidden: BTreeMap<DeviceId, HiddenEntry>,
+    /// Master brightness and All off (from the settings while the engine is not running).
+    pub lighting: LightingView,
 }
 
 /// Outcome of releasing one device.
@@ -108,19 +114,30 @@ fn err_string(err: impl std::fmt::Display) -> String {
 
 /// The Devices page's data.
 pub fn device_list_now(state: &AppState) -> DeviceList {
-    let hidden = hidden_view(&state.settings());
+    let (hidden, saved) = {
+        let settings = state.settings();
+        (
+            hidden_view(&settings),
+            LightingView {
+                master_brightness: settings.master_brightness,
+                all_off: settings.all_off,
+            },
+        )
+    };
     match state.engine() {
         Ok(engine) => DeviceList {
             devices: engine.devices(),
             failures: engine.failures(),
             engine_error: None,
             hidden,
+            lighting: engine.lighting(),
         },
         Err(_) => DeviceList {
             devices: Vec::new(),
             failures: Vec::new(),
             engine_error: state.engine_error(),
             hidden,
+            lighting: saved,
         },
     }
 }
@@ -150,7 +167,8 @@ pub fn profiles_changed<R: Runtime>(app: &AppHandle<R>, state: &AppState) {
     }
 }
 
-/// Applies profile `name` and records it as `last_profile`.
+/// Applies profile `name` with its device brightness and records it as `last_profile`; device brightness changes made
+/// since the previous apply are dropped (ADR 0001 #33).
 pub fn apply_profile_now<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
@@ -158,6 +176,7 @@ pub fn apply_profile_now<R: Runtime>(
 ) -> Result<ApplyReport, String> {
     let engine = state.engine()?;
     let profile = state.storage()?.profiles.load(name).map_err(err_string)?;
+    engine.replace_brightness(profile.brightness.clone());
     let report = state.apply_visible(engine, &profile);
     tracing::info!(
         profile = %profile.name,
@@ -168,6 +187,7 @@ pub fn apply_profile_now<R: Runtime>(
     );
     let saved = state.update_settings(|s| {
         s.last_profile = Some(profile.name.clone());
+        clear_brightness_overrides(s);
         Ok(())
     });
     profiles_changed(app, state);
@@ -338,6 +358,82 @@ pub async fn release_all<R: Runtime>(app: AppHandle<R>) -> Result<Vec<ReleaseRes
     blocking(app, |_, state| release_all_now(state)).await
 }
 
+/// Sets one device's brightness in percent (ADR 0001 #33). Refused for a hidden device. While a slider is dragged
+/// the page sends `persist = false`; the final value comes with `persist = true` and is saved in the settings until
+/// the next profile apply or save.
+#[tauri::command]
+pub async fn set_device_brightness<R: Runtime>(
+    app: AppHandle<R>,
+    id: DeviceId,
+    percent: u8,
+    persist: bool,
+) -> Result<(), String> {
+    blocking(app, move |_, state| {
+        let engine = state.engine()?;
+        visible_device(state, &id)?;
+        engine.set_device_brightness(&id, percent).map_err(err_string)?;
+        if persist {
+            state
+                .update_settings(|s| {
+                    record_brightness(s, &id, percent);
+                    Ok(())
+                })
+                .map_err(|err| format!("The brightness was changed, but it could not be saved: {err}"))?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Sets the master brightness in percent, multiplied into every device (ADR 0001 #33). `persist` as for
+/// [`set_device_brightness`]. Returns the master brightness and All off state.
+#[tauri::command]
+pub async fn set_master_brightness<R: Runtime>(
+    app: AppHandle<R>,
+    percent: u8,
+    persist: bool,
+) -> Result<LightingView, String> {
+    blocking(app, move |_, state| {
+        let engine = state.engine()?;
+        let percent = percent.min(cc_config::FULL_BRIGHTNESS);
+        engine.set_master_brightness(percent);
+        if persist {
+            state
+                .update_settings(|s| {
+                    s.master_brightness = percent;
+                    Ok(())
+                })
+                .map_err(|err| format!("The brightness was changed, but it could not be saved: {err}"))?;
+        }
+        Ok(engine.lighting())
+    })
+    .await
+}
+
+/// All off (`true`) fades every controlled device to black and keeps it dark, also after a restart; All on fades
+/// back (ADR 0001 #33). Returns the master brightness and All off state.
+#[tauri::command]
+pub async fn set_all_off<R: Runtime>(app: AppHandle<R>, off: bool) -> Result<LightingView, String> {
+    blocking(app, move |_, state| {
+        let engine = state.engine()?;
+        engine.set_all_off(off);
+        tracing::info!(off, "all off changed");
+        state
+            .update_settings(|s| {
+                s.all_off = off;
+                Ok(())
+            })
+            .map_err(|err| {
+                format!(
+                    "The lights were switched {}, but this could not be saved: {err}",
+                    if off { "off" } else { "on" }
+                )
+            })?;
+        Ok(engine.lighting())
+    })
+    .await
+}
+
 /// Hides or unhides a device (ADR 0001 #26) and saves that. Hiding releases the device to its own hardware mode;
 /// unhiding changes nothing on the hardware. Returns the new device list.
 #[tauri::command]
@@ -426,19 +522,37 @@ pub async fn list_profiles<R: Runtime>(app: AppHandle<R>) -> Result<crate::profi
     blocking(app, |_, state| state.profile_list()).await
 }
 
-/// Saves what the devices show now as profile `name` (replacing a profile of the same name).
+/// Saves what the devices show now, with their brightness, as profile `name` (replacing a profile of the same
+/// name). Saving the active profile makes the device brightness changes part of it (ADR 0001 #33).
 #[tauri::command]
 pub async fn save_profile<R: Runtime>(
     app: AppHandle<R>,
     name: String,
 ) -> Result<crate::profiles::ProfileList, String> {
     blocking(app, move |app, state| {
+        let engine = state.engine()?;
         let profile = Profile {
             name: name.trim().to_owned(),
-            devices: state.engine()?.current_settings(),
+            devices: engine.current_settings(),
+            brightness: engine.brightness(),
         };
         state.storage()?.profiles.save(&profile).map_err(err_string)?;
         tracing::info!(profile = %profile.name, devices = profile.devices.len(), "profile saved");
+        let active = state
+            .settings()
+            .last_profile
+            .as_deref()
+            .is_some_and(|last| same_name(last, &profile.name));
+        if active {
+            state
+                .update_settings(|s| {
+                    clear_brightness_overrides(s);
+                    Ok(())
+                })
+                .map_err(|err| {
+                    format!("The profile was saved, but the settings could not be updated: {err}")
+                })?;
+        }
         profiles_changed(app, state);
         state.profile_list()
     })
@@ -735,6 +849,7 @@ mod tests {
                 }),
                 colors: vec![red, Rgb::BLACK],
                 family: "msi_mystic_light".into(),
+                brightness: 55,
             }],
             failures: vec![DetectFailure {
                 family: "wooting".into(),
@@ -749,6 +864,10 @@ mod tests {
                     zones: vec!["JRAINBOW1".into()],
                 },
             )]),
+            lighting: LightingView {
+                master_brightness: 80,
+                all_off: true,
+            },
         };
         let json = serde_json::to_value(&list).expect("serializes");
         assert_eq!(
@@ -783,6 +902,11 @@ mod tests {
         );
         assert_eq!(d["colors"], serde_json::json!(["#FF0000", "#000000"]));
         assert_eq!(d["family"], serde_json::json!("msi_mystic_light"));
+        assert_eq!(d["brightness"], serde_json::json!(55));
+        assert_eq!(
+            json["lighting"],
+            serde_json::json!({ "master_brightness": 80, "all_off": true })
+        );
         assert_eq!(
             json["failures"][0]["error"],
             serde_json::json!({ "Transport": "busy" })

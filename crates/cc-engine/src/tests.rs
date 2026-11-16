@@ -85,7 +85,10 @@ impl Controller for FakeCtrl {
     fn set_mode(&mut self, state: &ModeState) -> Result<(), DeviceError> {
         let delay = self.behavior.lock().mode_delay;
         std::thread::sleep(delay);
-        self.log(format!("mode {}", state.mode));
+        match state.brightness {
+            Some(b) => self.log(format!("mode {} b={b}", state.mode)),
+            None => self.log(format!("mode {}", state.mode)),
+        }
         Ok(())
     }
 
@@ -317,6 +320,7 @@ fn fast_timing() -> Timing {
         backoff_max: Duration::from_millis(8),
         max_failures: 10,
         hotplug_poll: Duration::from_millis(10),
+        fade: Duration::from_millis(200),
     }
 }
 
@@ -1274,4 +1278,413 @@ fn late_result_does_not_touch_a_replugged_device() {
             .any(|ev| matches!(ev, EngineEvent::DeviceStateChanged { .. })),
         "{evs:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Brightness and All off (ADR 0001 #33)
+
+const DARK_RED: Rgb = Rgb::new(0x80, 0, 0); // 255 * 0.5 = 127.5 -> 128
+const DARKER_RED: Rgb = Rgb::new(0x40, 0, 0); // 255 * 0.25 = 63.75 -> 64
+
+fn hex(colors: &[Rgb]) -> String {
+    colors.iter().map(Rgb::to_string).collect::<Vec<_>>().join(",")
+}
+
+/// The direct frames device `n` was sent, as colour lists.
+fn frames(log: &Log, n: u16) -> Vec<String> {
+    let prefix = format!("{} direct ", id(n));
+    log.lock()
+        .iter()
+        .filter_map(|(_, s)| s.strip_prefix(&prefix).map(str::to_owned))
+        .collect()
+}
+
+/// The mode calls device `n` got ("2 b=41", "3").
+fn modes(log: &Log, n: u16) -> Vec<String> {
+    let prefix = format!("{} mode ", id(n));
+    log.lock()
+        .iter()
+        .filter_map(|(_, s)| s.strip_prefix(&prefix).map(str::to_owned))
+        .collect()
+}
+
+/// Red channel of the first LED of a frame string.
+fn first_red(frame: &str) -> u8 {
+    u8::from_str_radix(&frame[1..3], 16).unwrap()
+}
+
+/// Adds mode 2 "Breathing" (brightness 1..=100, one colour), mode 3 "Wave" (no brightness) and, with `off`, mode
+/// 4 "Off".
+fn with_effects(mut s: Spec, off: bool) -> Spec {
+    s.desc.modes.push(Mode {
+        id: 2,
+        name: "Breathing".into(),
+        caps: ModeCaps::BRIGHTNESS | ModeCaps::MODE_SPECIFIC_COLOR,
+        color_mode: ColorMode::ModeSpecific,
+        speed: None,
+        brightness: Some(1..=100),
+        colors: Some(1..=1),
+    });
+    s.desc.modes.push(Mode {
+        id: 3,
+        name: "Wave".into(),
+        caps: ModeCaps::SPEED,
+        color_mode: ColorMode::None,
+        speed: None,
+        brightness: None,
+        colors: None,
+    });
+    if off {
+        s.desc.modes.push(Mode {
+            id: 4,
+            name: "Off".into(),
+            caps: ModeCaps::empty(),
+            color_mode: ColorMode::None,
+            speed: None,
+            brightness: None,
+            colors: None,
+        });
+    }
+    s
+}
+
+fn breathing(brightness: u32) -> ModeState {
+    ModeState {
+        mode: 2,
+        speed: None,
+        brightness: Some(brightness),
+        direction: None,
+        colors: vec![RED],
+    }
+}
+
+fn wave() -> ModeState {
+    ModeState {
+        mode: 3,
+        speed: None,
+        brightness: None,
+        direction: None,
+        colors: vec![],
+    }
+}
+
+/// Waits until the last direct frame of device `n` is `want`.
+fn shows(log: &Log, n: u16, want: &[Rgb]) -> bool {
+    let want = hex(want);
+    wait_until(SECOND, || frames(log, n).last() == Some(&want))
+}
+
+/// Waits until the last mode call of device `n` is `want`.
+fn shows_mode(log: &Log, n: u16, want: &str) -> bool {
+    wait_until(SECOND, || modes(log, n).last().map(String::as_str) == Some(want))
+}
+
+#[test]
+fn brightness_scales_the_output_but_never_the_stored_colours() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_direct(&id(1), vec![RED; 7]).unwrap();
+    assert!(shows(&log, 1, &[RED; 7]));
+
+    e.set_device_brightness(&id(1), 50).unwrap();
+    assert!(shows(&log, 1, &[DARK_RED; 7]));
+    e.set_master_brightness(50);
+    assert!(shows(&log, 1, &[DARKER_RED; 7]));
+
+    let v = e.device(&id(1)).unwrap();
+    assert_eq!(v.brightness, 50);
+    assert_eq!(v.colors, vec![RED; 7], "the buffer stays unscaled");
+    let red = DeviceSetting::Direct { colors: vec![RED; 7] };
+    assert_eq!(v.setting, Some(red.clone()), "the record stays unscaled");
+    assert_eq!(e.current_settings()[&id(1)], red);
+    assert_eq!(e.brightness(), BTreeMap::from([(id(1), 50)]));
+    assert_eq!(e.lighting().master_brightness, 50);
+
+    // A colour edit while dimmed is stored as given and shown dimmed.
+    e.set_zone(&id(1), 2, vec![GREEN; 3]).unwrap();
+    let dim_green = Rgb::new(0, 0x40, 0);
+    let dimmed = [
+        DARKER_RED, DARKER_RED, DARKER_RED, DARKER_RED, dim_green, dim_green, dim_green,
+    ];
+    assert!(shows(&log, 1, &dimmed));
+    let stored = vec![RED, RED, RED, RED, GREEN, GREEN, GREEN];
+    assert_eq!(e.device(&id(1)).unwrap().colors, stored);
+
+    // Back up to full: exactly the stored colours again.
+    e.set_master_brightness(100);
+    e.set_device_brightness(&id(1), 150).unwrap(); // clamped to 100
+    assert!(shows(&log, 1, &stored));
+    assert!(e.brightness().is_empty());
+    assert_eq!(e.device(&id(1)).unwrap().brightness, 100);
+    assert!(matches!(
+        e.set_device_brightness(&id(9), 10),
+        Err(EngineError::UnknownDevice(_))
+    ));
+}
+
+#[test]
+fn brightness_and_all_off_leave_undriven_and_released_devices_alone() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            spec(id(2), "B", DeviceKind::Light),
+        ],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_direct(&id(1), vec![RED; 7]).unwrap();
+    assert!(shows(&log, 1, &[RED; 7]));
+    e.release(&id(1)).unwrap();
+    let before = log.lock().len();
+
+    e.set_device_brightness(&id(1), 30).unwrap();
+    e.set_device_brightness(&id(2), 30).unwrap();
+    e.set_master_brightness(10);
+    e.set_all_off(true);
+    std::thread::sleep(Duration::from_millis(350));
+    assert_eq!(
+        log.lock().len(),
+        before,
+        "nothing is sent to devices the engine does not drive"
+    );
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
+
+    // Taking control again shows the colour at the current levels: here, off.
+    e.set_direct(&id(1), vec![BLUE; 7]).unwrap();
+    assert!(shows(&log, 1, &[Rgb::BLACK; 7]));
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
+        == DeviceStatus::Active));
+}
+
+#[test]
+fn all_off_fades_to_black_and_back_and_keeps_changes_made_while_off() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_direct(&id(1), vec![RED; 7]).unwrap();
+    assert!(shows(&log, 1, &[RED; 7]));
+    let start = frames(&log, 1).len();
+
+    e.set_all_off(true);
+    assert!(e.lighting().all_off);
+    assert!(shows(&log, 1, &[Rgb::BLACK; 7]));
+    let fade: Vec<String> = frames(&log, 1)[start..].to_vec();
+    assert!(fade.len() >= 4, "a fade, not a cut: {fade:?}");
+    let reds: Vec<u8> = fade.iter().map(|f| first_red(f)).collect();
+    assert!(reds.windows(2).all(|w| w[1] <= w[0]), "monotonic: {reds:?}");
+    assert!(reds[0] > 0 && reds[0] < 255, "{reds:?}");
+    let red = DeviceSetting::Direct { colors: vec![RED; 7] };
+    assert_eq!(e.device(&id(1)).unwrap().setting, Some(red));
+
+    // Holds black: no frames after the fade ended.
+    std::thread::sleep(Duration::from_millis(100));
+    let held = frames(&log, 1).len();
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(frames(&log, 1).len(), held);
+
+    // A change while off is stored but shows black.
+    e.set_direct(&id(1), vec![BLUE; 7]).unwrap();
+    let blue = DeviceSetting::Direct {
+        colors: vec![BLUE; 7],
+    };
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting == Some(blue.clone())));
+    assert_eq!(frames(&log, 1).last().unwrap(), &hex(&[Rgb::BLACK; 7]));
+    assert_eq!(e.current_settings()[&id(1)], blue);
+
+    // All on fades up to the stored colour.
+    let start = frames(&log, 1).len();
+    e.set_all_off(false);
+    assert!(!e.lighting().all_off);
+    assert!(shows(&log, 1, &[BLUE; 7]));
+    assert!(frames(&log, 1).len() - start >= 4);
+    // Setting the current state again does nothing.
+    std::thread::sleep(Duration::from_millis(50));
+    let n = log.lock().len();
+    e.set_all_off(false);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(log.lock().len(), n);
+}
+
+#[test]
+fn toggling_mid_fade_reverses_from_the_current_level() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+    let timing = Timing {
+        fade: Duration::from_millis(600),
+        ..fast_timing()
+    };
+    let e = start_with(cfg(60), vec![Box::new(b)], None, timing).unwrap();
+    e.set_direct(&id(1), vec![RED; 7]).unwrap();
+    assert!(shows(&log, 1, &[RED; 7]));
+    let start = frames(&log, 1).len();
+
+    e.set_all_off(true);
+    std::thread::sleep(Duration::from_millis(150));
+    e.set_all_off(false); // cancels the fade to black
+    assert!(shows(&log, 1, &[RED; 7]));
+    std::thread::sleep(Duration::from_millis(700)); // the cancelled fade would have ended by now
+    let all = frames(&log, 1)[start..].to_vec();
+    assert_eq!(all.last().unwrap(), &hex(&[RED; 7]), "{all:?}");
+    assert!(
+        !all.contains(&hex(&[Rgb::BLACK; 7])),
+        "never reached black: {all:?}"
+    );
+    let reds: Vec<u8> = all.iter().map(|f| first_red(f)).collect();
+    let lowest = *reds.iter().min().unwrap();
+    assert!(lowest > 60 && lowest < 255, "turned around part way: {reds:?}");
+}
+
+#[test]
+fn hardware_mode_brightness_maps_into_the_mode_range_and_off_uses_the_off_mode() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        vec![with_effects(spec(id(1), "A", DeviceKind::Light), true)],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    let events = e.subscribe();
+    e.set_mode(&id(1), breathing(80)).unwrap();
+    assert_eq!(modes(&log, 1), ["2 b=80"]);
+
+    e.set_device_brightness(&id(1), 50).unwrap();
+    // 1 + (80 - 1) * 0.5 = 40.5 -> 41
+    assert!(shows_mode(&log, 1, "2 b=41"));
+    let stored = DeviceSetting::Mode { state: breathing(80) };
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting
+        == Some(stored.clone())));
+    assert_eq!(e.current_settings()[&id(1)], stored);
+
+    // Off: steps down inside the range, then the "Off" mode.
+    let start = modes(&log, 1).len();
+    e.set_all_off(true);
+    assert!(shows_mode(&log, 1, "4"));
+    let down = modes(&log, 1)[start..].to_vec();
+    assert!(down.len() >= 3, "{down:?}");
+    let steps: Vec<u32> = down[..down.len() - 1]
+        .iter()
+        .map(|m| m.strip_prefix("2 b=").unwrap().parse().unwrap())
+        .collect();
+    assert!(steps.windows(2).all(|w| w[1] <= w[0]), "{steps:?}");
+    assert!(steps.iter().all(|b| (1..=41).contains(b)), "{steps:?}");
+    assert_eq!(e.device(&id(1)).unwrap().setting, Some(stored.clone()));
+
+    // On: back to the mode at a low brightness, stepping up to the dimmed level.
+    let start = modes(&log, 1).len();
+    e.set_all_off(false);
+    assert!(shows_mode(&log, 1, "2 b=41"));
+    let up = modes(&log, 1)[start..].to_vec();
+    assert!(up.len() >= 3, "{up:?}");
+    assert_eq!(e.device(&id(1)).unwrap().setting, Some(stored));
+
+    // Only the explicit mode change emitted an event, not the brightness or fade steps.
+    let evs: Vec<EngineEvent> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert_eq!(evs.len(), 1, "{evs:?}");
+}
+
+#[test]
+fn hardware_mode_without_off_mode_goes_black_and_without_brightness_is_not_resent() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            with_effects(spec(id(1), "A", DeviceKind::Light), false),
+            with_effects(spec(id(2), "B", DeviceKind::Light), true),
+        ],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_mode(&id(1), breathing(100)).unwrap();
+    e.set_mode(&id(2), wave()).unwrap();
+
+    e.set_all_off(true);
+    assert!(
+        shows(&log, 1, &[Rgb::BLACK; 7]),
+        "no Off mode: black in direct mode"
+    );
+    assert!(shows_mode(&log, 2, "4"));
+    // The mode without brightness was not re-sent on every fade step: Wave once, then Off.
+    assert_eq!(modes(&log, 2), ["3", "4"]);
+    assert_eq!(
+        e.device(&id(1)).unwrap().setting,
+        Some(DeviceSetting::Mode {
+            state: breathing(100)
+        })
+    );
+
+    e.set_all_off(false);
+    assert!(shows_mode(&log, 1, "2 b=100"));
+    assert!(shows_mode(&log, 2, "3"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(modes(&log, 2), ["3", "4", "3"], "restored once, not per step");
+    // Device and master brightness do not touch a mode without a brightness parameter.
+    e.set_device_brightness(&id(2), 20).unwrap();
+    e.set_master_brightness(20);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(modes(&log, 2), ["3", "4", "3"]);
+}
+
+#[test]
+fn all_off_at_start_shows_black_without_a_coloured_frame() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            with_effects(spec(id(2), "B", DeviceKind::Light), true),
+        ],
+        &log,
+    );
+    let c = EngineConfig {
+        all_off: true,
+        brightness: BTreeMap::from([(id(1), 50)]),
+        ..cfg(60)
+    };
+    let e = start_with(c, vec![Box::new(b)], None, fast_timing()).unwrap();
+    assert!(e.lighting().all_off);
+    assert_eq!(e.device(&id(1)).unwrap().brightness, 50);
+    let profile = BTreeMap::from([
+        (id(1), DeviceSetting::Direct { colors: vec![RED; 7] }),
+        (id(2), DeviceSetting::Mode { state: breathing(60) }),
+    ]);
+    let report = e.apply(&profile);
+    assert_eq!(report.applied.len(), 2);
+    assert!(shows(&log, 1, &[Rgb::BLACK; 7]));
+    assert!(wait_until(SECOND, || modes(&log, 2) == ["4"]));
+    std::thread::sleep(Duration::from_millis(100));
+    let all = frames(&log, 1);
+    assert!(all.iter().all(|f| *f == hex(&[Rgb::BLACK; 7])), "{all:?}");
+    assert_eq!(modes(&log, 2), ["4"], "no coloured mode before All on");
+    assert!(
+        wait_until(SECOND, || e.current_settings() == profile),
+        "the profile is applied underneath"
+    );
+
+    e.set_all_off(false);
+    assert!(shows(&log, 1, &[DARK_RED; 7]));
+    assert!(shows_mode(&log, 2, "2 b=60"));
+}
+
+#[test]
+fn replace_brightness_resets_unlisted_devices_to_full() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            spec(id(2), "B", DeviceKind::Light),
+        ],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_direct(&id(1), vec![RED; 7]).unwrap();
+    e.set_direct(&id(2), vec![RED; 7]).unwrap();
+    e.set_device_brightness(&id(1), 10).unwrap();
+    e.replace_brightness(BTreeMap::from([(id(2), 50), (id(9), 20), (id(3), 100)]));
+    assert!(shows(&log, 1, &[RED; 7]));
+    assert!(shows(&log, 2, &[DARK_RED; 7]));
+    assert_eq!(e.brightness(), BTreeMap::from([(id(2), 50), (id(9), 20)]));
 }

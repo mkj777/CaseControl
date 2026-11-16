@@ -105,7 +105,7 @@ impl ProfileStore {
     fn write(&self, path: &Path, profile: &Profile, name: String) -> Result<()> {
         let profile = Profile {
             name,
-            devices: profile.devices.clone(),
+            ..profile.clone()
         };
         let text = toml::to_string(&profile).map_err(|e| ConfigError::Serialize(e.to_string()))?;
         write_atomic(path, &text)
@@ -273,6 +273,7 @@ mod tests {
         Profile {
             name: name.into(),
             devices,
+            brightness: BTreeMap::new(),
         }
     }
 

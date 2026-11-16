@@ -141,6 +141,16 @@ export interface DeviceView {
   colors: Rgb[]
   /** Family id of the backend that detected the device (e.g. `"wooting"`). */
   family: string
+  /** Device brightness in percent (ADR 0001 #33); `colors` and `setting` are unscaled. */
+  brightness: number
+}
+
+/** Master brightness and All off (ADR 0001 #33). */
+export interface LightingView {
+  /** Percent, multiplied into every device. */
+  master_brightness: number
+  /** Every controlled device is faded to black and kept dark (also while the fade still runs). */
+  all_off: boolean
 }
 
 export interface DetectFailure {
@@ -326,6 +336,8 @@ export interface DeviceList {
   engine_error: string | null
   /** Devices with something hidden, by id; devices with nothing hidden are absent. */
   hidden: Record<DeviceId, HiddenEntry>
+  /** Master brightness and All off (the saved values while the engine is not running). */
+  lighting: LightingView
 }
 
 export interface ReleaseResult {
@@ -374,6 +386,13 @@ export const resizeZone = (id: DeviceId, zone: number, len: number) =>
 export const saveToHardware = (id: DeviceId) => invoke<void>('save_to_hardware', { id })
 export const releaseDevice = (id: DeviceId) => invoke<void>('release_device', { id })
 export const releaseAll = () => invoke<ReleaseResult[]>('release_all')
+/** `persist = false` while a slider is dragged, `true` for the final value (saved in the settings). */
+export const setDeviceBrightness = (id: DeviceId, percent: number, persist: boolean) =>
+  invoke<void>('set_device_brightness', { id, percent, persist })
+export const setMasterBrightness = (percent: number, persist: boolean) =>
+  invoke<LightingView>('set_master_brightness', { percent, persist })
+/** All off fades every controlled device to black (and keeps it dark after a restart); `false` fades back. */
+export const setAllOff = (off: boolean) => invoke<LightingView>('set_all_off', { off })
 export const rescan = () => invoke<DeviceList>('rescan')
 export const setDeviceHidden = (id: DeviceId, hidden: boolean) =>
   invoke<DeviceList>('set_device_hidden', { id, hidden })

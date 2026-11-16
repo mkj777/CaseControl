@@ -30,6 +30,17 @@ pub struct Profile {
     /// Setting per device.
     #[serde(default)]
     pub devices: BTreeMap<DeviceId, DeviceSetting>,
+    /// Device brightness in percent (0 to 100) per device (ADR 0001 #33). A device without an entry has 100; the
+    /// map is written only when it is not empty, so profiles without dimmed devices keep their old format.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub brightness: BTreeMap<DeviceId, u8>,
+}
+
+impl Profile {
+    /// Device brightness of `id` in this profile: its entry clamped to 100, or 100 without one.
+    pub fn brightness_of(&self, id: &DeviceId) -> u8 {
+        self.brightness.get(id).map_or(100, |b| (*b).min(100))
+    }
 }
 
 impl DeviceSetting {
@@ -96,6 +107,7 @@ mod tests {
         Profile {
             name: "Evening".into(),
             devices,
+            brightness: BTreeMap::new(),
         }
     }
 
@@ -136,6 +148,37 @@ colors = ["#FF0000", "#00FF00"]
         let text = toml::to_string(&p).expect("serialize");
         assert_eq!(toml::from_str::<Profile>(&text).expect("parse"), p);
         assert_eq!(toml::from_str::<Profile>(SAMPLE_TOML).expect("parse snapshot"), p);
+    }
+
+    #[test]
+    fn brightness_round_trips_and_old_files_are_unchanged() {
+        // A profile without brightness serializes exactly as before (`toml_snapshot` pins the whole text).
+        assert!(
+            !toml::to_string(&sample())
+                .expect("serialize")
+                .contains("[brightness]")
+        );
+
+        let mut p = sample();
+        let dimmed = DeviceId::hid(0x31E3, 0x1310, Some("A1B2C3"));
+        p.brightness.insert(dimmed.clone(), 40);
+        let text = toml::to_string(&p).expect("serialize");
+        assert!(
+            text.contains(
+                "[brightness]
+\"hid:31e3:1310:A1B2C3\" = 40
+"
+            ),
+            "{text}"
+        );
+        let back: Profile = toml::from_str(&text).expect("parse");
+        assert_eq!(back, p);
+        assert_eq!(back.brightness_of(&dimmed), 40);
+        assert_eq!(back.brightness_of(&DeviceId::hid(0x046D, 0x0A78, None)), 100);
+
+        let mut loud = sample();
+        loud.brightness.insert(dimmed.clone(), 250);
+        assert_eq!(loud.brightness_of(&dimmed), 100, "out-of-range values clamp");
     }
 
     #[test]

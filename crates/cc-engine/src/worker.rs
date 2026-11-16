@@ -5,22 +5,28 @@
 //! issued it. The worker applies them in sequence order and skips anything older than what it last applied, so the
 //! device always ends up showing the most recently issued request. The worker, not the caller, records what was
 //! actually applied (setting, `DeviceStateChanged`, resized description), so the engine's record matches the device.
+//!
+//! Brightness (ADR 0001 #33): what the worker sends ([`Out`]) can differ from the unscaled setting it records
+//! ([`Output::stored`]). The latest-wins slot carries brightness and fade steps for hardware modes too, paced like
+//! colour frames; a mode output equal to the one the device already shows is not sent again, so a mode without a
+//! brightness parameter does not restart its effect on every fade step.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cc_core::{Controller, DeviceError, DeviceId, ModeState, Rgb};
+use cc_core::{Controller, DeviceError, DeviceId, ModeState};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
 use crate::engine::Shared;
+use crate::lighting::{Out, Output};
 use crate::view::DeviceStatus;
 
-/// A colour frame and the sequence number it was issued with.
-pub(crate) type Frame = (u64, Vec<Rgb>);
+/// An output (colour frame or brightness / fade step of a mode) and the sequence number it was issued with.
+pub(crate) type Frame = (u64, Output);
 
-/// Where the latest coalesced colour frame waits for the worker. Latest wins: a newer frame replaces an unsent one.
+/// Where the latest coalesced output waits for the worker. Latest wins: a newer output replaces an unsent one.
 pub(crate) type FrameSlot = Arc<Mutex<Option<Frame>>>;
 
 /// Reply channel of an acknowledged command.
@@ -30,10 +36,12 @@ pub(crate) type Reply = Sender<Result<(), DeviceError>>;
 pub(crate) enum Command {
     /// A new frame is in the [`FrameSlot`].
     Wake,
-    /// Switch to a hardware mode.
+    /// Switch to a hardware mode: send `out` (the mode at the current brightness, or the off output while All off
+    /// holds the device dark), record `state`.
     SetMode {
         seq: u64,
         state: ModeState,
+        out: Out,
         reply: Reply,
     },
     /// Resize a zone.
@@ -64,6 +72,8 @@ pub(crate) struct Timing {
     pub max_failures: u32,
     /// How often the hot-plug thread checks for shutdown.
     pub hotplug_poll: Duration,
+    /// Length of a full All off / on fade.
+    pub fade: Duration,
 }
 
 impl Default for Timing {
@@ -74,6 +84,7 @@ impl Default for Timing {
             backoff_max: Duration::from_secs(5),
             max_failures: 10,
             hotplug_poll: Duration::from_millis(100),
+            fade: Duration::from_millis(500),
         }
     }
 }
@@ -106,6 +117,8 @@ pub(crate) struct Worker {
     local: Local,
     fault_reason: String,
     dirty: Option<Frame>,
+    /// The mode the device was last sent and still shows (cleared by a colour frame or a release).
+    shown_mode: Option<ModeState>,
     /// Sequence number of the last frame, mode or release that was applied (or superseded everything before it).
     last_seq: u64,
     last_frame: Option<Instant>,
@@ -133,6 +146,7 @@ impl Worker {
             local: Local::Active,
             fault_reason: String::new(),
             dirty: None,
+            shown_mode: None,
             last_seq: 0,
             last_frame: None,
             failures: 0,
@@ -249,22 +263,31 @@ impl Worker {
         }
     }
 
-    fn send_frame(&mut self, (seq, colors): Frame, now: Instant) {
+    fn send_frame(&mut self, (seq, output): Frame, now: Instant) {
         if seq < self.last_seq {
             debug!(id = %self.id, "dropping superseded frame");
             return;
         }
-        if colors.len() != self.ctrl.description().led_count() {
+        if let Out::Direct(colors) = &output.out
+            && colors.len() != self.ctrl.description().led_count()
+        {
             debug!(id = %self.id, "dropping frame with stale length");
             return;
         }
-        self.last_frame = Some(now);
-        let r = self.ctrl.set_direct(&colors);
+        let unchanged = self.local == Local::Active
+            && matches!(&output.out, Out::Mode(m) if self.shown_mode.as_ref() == Some(m));
+        let r = if unchanged {
+            Ok(())
+        } else {
+            self.last_frame = Some(now);
+            self.send_out(&output.out)
+        };
         match &r {
             Ok(()) => {
                 self.last_seq = seq;
                 self.took_control(now);
-                self.shared.direct_applied(&self.id, self.generation, colors);
+                self.shared
+                    .applied(&self.id, self.generation, output.stored, false);
             }
             Err(DeviceError::InvalidArgument(msg)) => {
                 warn!(id = %self.id, %msg, "driver rejected frame");
@@ -273,12 +296,27 @@ impl Worker {
                 warn!(id = %self.id, error = %e, "frame write failed");
                 // Retry after the back-off, with whatever frame is newest by then.
                 if self.dirty.is_none() {
-                    self.dirty = Some((seq, colors));
+                    self.dirty = Some((seq, output));
                 }
             }
             Err(_) => {}
         }
         self.record(&r);
+    }
+
+    /// Sends one output to the device and remembers which mode it shows.
+    fn send_out(&mut self, out: &Out) -> Result<(), DeviceError> {
+        let r = match out {
+            Out::Direct(colors) => self.ctrl.set_direct(colors),
+            Out::Mode(state) => self.ctrl.set_mode(state),
+        };
+        if r.is_ok() {
+            self.shown_mode = match out {
+                Out::Direct(_) => None,
+                Out::Mode(state) => Some(state.clone()),
+            };
+        }
+        r
     }
 
     /// A write succeeded: the device is (again) under software control.
@@ -335,11 +373,21 @@ impl Worker {
     fn handle(&mut self, cmd: Command) -> bool {
         match cmd {
             Command::Wake => {}
-            Command::SetMode { seq, state, reply } => {
-                let r = self.ordered(seq, |w| w.ctrl.set_mode(&state));
+            Command::SetMode {
+                seq,
+                state,
+                out,
+                reply,
+            } => {
+                let r = self.ordered(seq, |w| w.send_out(&out));
                 if r == Ok(true) {
                     self.took_control(Instant::now());
-                    self.shared.mode_applied(&self.id, self.generation, state);
+                    self.shared.applied(
+                        &self.id,
+                        self.generation,
+                        cc_config::DeviceSetting::Mode { state },
+                        true,
+                    );
                 }
                 let _ = reply.send(r.map(|_| ()));
             }
@@ -410,6 +458,7 @@ impl Worker {
 
     fn mark_released(&mut self) {
         self.local = Local::Released;
+        self.shown_mode = None;
         self.next_keepalive = None;
         self.shared
             .set_status(&self.id, self.generation, DeviceStatus::Released);

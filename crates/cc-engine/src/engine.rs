@@ -18,7 +18,8 @@ use tracing::{debug, info, warn};
 
 use crate::error::EngineError;
 use crate::hotplug::{HotplugRuntime, HotplugSource};
-use crate::view::{ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView};
+use crate::lighting::{self, FULL, Levels, Output, Want};
+use crate::view::{ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView};
 use crate::worker::{Command, FrameSlot, Reply, Timing, Worker};
 
 /// Capacity of each device's command channel. Colour frames do not use it (they go through the frame slot), so a
@@ -40,6 +41,13 @@ pub struct EngineConfig {
     pub zone_sizes: BTreeMap<DeviceId, BTreeMap<String, usize>>,
     /// Whether to watch for HID arrivals and removals.
     pub hotplug: bool,
+    /// Master brightness in percent (clamped to 100), multiplied into every device (ADR 0001 #33).
+    pub master_brightness: u8,
+    /// Device brightness in percent per device; a device without an entry has 100.
+    pub brightness: BTreeMap<DeviceId, u8>,
+    /// Start with All off: every device the engine is given a setting for goes straight to black (no fade); the
+    /// settings are stored but not shown until [`EngineHandle::set_all_off`]`(false)`.
+    pub all_off: bool,
 }
 
 impl Default for EngineConfig {
@@ -49,6 +57,9 @@ impl Default for EngineConfig {
             disabled_families: HashSet::new(),
             zone_sizes: BTreeMap::new(),
             hotplug: true,
+            master_brightness: FULL,
+            brightness: BTreeMap::new(),
+            all_off: false,
         }
     }
 }
@@ -61,19 +72,23 @@ struct Slot {
     status: DeviceStatus,
     setting: Option<DeviceSetting>,
     colors: Vec<Rgb>,
+    /// What the engine drives the device with (unscaled), or `None` while it does not drive it (never set, or
+    /// released). Brightness and fade changes re-send only devices that have one.
+    want: Option<Want>,
     frame: FrameSlot,
     tx: Sender<Command>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Slot {
-    fn view(&self) -> DeviceView {
+    fn view(&self, brightness: u8) -> DeviceView {
         DeviceView {
             description: self.description.clone(),
             status: self.status.clone(),
             setting: self.setting.clone(),
             colors: self.colors.clone(),
             family: self.family.clone(),
+            brightness,
         }
     }
 
@@ -87,11 +102,17 @@ impl Slot {
         }
     }
 
-    /// Stores `colors` as the device's buffer and hands it to the worker as the latest frame (sequence `seq`). The
-    /// setting is recorded by the worker once the frame has actually been sent.
-    fn push_frame(&mut self, seq: u64, colors: Vec<Rgb>) {
-        *self.frame.lock() = Some((seq, colors.clone()));
-        self.colors = colors;
+    /// What the device is sent for its current want at `levels`, if the engine drives it.
+    fn output(&self, levels: Levels) -> Option<Output> {
+        self.want
+            .as_ref()
+            .map(|want| lighting::output(&self.description, want, &self.colors, levels))
+    }
+
+    /// Hands `output` to the worker as the latest frame (sequence `seq`). The setting is recorded by the worker once
+    /// the output has actually been sent.
+    fn push_output(&mut self, seq: u64, output: Output) {
+        *self.frame.lock() = Some((seq, output));
         // Full channel: the worker is busy and will pick the frame up from the slot anyway.
         let _ = self.tx.try_send(Command::Wake);
     }
@@ -103,6 +124,42 @@ struct State {
     pending: BTreeMap<DeviceId, DeviceSetting>,
     disabled_families: HashSet<String>,
     zone_sizes: BTreeMap<DeviceId, BTreeMap<String, usize>>,
+    /// Master brightness, percent.
+    master: u8,
+    /// Device brightness by id (entries of 100 are dropped).
+    brightness: BTreeMap<DeviceId, u8>,
+    /// All off is on (the target of the current or last fade).
+    off: bool,
+    /// Current fade factor, 0 (off) to 1 (on).
+    fade: f64,
+    /// Bumped by every All off / on toggle; a fade whose generation is stale stops (latest wins).
+    fade_gen: u64,
+}
+
+impl State {
+    fn levels(&self, id: &DeviceId) -> Levels {
+        Levels {
+            device: self.device_brightness(id),
+            master: self.master,
+            fade: self.fade,
+        }
+    }
+
+    fn device_brightness(&self, id: &DeviceId) -> u8 {
+        self.brightness.get(id).copied().unwrap_or(FULL)
+    }
+
+    fn view(&self, id: &DeviceId, slot: &Slot) -> DeviceView {
+        slot.view(self.device_brightness(id))
+    }
+}
+
+/// Device brightness map without entries of 100, values clamped to 100.
+fn normalized_brightness(map: BTreeMap<DeviceId, u8>) -> BTreeMap<DeviceId, u8> {
+    map.into_iter()
+        .map(|(id, b)| (id, b.min(FULL)))
+        .filter(|(_, b)| *b < FULL)
+        .collect()
 }
 
 /// State shared by the handle, the device threads and the hot-plug thread.
@@ -158,27 +215,128 @@ impl Shared {
         }
     }
 
-    /// Called by a worker after a colour frame went out: the device now shows `colors`.
-    pub(crate) fn direct_applied(&self, id: &DeviceId, generation: u64, colors: Vec<Rgb>) {
-        let mut st = self.state.lock();
-        if let Some(slot) = st.devices.get_mut(id).filter(|s| s.generation == generation) {
-            slot.setting = Some(DeviceSetting::Direct { colors });
-        }
-    }
-
-    /// Called by a worker after a mode was applied: records it and emits `DeviceStateChanged`.
-    pub(crate) fn mode_applied(&self, id: &DeviceId, generation: u64, state: ModeState) {
+    /// Called by a worker after an output went out: records the unscaled `setting` it stands for. With `event` (an
+    /// explicit mode change, not a brightness or fade step) a mode also emits `DeviceStateChanged`.
+    pub(crate) fn applied(&self, id: &DeviceId, generation: u64, setting: DeviceSetting, event: bool) {
         {
             let mut st = self.state.lock();
             let Some(slot) = st.devices.get_mut(id).filter(|s| s.generation == generation) else {
                 return;
             };
-            slot.setting = Some(DeviceSetting::Mode { state: state.clone() });
+            slot.setting = Some(setting.clone());
         }
-        self.emit(EngineEvent::DeviceStateChanged {
-            id: id.clone(),
-            state,
-        });
+        if let (true, DeviceSetting::Mode { state }) = (event, setting) {
+            self.emit(EngineEvent::DeviceStateChanged {
+                id: id.clone(),
+                state,
+            });
+        }
+    }
+
+    /// Re-sends every driven, usable device at the current brightness levels (or only `only`). Runs under the state
+    /// lock, so sequence numbers and wants stay consistent with concurrent edits.
+    fn refresh_locked(&self, st: &mut State, only: Option<&DeviceId>) {
+        let ids: Vec<DeviceId> = st
+            .devices
+            .iter()
+            .filter(|(id, s)| {
+                only.is_none_or(|o| o == *id)
+                    && s.want.is_some()
+                    && !matches!(s.status, DeviceStatus::Faulted { .. })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let levels = st.levels(&id);
+            let seq = self.next_seq();
+            if let Some(slot) = st.devices.get_mut(&id)
+                && let Some(output) = slot.output(levels)
+            {
+                slot.push_output(seq, output);
+            }
+        }
+    }
+
+    /// Sets device `id` to direct colours `colors` (already checked) and sends them at the current levels.
+    fn drive_direct(&self, st: &mut State, id: &DeviceId, colors: Vec<Rgb>) {
+        let levels = st.levels(id);
+        let seq = self.next_seq();
+        if let Some(slot) = st.devices.get_mut(id) {
+            slot.colors = colors;
+            slot.want = Some(Want::Direct);
+            if let Some(output) = slot.output(levels) {
+                slot.push_output(seq, output);
+            }
+        }
+    }
+
+    /// Records `state` as what device `id` is driven with and returns the sequence number and output of the
+    /// `SetMode` command that applies it.
+    fn want_mode(&self, st: &mut State, id: &DeviceId, state: &ModeState) -> Option<(u64, lighting::Out)> {
+        let levels = st.levels(id);
+        let slot = st.devices.get_mut(id)?;
+        slot.want = Some(Want::Mode(state.clone()));
+        let output = slot.output(levels)?;
+        Some((self.next_seq(), output.out))
+    }
+
+    /// Starts a fade to `target` (0 off, 1 on) for toggle generation `generation` on its own thread.
+    fn start_fade(this: &Arc<Self>, generation: u64, target: f64) {
+        let shared = Arc::clone(this);
+        let spawned = std::thread::Builder::new()
+            .name("cc-fade".into())
+            .spawn(move || shared.run_fade(generation, target));
+        if let Err(e) = spawned {
+            warn!(error = %e, "could not start the fade thread; switching without a fade");
+            let mut st = this.state.lock();
+            if st.fade_gen == generation {
+                st.fade = target;
+                this.refresh_locked(&mut st, None);
+            }
+        }
+    }
+
+    /// The fade: steps the fade factor from its current value to `target` over the fade duration (scaled by the
+    /// distance, so reversing a half-done fade takes half the time), one step per frame interval, re-sending every
+    /// driven device each step. Ends early when a newer toggle started or the engine shuts down.
+    fn run_fade(&self, generation: u64, target: f64) {
+        let from = self.state.lock().fade;
+        let total = self.timing.fade.mul_f64((target - from).abs());
+        let start = Instant::now();
+        loop {
+            // The first step lands one interval in: the level at the start is what the devices already show.
+            if !total.is_zero() {
+                std::thread::sleep(
+                    self.frame_interval()
+                        .min(total.saturating_sub(start.elapsed()))
+                        .max(Duration::from_millis(1)),
+                );
+            }
+            if self.is_closed() {
+                return;
+            }
+            let progress = if total.is_zero() {
+                1.0
+            } else {
+                (start.elapsed().as_secs_f64() / total.as_secs_f64()).min(1.0)
+            };
+            {
+                let mut st = self.state.lock();
+                if st.fade_gen != generation {
+                    return;
+                }
+                st.fade = if progress >= 1.0 {
+                    target
+                } else {
+                    from + (target - from) * progress
+                };
+                self.refresh_locked(&mut st, None);
+            }
+            if progress >= 1.0 {
+                debug!(target, "fade finished");
+                return;
+            }
+        }
     }
 
     /// Called by a worker after zone `zone` was resized: adopts the new description, carries the colour buffer and a
@@ -197,19 +355,18 @@ impl Shared {
             return;
         };
         let colors = remap_buffer(&slot.description, &desc, &slot.colors);
-        let direct = matches!(slot.setting, Some(DeviceSetting::Direct { .. }));
+        let direct = matches!(slot.want, Some(Want::Direct));
         if let Some(DeviceSetting::Direct { colors: c }) = &mut slot.setting {
             *c = remap_buffer(&slot.description, &desc, c);
         }
         let name = desc.zones.get(zone).map(|z| (z.name.clone(), z.len));
         slot.description = desc;
-        slot.colors = colors.clone();
-        if direct || dropped {
-            let seq = self.next_seq();
-            slot.push_frame(seq, colors);
-        }
+        slot.colors = colors;
         if let Some((name, len)) = name {
             st.zone_sizes.entry(id.clone()).or_default().insert(name, len);
+        }
+        if direct || dropped {
+            self.refresh_locked(&mut st, Some(id));
         }
     }
 
@@ -354,6 +511,7 @@ impl Shared {
             description,
             status: DeviceStatus::Active,
             setting: None,
+            want: None,
             frame,
             tx,
             thread: Some(thread),
@@ -393,23 +551,29 @@ impl Shared {
         let mut st = self.state.lock();
         let slot = st
             .devices
-            .get_mut(id)
+            .get(id)
             .ok_or_else(|| EngineError::UnknownDevice(id.clone()))?;
         match setting.fit_to(slot.description.led_count()) {
             DeviceSetting::Direct { colors } => {
                 check_has_direct(&slot.description)?;
-                let seq = self.next_seq();
-                slot.push_frame(seq, colors);
+                self.drive_direct(&mut st, id, colors);
             }
             DeviceSetting::Mode { state } => {
                 slot.description
                     .validate_state(&state)
                     .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
+                let tx = slot.tx.clone();
+                let (seq, out) = self
+                    .want_mode(&mut st, id, &state)
+                    .ok_or_else(|| EngineError::UnknownDevice(id.clone()))?;
                 let (reply, _) = crossbeam_channel::bounded(1);
-                let seq = self.next_seq();
-                slot.tx
-                    .try_send(Command::SetMode { seq, state, reply })
-                    .map_err(|_| EngineError::Timeout)?;
+                tx.try_send(Command::SetMode {
+                    seq,
+                    state,
+                    out,
+                    reply,
+                })
+                .map_err(|_| EngineError::Timeout)?;
             }
         }
         Ok(())
@@ -551,8 +715,7 @@ impl Shared {
                 colors.len()
             )));
         }
-        let seq = self.next_seq();
-        slot.push_frame(seq, colors);
+        self.drive_direct(&mut st, id, colors);
         Ok(())
     }
 
@@ -582,15 +745,14 @@ impl Shared {
         }
         let mut buffer = slot.colors.clone();
         buffer[range].copy_from_slice(&colors);
-        let seq = self.next_seq();
-        slot.push_frame(seq, buffer);
+        self.drive_direct(&mut st, id, buffer);
         Ok(())
     }
 
     fn set_mode(&self, id: &DeviceId, state: ModeState) -> Result<(), EngineError> {
         let tx = self.slot_tx(id)?;
-        {
-            let st = self.state.lock();
+        let (seq, out) = {
+            let mut st = self.state.lock();
             let slot = st
                 .devices
                 .get(id)
@@ -598,10 +760,16 @@ impl Shared {
             slot.description
                 .validate_state(&state)
                 .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        }
+            self.want_mode(&mut st, id, &state)
+                .ok_or_else(|| EngineError::UnknownDevice(id.clone()))?
+        };
         // The worker records the setting and emits DeviceStateChanged when (and if) it applies the mode.
-        let seq = self.next_seq();
-        self.acked(id, tx, move |reply| Command::SetMode { seq, state, reply })
+        self.acked(id, tx, move |reply| Command::SetMode {
+            seq,
+            state,
+            out,
+            reply,
+        })
     }
 
     fn resize_zone(&self, id: &DeviceId, zone: usize, len: usize) -> Result<(), EngineError> {
@@ -650,8 +818,68 @@ impl Shared {
 
     fn release(&self, id: &DeviceId) -> Result<(), EngineError> {
         let tx = self.slot_tx(id)?;
-        let seq = self.next_seq();
+        // Stop driving it before the sequence number is taken, so no later brightness or fade step takes it back.
+        let seq = {
+            let mut st = self.state.lock();
+            if let Some(slot) = st.devices.get_mut(id) {
+                slot.want = None;
+            }
+            self.next_seq()
+        };
         self.acked(id, tx, move |reply| Command::Release { seq, reply })
+    }
+
+    fn set_device_brightness(&self, id: &DeviceId, value: u8) -> Result<(), EngineError> {
+        if self.is_closed() {
+            return Err(EngineError::ShutDown);
+        }
+        let mut st = self.state.lock();
+        if !st.devices.contains_key(id) {
+            return Err(EngineError::UnknownDevice(id.clone()));
+        }
+        let value = value.min(FULL);
+        if value == FULL {
+            st.brightness.remove(id);
+        } else {
+            st.brightness.insert(id.clone(), value);
+        }
+        self.refresh_locked(&mut st, Some(id));
+        Ok(())
+    }
+
+    fn replace_brightness(&self, map: BTreeMap<DeviceId, u8>) {
+        if self.is_closed() {
+            return;
+        }
+        let mut st = self.state.lock();
+        st.brightness = normalized_brightness(map);
+        self.refresh_locked(&mut st, None);
+    }
+
+    fn set_master_brightness(&self, value: u8) {
+        if self.is_closed() {
+            return;
+        }
+        let mut st = self.state.lock();
+        st.master = value.min(FULL);
+        self.refresh_locked(&mut st, None);
+    }
+
+    fn set_all_off(this: &Arc<Self>, off: bool) {
+        if this.is_closed() {
+            return;
+        }
+        let generation = {
+            let mut st = this.state.lock();
+            if st.off == off {
+                return;
+            }
+            st.off = off;
+            st.fade_gen += 1;
+            st.fade_gen
+        };
+        info!(off, "all off toggled");
+        Self::start_fade(this, generation, if off { 0.0 } else { 1.0 });
     }
 
     fn apply_one(&self, id: &DeviceId, setting: DeviceSetting) -> Result<(), EngineError> {
@@ -855,6 +1083,11 @@ pub(crate) fn start_with(
             pending: BTreeMap::new(),
             disabled_families: cfg.disabled_families,
             zone_sizes: cfg.zone_sizes,
+            master: cfg.master_brightness.min(FULL),
+            brightness: normalized_brightness(cfg.brightness),
+            off: cfg.all_off,
+            fade: if cfg.all_off { 0.0 } else { 1.0 },
+            fade_gen: 0,
         }),
         subscribers: Mutex::new(Vec::new()),
         backends,
@@ -886,7 +1119,7 @@ impl EngineHandle {
     /// Every controlled device, sorted by kind, then name (then id).
     pub fn devices(&self) -> Vec<DeviceView> {
         let st = self.shared().state.lock();
-        let mut out: Vec<DeviceView> = st.devices.values().map(Slot::view).collect();
+        let mut out: Vec<DeviceView> = st.devices.iter().map(|(id, s)| st.view(id, s)).collect();
         out.sort_by(|a, b| {
             let (a, b) = (&a.description.info, &b.description.info);
             (a.kind as u32, &a.name, &a.id).cmp(&(b.kind as u32, &b.name, &b.id))
@@ -896,7 +1129,8 @@ impl EngineHandle {
 
     /// One device, if controlled.
     pub fn device(&self, id: &DeviceId) -> Option<DeviceView> {
-        self.shared().state.lock().devices.get(id).map(Slot::view)
+        let st = self.shared().state.lock();
+        st.devices.get(id).map(|s| st.view(id, s))
     }
 
     /// Devices backends found but could not bring up (most recent last, bounded).
@@ -990,6 +1224,52 @@ impl EngineHandle {
             .iter()
             .filter_map(|(id, s)| s.setting.clone().map(|set| (id.clone(), set)))
             .collect()
+    }
+
+    /// Sets device `id`'s brightness in percent (clamped to 100) and re-sends the device at the new level if the
+    /// engine drives it (ADR 0001 #33). Direct colours are scaled; in a hardware mode with a brightness parameter the
+    /// mode's brightness is scaled inside its range; other hardware modes are not affected. The stored colours and
+    /// mode stay unscaled. Coalesced like [`set_direct`](Self::set_direct).
+    pub fn set_device_brightness(&self, id: &DeviceId, percent: u8) -> Result<(), EngineError> {
+        self.shared().set_device_brightness(id, percent)
+    }
+
+    /// Replaces every device brightness (a device without an entry gets 100), as applying a profile does, and
+    /// re-sends the driven devices. Values are clamped to 100. Call it before [`apply`](Self::apply) so the
+    /// profile's colours go out at the profile's brightness right away.
+    pub fn replace_brightness(&self, brightness: BTreeMap<DeviceId, u8>) {
+        self.shared().replace_brightness(brightness);
+    }
+
+    /// Every device brightness below 100, also of devices that are not connected now (for saving as a profile).
+    pub fn brightness(&self) -> BTreeMap<DeviceId, u8> {
+        self.shared().state.lock().brightness.clone()
+    }
+
+    /// Sets the master brightness in percent (clamped to 100), multiplied into every device, and re-sends the driven
+    /// devices.
+    pub fn set_master_brightness(&self, percent: u8) {
+        self.shared().set_master_brightness(percent);
+    }
+
+    /// All off (`true`) fades every device the engine drives (not released, with a setting) to black over 500 ms
+    /// and holds it there: direct colours are scaled down step by step; a hardware mode with a brightness parameter
+    /// is stepped down to its minimum, then switched to the device's "Off" mode if it has one, else to black in
+    /// direct mode. All on (`false`) fades back to the current settings, restoring a hardware mode at its lowest
+    /// brightness and stepping it up. Changes made while off are stored but not shown until on. A toggle during a
+    /// fade takes over from the current level (latest wins). Returns at once; the fade runs on its own thread.
+    /// Setting the current state again does nothing.
+    pub fn set_all_off(&self, off: bool) {
+        Shared::set_all_off(self.shared(), off);
+    }
+
+    /// Master brightness and the All off state.
+    pub fn lighting(&self) -> LightingView {
+        let st = self.shared().state.lock();
+        LightingView {
+            master_brightness: st.master,
+            all_off: st.off,
+        }
     }
 
     /// Changes the frame rate; clamped to `1..=60`. Takes effect with the next frame.
