@@ -33,6 +33,9 @@ pub struct ProcessInfo {
     pub name: String,
     /// Full image path, `None` when the process could not be opened (protected or other session).
     pub exe_path: Option<String>,
+    /// Windows session the process runs in, `None` when unknown.
+    #[serde(default)]
+    pub session_id: Option<u32>,
 }
 
 /// Whether a service is a user-mode service or a kernel driver.

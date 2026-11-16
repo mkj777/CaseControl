@@ -277,7 +277,8 @@ unless noted.
   plus the 2 px focus ring, so a focused field is unmistakable even though the resting edge is subtle; invalid
   border `--error` plus the inline error; disabled (`--text-disabled`, fill `--surface`, border `--border`).
 - **Rules:** every field has a visible label (Field) or, inside a one-field form such as "Profile name", an
-  `aria-label` plus a placeholder that names it. Text selection is allowed only in fields.
+  `aria-label` plus a placeholder that names it. Text selection is allowed in fields and in the copyable text listed
+  under [Text selection](#text-selection).
 
 ### Field
 
@@ -359,7 +360,8 @@ Severity group headings on the Conflicts page stay headings, not badges.
 - **Inline error** (field level): `--text-sm`, `--error`, under the field, linked with
   `aria-describedby`; the field gets `aria-invalid`.
 - **Rules:** messages say what happened and what to do next. Success messages ("Saved to the device.") use `info`
-  and disappear on the next action. Stacked notices are `--space-3` apart.
+  and disappear on the next action. Stacked notices are `--space-3` apart. Error notices and inline errors are
+  selectable (see [Text selection](#text-selection)).
 
 ### List row
 
@@ -373,7 +375,8 @@ Severity group headings on the Conflicts page stay headings, not badges.
 
 ### Key-value list
 
-- `<dl>` grid, `max-content 1fr`, gap `--space-2` `--space-6`, `dt` muted, values that are ids in `--font-mono`.
+- `<dl>` grid, `max-content 1fr`, gap `--space-2` `--space-6`, `dt` muted, values that are ids in `--font-mono`
+  (`dd.mono`, selectable).
   Replaces `.details`, `.facts` and `.info`.
 
 ### LED and key preview
@@ -392,6 +395,19 @@ The preview is the focus of the app (ADR #15), so it gets the most room and the 
 - **Selection controls** (All, None, count) sit above the stage (ADR #28), ghost buttons.
 - **Rules:** no labels, glows, reflections or device photos in the stage. Swatches and colour chips follow the same
   border and selection rules.
+
+## Text selection
+
+The app body is `user-select: none` (a desktop tool: dragging over a page does not paint selections). Text that
+people copy into a search or a bug report is selectable (ADR 0001 #32):
+
+- error and fault messages: Notice `error` (the whole notice), the Field inline error, fault and failure texts;
+- device ids and other monospace values (`KeyValueList` `dd.mono`);
+- conflict evidence: process and service names, paths, autostart entries and their commands, scan errors and
+  action results.
+
+Primitives handle their own cases. Elsewhere add the utility class `selectable` from `styles.css`
+(`user-select: text`, text cursor). Fields stay selectable as before. Nothing else is.
 
 ## Accessibility
 

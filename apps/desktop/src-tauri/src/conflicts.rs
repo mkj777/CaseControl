@@ -1,14 +1,14 @@
-//! Conflict scan results as the Conflicts page shows them, and the checks that tie an action click back to the
-//! finding it came from (so the frontend cannot ask to end an arbitrary pid or stop an arbitrary service).
+//! Conflict scan results as the Conflicts page shows them. Actions are checked against a fresh scan in
+//! `conflict_actions` (so the frontend cannot ask to end an arbitrary pid or stop an arbitrary service).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cc_conflicts::{AFFECTS_ALL, Evidence, Finding, ScanReport, autostart_actions};
+use cc_conflicts::{AFFECTS_ALL, Finding, ScanReport, autostart_actions};
 use cc_core::DeviceId;
 use cc_engine::DeviceView;
 use serde::Serialize;
 
-use crate::startup::{StartupConflicts, remembered_start_type, startup_model};
+use crate::startup::{CloseTarget, StartupConflicts, close_targets, remembered_start_type, startup_model};
 
 /// One of our devices a finding may interfere with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -29,6 +29,8 @@ pub struct FindingView {
     pub affected_devices: Vec<AffectedDevice>,
     /// The user ticked "Don't ask again" for it (it never shows in the start dialog).
     pub dont_ask: bool,
+    /// What End process / Stop service can end: its processes in this session and its running Win32 services.
+    pub close_targets: Vec<CloseTarget>,
     /// At least one of its autostart items is on and can be turned off ("Turn off" on the Conflicts page).
     pub autostart_on: bool,
     /// At least one autostart item is off and can be turned back on ("Re-enable"): a switched-off Run / Startup
@@ -58,6 +60,8 @@ pub struct ViewContext<'a> {
     pub dont_ask: &'a BTreeSet<String>,
     /// `conflicts.previous_start_types`.
     pub remembered: &'a BTreeMap<String, String>,
+    /// The app's Windows session (processes of other sessions are never offered for closing).
+    pub session: Option<u32>,
 }
 
 /// A device under our control, as far as conflict matching needs it.
@@ -103,6 +107,7 @@ pub fn scan_view(report: &ScanReport, ctx: &ViewContext<'_>) -> ConflictScan {
             .map(|f| FindingView {
                 affected_devices: affected_devices(f, ctx.devices),
                 dont_ask: ctx.dont_ask.contains(&f.entry_id),
+                close_targets: close_targets(f, ctx.session),
                 autostart_on: f.autostart.iter().any(|i| i.can_turn_off()),
                 can_reenable: !autostart_actions(f, true, |name| remembered_start_type(ctx.remembered, name))
                     .is_empty(),
@@ -110,48 +115,15 @@ pub fn scan_view(report: &ScanReport, ctx: &ViewContext<'_>) -> ConflictScan {
             })
             .collect(),
         errors: report.errors.clone(),
-        startup: startup_model(report, ctx.visible, ctx.dont_ask),
-    }
-}
-
-fn finding<'a>(report: &'a ScanReport, entry_id: &str) -> Result<&'a Finding, String> {
-    report
-        .findings
-        .iter()
-        .find(|f| f.entry_id == entry_id)
-        .ok_or_else(|| format!("no finding {entry_id:?} in the last scan; scan again"))
-}
-
-/// The executable name of process `pid` as recorded in finding `entry_id` of the last scan.
-pub fn process_name(report: &ScanReport, entry_id: &str, pid: u32) -> Result<String, String> {
-    finding(report, entry_id)?
-        .evidence
-        .iter()
-        .find_map(|e| match e {
-            Evidence::Process { pid: p, name, .. } if *p == pid => Some(name.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| format!("process {pid} is not part of finding {entry_id:?}"))
-}
-
-/// Checks that service or driver `name` is part of finding `entry_id` of the last scan.
-pub fn check_service(report: &ScanReport, entry_id: &str, name: &str) -> Result<(), String> {
-    let found = finding(report, entry_id)?.evidence.iter().any(|e| match e {
-        Evidence::Service { name: n, .. } | Evidence::Driver { name: n, .. } => n.eq_ignore_ascii_case(name),
-        _ => false,
-    });
-    if found {
-        Ok(())
-    } else {
-        Err(format!("service {name:?} is not part of finding {entry_id:?}"))
+        startup: startup_model(report, ctx.visible, ctx.dont_ask, ctx.session),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use cc_conflicts::{
-        Access, AutostartItem, AutostartLocation, Category, Class, ServiceKind, ServiceState, Severity,
-        StartType,
+        Access, AutostartItem, AutostartLocation, Category, Class, Evidence, ServiceKind, ServiceState,
+        Severity, StartType,
     };
     use cc_core::family;
 
@@ -184,6 +156,7 @@ mod tests {
                     pid: 42,
                     name: "lghub.exe".into(),
                     path: None,
+                    session: Some(1),
                 },
                 Evidence::Service {
                     name: "LGHUBUpdaterService".into(),
@@ -236,19 +209,6 @@ mod tests {
     }
 
     #[test]
-    fn actions_must_match_the_last_scan() {
-        let report = ScanReport {
-            findings: vec![sample_finding(&[family::LOGITECH])],
-            errors: vec![],
-        };
-        assert_eq!(process_name(&report, "ghub", 42).as_deref(), Ok("lghub.exe"));
-        assert!(process_name(&report, "ghub", 43).is_err());
-        assert!(process_name(&report, "other", 42).is_err());
-        assert!(check_service(&report, "ghub", "lghubupdaterservice").is_ok());
-        assert!(check_service(&report, "ghub", "Spooler").is_err());
-    }
-
-    #[test]
     fn view_flattens_finding() {
         let report = ScanReport {
             findings: vec![sample_finding(&[family::LOGITECH])],
@@ -262,6 +222,7 @@ mod tests {
             visible: &devices,
             dont_ask: &dont_ask,
             remembered: &remembered,
+            session: Some(1),
         };
         let json = serde_json::to_value(scan_view(&report, &ctx)).expect("serializes");
         let f = &json["findings"][0];
@@ -286,6 +247,14 @@ mod tests {
             json["startup"],
             serde_json::json!([]),
             "vendor tools never reach the dialog"
+        );
+        assert_eq!(
+            f["close_targets"][0],
+            serde_json::json!({ "kind": "process", "pid": 42, "name": "lghub.exe" })
+        );
+        assert_eq!(
+            f["close_targets"][1],
+            serde_json::json!({ "kind": "service", "name": "LGHUBUpdaterService" })
         );
     }
 }

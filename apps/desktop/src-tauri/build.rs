@@ -26,8 +26,7 @@ const COMMANDS: &[&str] = &[
     "resolve_conflicts",
     "set_autostart",
     "set_dont_ask",
-    "terminate_process",
-    "stop_service",
+    "close_program",
     "get_settings",
     "set_settings",
 ];

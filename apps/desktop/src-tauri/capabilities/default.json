@@ -33,8 +33,7 @@
     "allow-resolve-conflicts",
     "allow-set-autostart",
     "allow-set-dont-ask",
-    "allow-terminate-process",
-    "allow-stop-service",
+    "allow-close-program",
     "allow-get-settings",
     "allow-set-settings"
   ]

@@ -168,6 +168,36 @@ export type Access = 'hid' | 'smbus' | 'superio' | 'kernel_driver' | 'lamparray'
 export type ServiceState = 'running' | 'stopped' | { other: number }
 export type ServiceKind = 'win32' | 'driver'
 export type Hive = 'hklm_native' | 'hklm_wow6432' | 'hkcu'
+/** Suites may appear in the start dialog; vendor tools only on the Conflicts page (ADR 0001 #31). */
+export type ConflictClass = 'suite' | 'vendor_tool'
+export type StartType = 'boot' | 'system' | 'auto' | 'manual' | 'disabled'
+export type AutostartLocation =
+  | 'hkcu_run'
+  | 'hkcu_run_once'
+  | 'hklm_run'
+  | 'hklm_run_once'
+  | 'hklm_run32'
+  | 'hklm_run_once32'
+  | 'user_startup_folder'
+  | 'common_startup_folder'
+  | 'service'
+
+/** How a program starts with Windows: a Run / RunOnce value, a Startup folder item or a service start type. */
+export interface AutostartItem {
+  location: AutostartLocation
+  /** Value name, Startup folder file name or service name. */
+  name: string
+  /** Command line or shortcut target; `null` for services. */
+  command: string | null
+  /** Starts with Windows now. */
+  enabled: boolean
+  /** Services only. */
+  start_type: StartType | null
+  /** CaseControl can switch it off and on (not RunOnce, not disabled services). */
+  toggleable: boolean
+  /** Changing it shows a Windows permission prompt. */
+  needs_admin: boolean
+}
 
 export interface DynamicLighting {
   ambient_enabled: boolean
@@ -178,7 +208,7 @@ export interface DynamicLighting {
 
 /** `Evidence` (adjacently tagged with `type` / `data`). */
 export type Evidence =
-  | { type: 'process'; data: { pid: number; name: string; path: string | null } }
+  | { type: 'process'; data: { pid: number; name: string; path: string | null; session: number | null } }
   | { type: 'service'; data: { name: string; state: ServiceState; kind: ServiceKind } }
   | { type: 'driver'; data: { name: string; state: ServiceState; path: string | null } }
   | { type: 'installed'; data: { display_name: string; version: string | null; hive: Hive } }
@@ -197,6 +227,7 @@ export interface Finding {
   name: string
   vendor: string
   category: Category
+  class: ConflictClass
   severity: Severity
   verified: boolean
   access: Access[]
@@ -205,12 +236,71 @@ export interface Finding {
   running: boolean
   installed: boolean
   evidence: Evidence[]
+  autostart: AutostartItem[]
   affected_devices: AffectedDevice[]
+  /** What End process / Stop service can end (processes of this Windows session, running services). */
+  close_targets: CloseTarget[]
+  /** "Don't ask again" is set: it never shows in the start dialog. */
+  dont_ask: boolean
+  /** An autostart item is on and can be turned off. */
+  autostart_on: boolean
+  /** An autostart item is off and can be turned back on. */
+  can_reenable: boolean
+}
+
+/** Something "Close now" / End process / Stop service ends. */
+export type CloseTarget = { kind: 'process'; pid: number; name: string } | { kind: 'service'; name: string }
+
+/** One program of the start dialog (`startup::ConflictProgram`). */
+export interface ConflictProgram {
+  entry_id: string
+  name: string
+  vendor: string
+  note: string
+  /** Our visible devices it affects. */
+  affected_devices: AffectedDevice[]
+  running: boolean
+  close_targets: CloseTarget[]
+  /** The autostart items that are on; "Turn off autostart" switches them off. */
+  autostart: AutostartItem[]
+  autostart_on: boolean
+  /** Proceeding may show a Windows permission prompt. */
+  needs_admin: boolean
 }
 
 export interface ConflictScan {
   findings: Finding[]
   errors: string[]
+  /** The start dialog model for this scan (empty: nothing to ask). */
+  startup: ConflictProgram[]
+}
+
+/** One change CaseControl made (or tried) to other software. */
+export type ConflictAction =
+  | { kind: 'terminate_process'; pid: number; name: string }
+  | { kind: 'stop_service'; name: string }
+  | { kind: 'set_service_start_type'; name: string; start_type: StartType }
+  | { kind: 'set_startup_approved'; location: AutostartLocation; name: string; enabled: boolean }
+
+export interface ActionResult {
+  entry_id: string
+  action: ConflictAction
+  ok: boolean
+  error: string | null
+  /** Not confirmed yet (the elevated helper was still working); `ok` is false, a scan shows the real state. */
+  unknown: boolean
+}
+
+export interface ActionReport {
+  results: ActionResult[]
+  /** Programs of the request that could not be acted on. */
+  refused: { entry_id: string; reason: string }[]
+  /** The scan afterwards (also sent as `conflicts-updated`). */
+  scan: ConflictScan
+}
+
+export interface ResolveRequest {
+  items: { entry_id: string; close: boolean; disable_autostart: boolean }[]
 }
 
 // ---- app -------------------------------------------------------------------------------------------------------
@@ -297,9 +387,17 @@ export const renameProfile = (from: string, to: string) => invoke<ProfileList>('
 export const deleteProfile = (name: string) => invoke<ProfileList>('delete_profile', { name })
 
 export const scanConflicts = () => invoke<ConflictScan>('scan_conflicts')
-export const terminateProcess = (pid: number, finding: string) =>
-  invoke<void>('terminate_process', { pid, finding })
-export const stopService = (name: string, finding: string) => invoke<void>('stop_service', { name, finding })
+/** The start dialog model from a fresh scan (also sends `conflicts-updated`). */
+export const startupConflicts = () => invoke<ConflictProgram[]>('startup_conflicts')
+/** The start dialog's Proceed; at most one Windows permission prompt. */
+export const resolveConflicts = (request: ResolveRequest) => invoke<ActionReport>('resolve_conflicts', { request })
+/** End process / Stop service on the Conflicts page; at most one Windows permission prompt. */
+export const closeProgram = (entry: string, targets: CloseTarget[]) =>
+  invoke<ActionReport>('close_program', { entry, targets })
+/** Turn off (`false`) or re-enable (`true`) a program's autostart. */
+export const setAutostart = (entry: string, enabled: boolean) =>
+  invoke<ActionReport>('set_autostart', { entry, enabled })
+export const setDontAsk = (entry: string, dontAsk: boolean) => invoke<ConflictScan>('set_dont_ask', { entry, dontAsk })
 
 export const getSettings = () => invoke<SettingsView>('get_settings')
 export const setSettings = (patch: SettingsPatch) => invoke<SettingsView>('set_settings', { patch })
@@ -315,6 +413,8 @@ export interface EventPayloads {
   'devices-changed': null
   'profiles-changed': ProfileList
   'conflicts-updated': ConflictScan
+  /** Sent once after start when the start dialog has programs to ask about. */
+  'startup-conflicts': ConflictProgram[]
 }
 
 export function on<K extends keyof EventPayloads>(

@@ -3,7 +3,7 @@
 //! user clicked.
 
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use windows_registry::{CURRENT_USER, Key, LOCAL_MACHINE, Type};
 
@@ -12,6 +12,7 @@ use crate::autostart::{
     AutostartEntry, AutostartLocation, AutostartSource, command_executable, encode_startup_approved,
     filetime, parse_shell_link, parse_startup_approved,
 };
+use crate::elevation::SERVICE_STOP_WAIT;
 use crate::resolve::SystemOps;
 use crate::sources::{
     DynamicLighting, Hive, InstalledApp, ProcessInfo, ProcessSource, RegistrySource, ScanError, ServiceInfo,
@@ -30,6 +31,7 @@ impl ProcessSource for WindowsProcesses {
             .map(|(pid, name)| ProcessInfo {
                 pid,
                 exe_path: sys::process_image_path(pid),
+                session_id: sys::process_session(pid),
                 name,
             })
             .collect())
@@ -238,9 +240,6 @@ impl AutostartSource for WindowsAutostart {
         Ok(out)
     }
 }
-
-/// How long [`WindowsOps::stop_service`] waits for a service to reach the stopped state.
-pub const SERVICE_STOP_WAIT: Duration = Duration::from_secs(10);
 
 /// The real [`SystemOps`]: checked process termination, SCM stop / start type, `StartupApproved` writes.
 ///

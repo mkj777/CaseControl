@@ -6,15 +6,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use cc_conflicts::{
-    Action, ActionOutcome, AutostartItem, Class, Evidence, Finding, PlannedAction, ScanReport, ServiceKind,
-    ServiceState, StartType, autostart_actions, close_actions,
+    Action, ActionOutcome, AutostartItem, Class, Finding, PlannedAction, ScanReport, StartType,
+    autostart_actions, close_actions,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::conflicts::{AffectedDevice, KnownDevice, affected_devices};
 
 /// Something "Close now" ends.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CloseTarget {
     /// A running process.
@@ -59,20 +59,13 @@ pub struct ConflictProgram {
 /// The start dialog model: programs in scan order (running first, then by severity).
 pub type StartupConflicts = Vec<ConflictProgram>;
 
-fn close_targets(finding: &Finding) -> Vec<CloseTarget> {
-    finding
-        .evidence
-        .iter()
-        .filter_map(|e| match e {
-            Evidence::Process { pid, name, .. } => Some(CloseTarget::Process {
-                pid: *pid,
-                name: name.clone(),
-            }),
-            Evidence::Service {
-                name,
-                state: ServiceState::Running,
-                kind: ServiceKind::Win32,
-            } => Some(CloseTarget::Service { name: name.clone() }),
+/// What "Close now" ends for `finding`: its processes in `session` (when given) and its running Win32 services.
+pub fn close_targets(finding: &Finding, session: Option<u32>) -> Vec<CloseTarget> {
+    close_actions(finding, session)
+        .into_iter()
+        .filter_map(|a| match a {
+            Action::TerminateProcess { pid, name } => Some(CloseTarget::Process { pid, name }),
+            Action::StopService { name } => Some(CloseTarget::Service { name }),
             _ => None,
         })
         .collect()
@@ -87,6 +80,7 @@ pub fn program(
     finding: &Finding,
     visible: &[KnownDevice],
     dont_ask: &BTreeSet<String>,
+    session: Option<u32>,
 ) -> Option<ConflictProgram> {
     if finding.class != Class::Suite || dont_ask.contains(&finding.entry_id) {
         return None;
@@ -95,7 +89,7 @@ pub fn program(
     if affected.is_empty() {
         return None;
     }
-    let close_targets = close_targets(finding);
+    let close_targets = close_targets(finding, session);
     let autostart: Vec<AutostartItem> = finding
         .autostart
         .iter()
@@ -128,11 +122,12 @@ pub fn startup_model(
     report: &ScanReport,
     visible: &[KnownDevice],
     dont_ask: &BTreeSet<String>,
+    session: Option<u32>,
 ) -> StartupConflicts {
     report
         .findings
         .iter()
-        .filter_map(|f| program(f, visible, dont_ask))
+        .filter_map(|f| program(f, visible, dont_ask, session))
         .collect()
 }
 
@@ -165,6 +160,8 @@ pub struct ActionResult {
     pub ok: bool,
     /// Why it failed.
     pub error: Option<String>,
+    /// Not confirmed yet (the elevated helper was still running); `ok` is `false`, a rescan shows the state.
+    pub unknown: bool,
 }
 
 impl From<ActionOutcome> for ActionResult {
@@ -174,6 +171,7 @@ impl From<ActionOutcome> for ActionResult {
             action: o.action,
             ok: o.ok,
             error: o.error,
+            unknown: o.unknown,
         }
     }
 }
@@ -190,7 +188,12 @@ pub struct Plan {
 /// Turns the dialog's Proceed into actions, checked against `report` (a fresh scan): each item must still be a
 /// dialog program for `visible` (the "don't ask again" set is ignored here, so ticking it together with Proceed
 /// works). Close: processes and running services. Turn off autostart: every enabled toggleable item.
-pub fn plan_resolve(request: &ResolveRequest, report: &ScanReport, visible: &[KnownDevice]) -> Plan {
+pub fn plan_resolve(
+    request: &ResolveRequest,
+    report: &ScanReport,
+    visible: &[KnownDevice],
+    session: Option<u32>,
+) -> Plan {
     let mut plan = Plan::default();
     let none = BTreeSet::new();
     let mut seen = BTreeSet::new();
@@ -199,7 +202,10 @@ pub fn plan_resolve(request: &ResolveRequest, report: &ScanReport, visible: &[Kn
             continue;
         }
         let finding = report.findings.iter().find(|f| f.entry_id == item.entry_id);
-        if finding.and_then(|f| program(f, visible, &none)).is_none() {
+        if finding
+            .and_then(|f| program(f, visible, &none, session))
+            .is_none()
+        {
             plan.refused.push((
                 item.entry_id.clone(),
                 "this program is no longer running or starting with Windows".to_owned(),
@@ -212,7 +218,7 @@ pub fn plan_resolve(request: &ResolveRequest, report: &ScanReport, visible: &[Kn
             actions.extend(autostart_actions(finding, false, |_| None));
         }
         if item.close {
-            actions.extend(close_actions(finding));
+            actions.extend(close_actions(finding, session));
         }
         plan.actions
             .extend(actions.into_iter().map(|action| PlannedAction {
@@ -221,6 +227,57 @@ pub fn plan_resolve(request: &ResolveRequest, report: &ScanReport, visible: &[Kn
             }));
     }
     plan
+}
+
+/// The actions of the Conflicts page's End process / Stop service for `targets` of `entry_id` (any class). Every
+/// target must still be a close target of the finding in `report` (a fresh scan); anything else is an error and
+/// nothing runs.
+pub fn plan_close(
+    entry_id: &str,
+    targets: &[CloseTarget],
+    report: &ScanReport,
+    session: Option<u32>,
+) -> Result<Vec<PlannedAction>, String> {
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.entry_id == entry_id)
+        .ok_or_else(|| format!("{entry_id:?} was not found by a fresh scan; scan again"))?;
+    let current = close_targets(finding, session);
+    targets
+        .iter()
+        .map(|t| {
+            let found = current.iter().any(|c| match (c, t) {
+                (CloseTarget::Process { pid: a, name: n }, CloseTarget::Process { pid: b, name: m }) => {
+                    a == b && n.eq_ignore_ascii_case(m)
+                }
+                (CloseTarget::Service { name: n }, CloseTarget::Service { name: m }) => {
+                    n.eq_ignore_ascii_case(m)
+                }
+                _ => false,
+            });
+            if !found {
+                return Err(match t {
+                    CloseTarget::Process { pid, name } => {
+                        format!("{name} (process {pid}) is no longer running; scan again")
+                    }
+                    CloseTarget::Service { name } => {
+                        format!("service {name} is no longer running; scan again")
+                    }
+                });
+            }
+            Ok(PlannedAction {
+                entry_id: entry_id.to_owned(),
+                action: match t {
+                    CloseTarget::Process { pid, name } => Action::TerminateProcess {
+                        pid: *pid,
+                        name: name.clone(),
+                    },
+                    CloseTarget::Service { name } => Action::StopService { name: name.clone() },
+                },
+            })
+        })
+        .collect()
 }
 
 /// The actions of the Conflicts page's Turn off (`enabled = false`) / Re-enable (`true`) for `entry_id`, any class.
@@ -278,13 +335,13 @@ pub fn remembered_start_type(remembered: &BTreeMap<String, String>, name: &str) 
 }
 
 /// Updates the remembered start types for `actions` before they run: a service about to be set to Manual gets its
-/// current start type (from `report`) remembered unless one is already stored. Returns whether anything changed.
+/// current start type (from `report`) remembered unless one is already stored. Returns the names it added.
 pub fn remember_start_types(
     remembered: &mut BTreeMap<String, String>,
     actions: &[PlannedAction],
     report: &ScanReport,
-) -> bool {
-    let mut changed = false;
+) -> Vec<String> {
+    let mut added = Vec::new();
     for planned in actions {
         let Action::SetServiceStartType {
             name,
@@ -307,10 +364,30 @@ pub fn remember_start_types(
             .and_then(|i| i.start_type);
         if let Some(st) = current {
             remembered.insert(name.clone(), start_type_name(st).to_owned());
-            changed = true;
+            added.push(name.clone());
         }
     }
-    changed
+    added
+}
+
+/// Forgets the memories `newly` (service names remembered for this batch) whose change to Manual failed or did not
+/// run, so a failed "Turn off" leaves no memory behind. Returns whether anything changed.
+pub fn forget_failed_turn_off(
+    remembered: &mut BTreeMap<String, String>,
+    newly: &[String],
+    outcomes: &[ActionOutcome],
+) -> bool {
+    let before = remembered.len();
+    for name in newly {
+        let succeeded = outcomes.iter().any(|o| {
+            o.ok && matches!(&o.action, Action::SetServiceStartType { name: n, start_type: StartType::Manual }
+                if n.eq_ignore_ascii_case(name))
+        });
+        if !succeeded {
+            remembered.retain(|k, _| !k.eq_ignore_ascii_case(name));
+        }
+    }
+    remembered.len() != before
 }
 
 /// Forgets the remembered start type of every service that was successfully set back from Manual. Returns whether
@@ -329,7 +406,7 @@ pub fn forget_restored(remembered: &mut BTreeMap<String, String>, outcomes: &[Ac
 
 #[cfg(test)]
 mod tests {
-    use cc_conflicts::{Access, AutostartLocation, Category, Severity};
+    use cc_conflicts::{Access, AutostartLocation, Category, Evidence, ServiceKind, ServiceState, Severity};
     use cc_core::{DeviceId, family};
 
     use super::*;
@@ -383,6 +460,14 @@ mod tests {
                 pid: 42,
                 name: "SignalRgb.exe".into(),
                 path: None,
+                session: Some(1),
+            },
+            // Another user's SignalRGB: never a close target.
+            Evidence::Process {
+                pid: 43,
+                name: "SignalRgb.exe".into(),
+                path: None,
+                session: Some(2),
             },
             Evidence::Service {
                 name: "SignalRgb.Service".into(),
@@ -422,6 +507,7 @@ mod tests {
             pid: 7,
             name: "lghub.exe".into(),
             path: None,
+            session: Some(1),
         }];
         f.autostart = vec![app_item(AutostartLocation::HkcuRun, "LGHUB", true)];
         f
@@ -442,7 +528,7 @@ mod tests {
     fn dialog_lists_suites_that_affect_visible_devices() {
         let r = report(vec![signalrgb(), openrgb(), ghub()]);
         let wooting = [device(family::WOOTING)];
-        let model = startup_model(&r, &wooting, &BTreeSet::new());
+        let model = startup_model(&r, &wooting, &BTreeSet::new(), Some(1));
         assert_eq!(ids(&model), ["signalrgb", "openrgb"], "vendor tools never appear");
 
         let signal = &model[0];
@@ -471,10 +557,13 @@ mod tests {
     #[test]
     fn no_visible_device_means_no_dialog() {
         let r = report(vec![signalrgb(), openrgb()]);
-        assert!(startup_model(&r, &[], &BTreeSet::new()).is_empty());
+        assert!(startup_model(&r, &[], &BTreeSet::new(), Some(1)).is_empty());
         // A device of a family only OpenRGB ("all") affects in this fixture.
         let msi = [device(family::MSI_MYSTIC_LIGHT)];
-        assert_eq!(ids(&startup_model(&r, &msi, &BTreeSet::new())), ["openrgb"]);
+        assert_eq!(
+            ids(&startup_model(&r, &msi, &BTreeSet::new(), Some(1))),
+            ["openrgb"]
+        );
     }
 
     #[test]
@@ -482,7 +571,7 @@ mod tests {
         let r = report(vec![signalrgb(), openrgb()]);
         let dont = BTreeSet::from(["openrgb".to_owned()]);
         assert_eq!(
-            ids(&startup_model(&r, &[device(family::WOOTING)], &dont)),
+            ids(&startup_model(&r, &[device(family::WOOTING)], &dont, Some(1))),
             ["signalrgb"]
         );
     }
@@ -497,11 +586,16 @@ mod tests {
             AutostartItem::service("SignalRgb.Service", Some(StartType::Manual)),
         ];
         let r = report(vec![f.clone()]);
-        assert!(startup_model(&r, &[device(family::WOOTING)], &BTreeSet::new()).is_empty());
+        assert!(startup_model(&r, &[device(family::WOOTING)], &BTreeSet::new(), Some(1)).is_empty());
 
         // Not running, but autostart on: shown, without close targets, with the hint flag.
         f.autostart[0].enabled = true;
-        let model = startup_model(&report(vec![f]), &[device(family::WOOTING)], &BTreeSet::new());
+        let model = startup_model(
+            &report(vec![f]),
+            &[device(family::WOOTING)],
+            &BTreeSet::new(),
+            Some(1),
+        );
         assert_eq!(model.len(), 1);
         assert!(model[0].close_targets.is_empty());
         assert!(model[0].autostart_on && !model[0].needs_admin);
@@ -536,7 +630,7 @@ mod tests {
                 },
             ],
         };
-        let plan = plan_resolve(&request, &r, &visible);
+        let plan = plan_resolve(&request, &r, &visible, Some(1));
         let actions: Vec<(&str, &Action)> = plan
             .actions
             .iter()
@@ -589,6 +683,7 @@ mod tests {
             },
             &r,
             &visible,
+            Some(1),
         );
         assert_eq!(plan, Plan::default());
     }
@@ -604,10 +699,12 @@ mod tests {
             }],
         };
         assert_eq!(
-            plan_resolve(&item, &r, &[device(family::WOOTING)]).actions.len(),
+            plan_resolve(&item, &r, &[device(family::WOOTING)], Some(1))
+                .actions
+                .len(),
             1
         );
-        let plan = plan_resolve(&item, &r, &[]);
+        let plan = plan_resolve(&item, &r, &[], Some(1));
         assert!(plan.actions.is_empty());
         assert_eq!(plan.refused.len(), 1);
     }
@@ -641,6 +738,89 @@ mod tests {
     }
 
     #[test]
+    fn page_close_targets_must_be_current() {
+        let r = report(vec![signalrgb(), openrgb(), ghub()]);
+        let ok = plan_close(
+            "logitech_g_hub",
+            &[CloseTarget::Process {
+                pid: 7,
+                name: "LGHUB.exe".into(),
+            }],
+            &r,
+            Some(1),
+        )
+        .expect("current target");
+        assert_eq!(
+            ok[0].action,
+            Action::TerminateProcess {
+                pid: 7,
+                name: "LGHUB.exe".into()
+            }
+        );
+        let svc = plan_close(
+            "openrgb",
+            &[CloseTarget::Service {
+                name: "OpenRGB".into(),
+            }],
+            &r,
+            Some(1),
+        )
+        .expect("service");
+        assert_eq!(
+            svc[0].action,
+            Action::StopService {
+                name: "OpenRGB".into()
+            }
+        );
+        // Stale pid, a stopped service, a target of another program, an unknown program.
+        assert!(
+            plan_close(
+                "logitech_g_hub",
+                &[CloseTarget::Process {
+                    pid: 8,
+                    name: "lghub.exe".into()
+                }],
+                &r,
+                Some(1)
+            )
+            .is_err()
+        );
+        assert!(
+            plan_close(
+                "signalrgb",
+                &[CloseTarget::Service {
+                    name: "SignalRgb.Service".into()
+                }],
+                &r,
+                Some(1)
+            )
+            .is_err()
+        );
+        assert!(
+            plan_close(
+                "signalrgb",
+                &[CloseTarget::Service {
+                    name: "OpenRGB".into()
+                }],
+                &r,
+                Some(1)
+            )
+            .is_err()
+        );
+        assert!(plan_close("nope", &[], &r, Some(1)).is_err());
+        let json: CloseTarget =
+            serde_json::from_value(serde_json::json!({ "kind": "process", "pid": 7, "name": "a.exe" }))
+                .expect("parses");
+        assert_eq!(
+            json,
+            CloseTarget::Process {
+                pid: 7,
+                name: "a.exe".into()
+            }
+        );
+    }
+
+    #[test]
     fn start_types_are_remembered_and_forgotten() {
         let r = report(vec![openrgb()]);
         let off = vec![PlannedAction {
@@ -651,10 +831,10 @@ mod tests {
             },
         }];
         let mut remembered = BTreeMap::new();
-        assert!(remember_start_types(&mut remembered, &off, &r));
+        assert_eq!(remember_start_types(&mut remembered, &off, &r), ["OpenRGB"]);
         assert_eq!(remembered["OpenRGB"], "auto");
         // A second turn-off (e.g. after the user re-set it to Auto by hand) keeps the first memory.
-        assert!(!remember_start_types(&mut remembered, &off, &r));
+        assert!(remember_start_types(&mut remembered, &off, &r).is_empty());
 
         let on = PlannedAction {
             entry_id: "openrgb".into(),
@@ -667,6 +847,63 @@ mod tests {
         assert!(!forget_restored(&mut remembered, &[failed]));
         assert!(forget_restored(&mut remembered, &[ActionOutcome::success(&on)]));
         assert!(remembered.is_empty());
+    }
+
+    #[test]
+    fn failed_turn_off_leaves_no_memory() {
+        let r = report(vec![openrgb()]);
+        let off = vec![PlannedAction {
+            entry_id: "openrgb".into(),
+            action: Action::SetServiceStartType {
+                name: "OpenRGB".into(),
+                start_type: StartType::Manual,
+            },
+        }];
+        let mut remembered = BTreeMap::from([("Other".to_owned(), "auto".to_owned())]);
+        let added = remember_start_types(&mut remembered, &off, &r);
+        assert!(!forget_failed_turn_off(
+            &mut remembered,
+            &added,
+            &[ActionOutcome::success(&off[0])]
+        ));
+        assert!(remembered.contains_key("OpenRGB"));
+
+        remembered.remove("OpenRGB");
+        let added = remember_start_types(&mut remembered, &off, &r);
+        let declined = ActionOutcome::failure(&off[0], "the Windows permission prompt was declined");
+        assert!(forget_failed_turn_off(&mut remembered, &added, &[declined]));
+        assert_eq!(
+            remembered.keys().collect::<Vec<_>>(),
+            ["Other"],
+            "older memories stay"
+        );
+        // Not run at all (no outcome) counts as failed too.
+        let added = remember_start_types(&mut remembered, &off, &r);
+        assert!(forget_failed_turn_off(&mut remembered, &added, &[]));
+    }
+
+    #[test]
+    fn other_sessions_are_never_close_targets() {
+        let r = report(vec![signalrgb()]);
+        let model = startup_model(&r, &[device(family::WOOTING)], &BTreeSet::new(), Some(1));
+        assert!(
+            model[0]
+                .close_targets
+                .iter()
+                .all(|t| !matches!(t, CloseTarget::Process { pid: 43, .. }))
+        );
+        assert!(
+            plan_close(
+                "signalrgb",
+                &[CloseTarget::Process {
+                    pid: 43,
+                    name: "SignalRgb.exe".into()
+                }],
+                &r,
+                Some(1)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -686,7 +923,7 @@ mod tests {
     #[test]
     fn model_serializes_to_frontend_shape() {
         let r = report(vec![signalrgb()]);
-        let model = startup_model(&r, &[device(family::WOOTING)], &BTreeSet::new());
+        let model = startup_model(&r, &[device(family::WOOTING)], &BTreeSet::new(), Some(1));
         let json = serde_json::to_value(&model).expect("serializes");
         let p = &json[0];
         assert_eq!(p["entry_id"], serde_json::json!("signalrgb"));
@@ -716,7 +953,8 @@ mod tests {
                 "entry_id": "openrgb",
                 "action": { "kind": "stop_service", "name": "OpenRGB" },
                 "ok": false,
-                "error": "declined"
+                "error": "declined",
+                "unknown": false
             })
         );
     }

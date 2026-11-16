@@ -25,7 +25,10 @@
   overflow-wrap: anywhere;
 }
 
+/* Monospace values are ids, paths and versions: selectable so they can be copied (ADR 0001 #32). */
 .kv :slotted(dd.mono) {
   font-family: var(--font-mono);
+  user-select: text;
+  cursor: text;
 }
 </style>

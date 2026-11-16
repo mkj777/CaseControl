@@ -1,10 +1,15 @@
 <script setup lang="ts">
 // The shell: sidebar navigation and the page area. The window has no Windows title bar (ADR 0001 #29): the app name
 // sits at the top of the sidebar, the window controls at the top right of the page area, and that top strip drags
-// the window (double-click toggles maximise; both are handled by Tauri's drag-region script).
-import { onMounted } from 'vue'
+// the window (double-click toggles maximise; both are handled by Tauri's drag-region script). The shell also owns
+// the start dialog for conflicting RGB programs and the hint shown while one of them still starts with Windows
+// (ADR 0001 #31).
+import { computed, onMounted } from 'vue'
 import { RouterLink, RouterView, useRoute } from 'vue-router'
+import StartupConflictsDialog from './components/StartupConflictsDialog.vue'
 import WindowControls from './components/WindowControls.vue'
+import { Button, Notice } from './components/ui'
+import { conflictState, hintPrograms, openDialog, startConflictWatch } from './stores/conflicts'
 import { listenForDeviceEvents, refreshDevices } from './stores/devices'
 
 const nav = [
@@ -20,6 +25,13 @@ const isActive = (to: string) => route.path === to || route.path.startsWith(`${t
 onMounted(() => {
   listenForDeviceEvents()
   void refreshDevices()
+  void startConflictWatch()
+})
+
+const hint = computed(() => (conflictState.dialogOpen ? [] : hintPrograms()))
+const hintNames = computed(() => {
+  const names = hint.value.map((p) => p.name)
+  return names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`
 })
 </script>
 
@@ -45,8 +57,15 @@ onMounted(() => {
         <WindowControls />
       </header>
       <main class="content">
+        <Notice v-if="hint.length > 0" variant="warning">
+          {{ hintNames }} {{ hint.length === 1 ? 'starts' : 'start' }} with Windows and can take over your devices.
+          <template #details>
+            <div><Button size="sm" @click="openDialog">Review</Button></div>
+          </template>
+        </Notice>
         <RouterView />
       </main>
+      <StartupConflictsDialog />
     </div>
   </div>
 </template>

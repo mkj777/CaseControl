@@ -18,7 +18,7 @@ use crate::conflict_actions::{
     ActionReport, check_catalogue_id, conflict_view, known_devices, run_and_report, run_scan,
     scan_and_publish, set_dont_ask_in,
 };
-use crate::conflicts::{ConflictScan, check_service, process_name};
+use crate::conflicts::ConflictScan;
 use crate::events::{self, CONFLICTS_UPDATED, DEVICES_CHANGED, PROFILES_CHANGED};
 use crate::hidden::{
     HiddenEntry, hidden_device_error, hidden_view, hidden_zones, is_device_hidden, mask_hidden_zones,
@@ -26,7 +26,9 @@ use crate::hidden::{
 };
 use crate::prefs::{SettingsPatch, SettingsView, apply_patch, record_zone_size};
 use crate::profiles::{clears_last, last_after_rename};
-use crate::startup::{ResolveRequest, StartupConflicts, plan_autostart, plan_resolve};
+use crate::startup::{
+    CloseTarget, ResolveRequest, StartupConflicts, plan_autostart, plan_close, plan_resolve,
+};
 use crate::state::AppState;
 
 /// Which Rust profile this binary was compiled with.
@@ -515,7 +517,7 @@ pub async fn resolve_conflicts<R: Runtime>(
     blocking(app, move |app, state| {
         let report = run_scan(state)?;
         let (_, visible) = known_devices(state);
-        let plan = plan_resolve(&request, &report, &visible);
+        let plan = plan_resolve(&request, &report, &visible, cc_conflicts::current_session_id());
         tracing::info!(
             programs = request.items.len(),
             actions = plan.actions.len(),
@@ -572,30 +574,20 @@ pub async fn set_dont_ask<R: Runtime>(
     .await
 }
 
-/// Ends process `pid` of finding `finding` from the last scan (the name recorded there is re-checked).
+/// The Conflicts page's End process / Stop service: closes `targets` of finding `entry` (any class). The targets
+/// are re-checked against a fresh scan; a service stop (and a process this user may not end) runs in the elevated
+/// helper behind one UAC prompt. Returns per-action results and the scan afterwards.
 #[tauri::command]
-pub async fn terminate_process<R: Runtime>(
+pub async fn close_program<R: Runtime>(
     app: AppHandle<R>,
-    pid: u32,
-    finding: String,
-) -> Result<(), String> {
-    blocking(app, move |_, state| {
-        let name = state.with_last_scan(|r| process_name(r, &finding, pid))?;
-        cc_conflicts::terminate_process(pid, &name, &finding).map_err(err_string)
-    })
-    .await
-}
-
-/// Asks Windows (UAC) to stop service or driver `name` of finding `finding` from the last scan.
-#[tauri::command]
-pub async fn stop_service<R: Runtime>(
-    app: AppHandle<R>,
-    name: String,
-    finding: String,
-) -> Result<(), String> {
-    blocking(app, move |_, state| {
-        state.with_last_scan(|r| check_service(r, &finding, &name))?;
-        cc_conflicts::request_stop_service(&name, &finding).map_err(err_string)
+    entry: String,
+    targets: Vec<CloseTarget>,
+) -> Result<ActionReport, String> {
+    blocking(app, move |app, state| {
+        let report = run_scan(state)?;
+        let actions = plan_close(&entry, &targets, &report, cc_conflicts::current_session_id())?;
+        tracing::info!(entry = %entry, actions = actions.len(), "closing a program on user request");
+        run_and_report(app, state, &report, &actions, Vec::new())
     })
     .await
 }

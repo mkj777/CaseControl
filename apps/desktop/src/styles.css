@@ -19,9 +19,17 @@
 body {
   margin: 0;
   background: var(--bg);
-  /* A desktop tool: text is selectable only in fields (see the field rule below). */
+  /* A desktop tool: text is selectable only in fields (see the field rule below) and where `.selectable` says so. */
   user-select: none;
   cursor: default;
+}
+
+/* Text people copy into a search or a bug report (ADR 0001 #32): error and fault messages, device ids, conflict
+   evidence (paths, commands, service names). Error notices, inline errors and monospace key-value values get it
+   from their primitive; pages add the class to other such text. */
+.selectable {
+  user-select: text;
+  cursor: text;
 }
 
 h1 {
