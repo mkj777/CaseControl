@@ -35,6 +35,18 @@ pub enum Category {
     Driver,
 }
 
+/// How the start dialog treats an entry (ADR 0001 #31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Class {
+    /// A full RGB suite (SignalRGB, OpenRGB, iCUE, Armoury Crate / Aura, ...). May appear in the start dialog when
+    /// it affects one of our visible devices.
+    Suite,
+    /// Any other software (vendor tools such as G HUB, Wootility, MSI Center, the LampArray service, monitors,
+    /// drivers). Listed on the Conflicts page only, never in the start dialog.
+    VendorTool,
+}
+
 /// How the software reaches the hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,7 +102,10 @@ pub struct Entry {
     pub vendor: String,
     /// Kind of software.
     pub category: Category,
-    /// Executable names (case-insensitive, `*` wildcard).
+    /// Suite or vendor tool; decides whether the entry can appear in the start dialog.
+    pub class: Class,
+    /// Executable names (case-insensitive, `*` wildcard). Also matched against the executable of autostart
+    /// entries.
     #[serde(default)]
     pub processes: Vec<String>,
     /// Win32 service names (case-insensitive, `*` wildcard, also matched against the display name).
@@ -313,6 +328,42 @@ mod tests {
     }
 
     #[test]
+    fn suites_and_vendor_tools() {
+        let catalog = Catalog::embedded();
+        for id in [
+            "signalrgb",
+            "openrgb",
+            "corsair_icue",
+            "asus_armoury_crate",
+            "asrock_polychrome",
+            "gigabyte_rgb_fusion",
+        ] {
+            assert_eq!(catalog.get(id).map(|e| e.class), Some(Class::Suite), "{id}");
+        }
+        for id in [
+            "logitech_g_hub",
+            "msi_center",
+            "windows_dynamic_lighting",
+            "fancontrol",
+            "inpoutx64",
+        ] {
+            assert_eq!(catalog.get(id).map(|e| e.class), Some(Class::VendorTool), "{id}");
+        }
+        let ghub = catalog.get("logitech_g_hub").expect("g hub");
+        assert!(ghub.processes.iter().any(|p| p == "lghub_system_tray.exe"));
+    }
+
+    #[test]
+    fn rejects_missing_class() {
+        let text = with_required(&minimal("a").replace(
+            "class = \"vendor_tool\"
+",
+            "",
+        ));
+        assert!(matches!(Catalog::parse(&text), Err(CatalogError::Parse(_))));
+    }
+
+    #[test]
     fn affects_ids_are_family_ids_or_all() {
         for entry in Catalog::embedded().entries() {
             for value in &entry.affects {
@@ -332,6 +383,7 @@ id = "{id}"
 name = "X"
 vendor = "Y"
 category = "driver"
+class = "vendor_tool"
 drivers = ["x"]
 access = ["kernel_driver"]
 affects = []

@@ -16,8 +16,11 @@ pub const DEVICE_STATE_CHANGED: &str = "device-state-changed";
 pub const DEVICES_CHANGED: &str = "devices-changed";
 /// Profiles were saved, renamed, deleted or applied; payload: `ProfileList`.
 pub const PROFILES_CHANGED: &str = "profiles-changed";
-/// A conflict scan finished; payload: `ConflictScan`.
+/// A conflict scan finished or conflict settings / autostart changed; payload: `ConflictScan`.
 pub const CONFLICTS_UPDATED: &str = "conflicts-updated";
+/// The start-up check found programs to ask about (sent once per start, after the window was shown); payload:
+/// `StartupConflicts` (non-empty). The frontend can also call `startup_conflicts`.
+pub const STARTUP_CONFLICTS: &str = "startup-conflicts";
 
 /// The Tauri event name and payload for an engine event.
 pub fn engine_event(ev: &EngineEvent) -> (&'static str, Value) {
