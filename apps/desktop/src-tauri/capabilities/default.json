@@ -23,6 +23,7 @@
     "allow-set-device-brightness",
     "allow-set-master-brightness",
     "allow-set-all-off",
+    "allow-connect-all",
     "allow-rescan",
     "allow-set-device-hidden",
     "allow-set-zone-hidden",

@@ -396,6 +396,9 @@ export const setMasterBrightness = (percent: number, persist: boolean) =>
   invoke<LightingView>('set_master_brightness', { percent, persist })
 /** All off fades every controlled device to black (and keeps it dark after a restart); `false` fades back. */
 export const setAllOff = (off: boolean) => invoke<LightingView>('set_all_off', { off })
+/** Connect all, the counterpart of Release all: takes control of every released device that is neither hidden nor
+ * faulted (its last setting, else its own mode; a device with neither stays released) and turns All off off. */
+export const connectAll = () => invoke<LightingView>('connect_all')
 export const rescan = () => invoke<DeviceList>('rescan')
 export const setDeviceHidden = (id: DeviceId, hidden: boolean) =>
   invoke<DeviceList>('set_device_hidden', { id, hidden })

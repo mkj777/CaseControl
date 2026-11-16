@@ -434,6 +434,28 @@ pub async fn set_all_off<R: Runtime>(app: AppHandle<R>, off: bool) -> Result<Lig
     .await
 }
 
+/// Connect all, the counterpart of Release all: takes control of every released device that is neither hidden nor
+/// faulted (its last setting, else the mode it shows on its own; a device with neither stays released) and turns All
+/// off off, fading up, and saves that. Returns the master brightness and All off state.
+#[tauri::command]
+pub async fn connect_all<R: Runtime>(app: AppHandle<R>) -> Result<LightingView, String> {
+    blocking(app, |_, state| {
+        let engine = state.engine()?;
+        engine.connect_all();
+        tracing::info!("connect all");
+        if state.settings().all_off {
+            state
+                .update_settings(|s| {
+                    s.all_off = false;
+                    Ok(())
+                })
+                .map_err(|err| format!("The lights were switched on, but this could not be saved: {err}"))?;
+        }
+        Ok(engine.lighting())
+    })
+    .await
+}
+
 /// Hides or unhides a device (ADR 0001 #26) and saves that. Hiding releases the device to its own hardware mode;
 /// unhiding changes nothing on the hardware. Either way the engine learns which devices brightness and All off must
 /// not take over. Returns the new device list.
