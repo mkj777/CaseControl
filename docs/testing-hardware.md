@@ -39,3 +39,12 @@ Families: `msi_mystic_light` (pass JRAINBOW1/2 LED counts as arguments if they d
 | 2026-11-16 | `nvidia_illumination_probe` | pass | 3 single-colour zones, brightness 50/60/60 |
 | 2026-11-16 | `wooting_probe` | pass | 67 LEDs, ISO layout |
 | 2026-11-16 | `msi_mystic_light_probe` | pass | 185-byte class, firmware AP/LD 0.6/1.5, JRAINBOW1/2 stored counts 20/20, sync per-LED protocol |
+| 2026-11-16 | `logitech_probe` | pass | G560 4 zones; PRO Wireless (wpid 4079, index 1) 2 zones, GetEffect readback all zero |
+| 2026-11-16 | `msi_mystic_light_demo -- 20 20` | pass | 42 LEDs; owner: all fans reacted, previous lighting (JRGB effect 25, Rainbow wave 26) returned |
+| 2026-11-16 | `wooting_demo` | inconclusive | no errors; owner saw nothing, keyboard brightness is 0 in its own profile |
+| 2026-11-16 | `logitech_demo` (G560) | inconclusive | no errors; owner saw nothing, speaker brightness is 0 in G HUB settings |
+| 2026-11-16 | `logitech_demo` (PRO Wireless) | partial | red/green shown, then `device timed out` on blue and on release; owner: mouse reacted and returned to its previous state |
+| 2026-11-16 | `nvidia_illumination_demo` | pass (software) | round trip identical, state restored identically; owner unsure whether the light changed visibly |
+| 2026-11-16 | app: start, window, tray, overview | pass | debug exe (`tauri build --debug --no-bundle`), 5 devices |
+| 2026-11-16 | app: Mystic Light whole device, live picker, single LEDs (click/drag/Ctrl) | pass | only JRAINBOW1 has visible LEDs (20, confirmed); JRGB1/2 and JRAINBOW2 are empty headers |
+| 2026-11-16 | app: Mystic Light hardware mode (Rainbow wave, speed/brightness), Release | pass | |

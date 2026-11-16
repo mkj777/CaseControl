@@ -4,9 +4,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use cc_config::{Paths, ProfileStore, Settings};
+use cc_config::{Paths, Profile, ProfileStore, Settings};
 use cc_conflicts::ScanReport;
-use cc_engine::EngineHandle;
+use cc_engine::{ApplyReport, EngineHandle};
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::prefs::engine_config;
@@ -98,7 +98,7 @@ impl AppState {
         };
         match storage.profiles.load(&name) {
             Ok(profile) => {
-                let report = engine.apply(&profile.devices);
+                let report = self.apply_visible(engine, &profile);
                 tracing::info!(
                     profile = %profile.name,
                     applied = report.applied.len(),
@@ -109,6 +109,17 @@ impl AppState {
             }
             Err(err) => tracing::warn!(profile = %name, %err, "last profile not applied"),
         }
+    }
+
+    /// Applies `profile` without its hidden devices and with its hidden zones black (ADR 0001 #26).
+    pub fn apply_visible(&self, engine: &EngineHandle, profile: &Profile) -> ApplyReport {
+        let (devices, skipped) = crate::hidden::visible_profile(&self.settings(), &profile.devices, |id| {
+            engine.device(id).map(|v| v.description)
+        });
+        if !skipped.is_empty() {
+            tracing::info!(profile = %profile.name, hidden = skipped.len(), "hidden devices skipped");
+        }
+        engine.apply(&devices)
     }
 
     /// The running engine, or why there is none.

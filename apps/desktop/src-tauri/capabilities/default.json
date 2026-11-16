@@ -1,12 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window: core defaults (incl. event listening) plus the app commands the pages call.",
+  "description": "Main window: core defaults (incl. event listening), the window controls of the custom title bar (minimise, maximise, drag) and the app commands the pages call.",
   "windows": [
     "main"
   ],
   "permissions": [
     "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-start-dragging",
     "allow-app-info",
     "allow-hide-to-tray",
     "allow-list-devices",
@@ -18,6 +21,8 @@
     "allow-release-device",
     "allow-release-all",
     "allow-rescan",
+    "allow-set-device-hidden",
+    "allow-set-zone-hidden",
     "allow-list-profiles",
     "allow-save-profile",
     "allow-apply-profile",

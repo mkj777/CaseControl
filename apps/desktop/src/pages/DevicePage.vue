@@ -1,6 +1,8 @@
 <script setup lang="ts">
 // Device view (ADR 0001 #18-#22, #25): a large preview where LEDs are selected, the mode menu, the colour picker
-// (static mode) or the mode's controls (hardware modes), zone sizes and the device actions.
+// (static mode) or the mode's controls (hardware modes), zone sizes and the device actions. The preview scales with
+// the window and the selection controls sit above it (ADR 0001 #28). Right-click a zone to hide or unhide it; hidden
+// zones stay black and are drawn (greyed) only with "Show hidden" on (ADR 0001 #26, #27).
 //
 // Every colour and mode change goes through one ordered sender, so the last user action always wins. While changes
 // are queued or in flight, the page shows its own latest intent instead of the store, so a refresh that raced an
@@ -9,6 +11,7 @@ import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import ColorPicker from '../components/ColorPicker.vue'
 import ConfirmDialog from '../components/ConfirmDialog.vue'
+import ContextMenu, { type MenuItem } from '../components/ContextMenu.vue'
 import DevicePreview from '../components/DevicePreview.vue'
 import ModeControls from '../components/ModeControls.vue'
 import {
@@ -28,18 +31,40 @@ import {
   currentHardwareMode,
   hardwareModes,
   kindLabel,
+  ledsOfZones,
   stateFor,
   statusOf,
+  visibleLeds,
+  zoneIndicesNamed,
 } from '../lib/device'
-import { EMPTY, clampSelection, paint, range, selectionColor, type Selection } from '../lib/selection'
+import { EMPTY, blackOut, clampSelection, paint, selectionColor, without, type Selection } from '../lib/selection'
 import { latestSender } from '../lib/throttle'
-import { deviceState, echoColors, findDevice, refreshDevices, replaceDevice } from '../stores/devices'
+import {
+  deviceState,
+  echoColors,
+  findDevice,
+  hiddenZoneNames,
+  hideZone,
+  isDeviceHidden,
+  refreshDevices,
+  replaceDevice,
+} from '../stores/devices'
 
 const props = defineProps<{ id: string }>()
 
 const device = computed(() => findDevice(props.id))
 const desc = computed(() => device.value?.description)
 const faulted = computed(() => device.value !== undefined && statusOf(device.value) === 'faulted')
+const deviceHidden = computed(() => isDeviceHidden(props.id))
+/** Controls are disabled: the device is faulted or hidden. */
+const locked = computed(() => faulted.value || deviceHidden.value)
+
+/** Indices of the hidden zones, their LEDs, and the LEDs a colour without a selection goes to. */
+const hiddenZones = computed(() =>
+  desc.value ? zoneIndicesNamed(desc.value, hiddenZoneNames(props.id)) : new Set<number>(),
+)
+const hiddenLeds = computed(() => (desc.value ? ledsOfZones(desc.value, hiddenZones.value) : new Set<number>()))
+const visibleScope = computed(() => new Set(desc.value ? visibleLeds(desc.value, hiddenZones.value) : []))
 const hasDirect = computed(() => desc.value?.direct_mode != null)
 const modes = computed(() => (desc.value ? hardwareModes(desc.value) : []))
 
@@ -125,16 +150,22 @@ watch(
   { immediate: true },
 )
 
+// A zone hidden while some of its LEDs were selected leaves the selection.
+watch(hiddenLeds, (off) => {
+  selection.value = without(selection.value, off)
+})
+
 const selectionText = computed(() => {
   const n = selection.value.size
-  if (n === 0) return 'Whole device'
+  if (n === 0) return hiddenZones.value.size > 0 ? 'All visible zones' : 'Whole device'
   return n === 1 ? '1 LED selected' : `${n} LEDs selected`
 })
 
 function onColor(hex: string) {
   if (!device.value) return
   pickerColor.value = hex
-  write({ kind: 'direct', colors: paint(colors.value, selection.value, hex) })
+  const painted = paint(colors.value, selection.value, hex, visibleScope.value)
+  write({ kind: 'direct', colors: blackOut(painted, hiddenLeds.value) })
 }
 
 // ---- mode menu -------------------------------------------------------------------------------------------------
@@ -179,7 +210,8 @@ function onMenu(value: string) {
   if (value === STATIC) {
     // A device that was never set has an all-black buffer; start from white so "Static" does not look like "off".
     const fresh = d.setting === null && d.colors.every((c) => c === BLACK)
-    write({ kind: 'direct', colors: fresh ? d.colors.map(() => '#FFFFFF') : [...colors.value] })
+    const start = fresh ? d.colors.map(() => '#FFFFFF') : [...colors.value]
+    write({ kind: 'direct', colors: blackOut(start, hiddenLeds.value) })
     syncPicker()
     return
   }
@@ -190,8 +222,42 @@ function onMenu(value: string) {
 // ---- zones -----------------------------------------------------------------------------------------------------
 
 const resizable = computed(() =>
-  (desc.value?.zones ?? []).map((zone, index) => ({ zone, index })).filter((z) => z.zone.resizable !== null),
+  (desc.value?.zones ?? [])
+    .map((zone, index) => ({ zone, index, hidden: hiddenZones.value.has(index) }))
+    .filter((z) => z.zone.resizable !== null && (deviceState.showHiddenZones || !z.hidden)),
 )
+
+// ---- hiding zones ----------------------------------------------------------------------------------------------
+
+const menuAt = ref<{ x: number; y: number } | null>(null)
+const menuItems = ref<MenuItem[]>([])
+
+function onZoneMenu(index: number, e: MouseEvent) {
+  const zone = desc.value?.zones[index]
+  if (!zone || busy.value) return
+  const hidden = hiddenZones.value.has(index)
+  menuItems.value = [
+    { label: hidden ? 'Unhide zone' : 'Hide zone', action: () => void setZoneHiddenTo(zone.name, !hidden) },
+  ]
+  menuAt.value = { x: e.clientX, y: e.clientY }
+}
+
+async function setZoneHiddenTo(zoneName: string, hidden: boolean) {
+  busy.value = true
+  error.value = null
+  notice.value = null
+  try {
+    // Send pending colour edits first, so the backend masks the latest buffer.
+    await sender.flush()
+    dropIntent()
+    await hideZone(props.id, zoneName, hidden)
+  } catch (e) {
+    error.value = errorText(e)
+  } finally {
+    busy.value = false
+    void refreshDevices()
+  }
+}
 
 async function onResize(zone: Zone, index: number, raw: string) {
   const r = zone.resizable
@@ -257,20 +323,32 @@ async function onSave() {
   }
 }
 
-const selectAll = () => device.value && onSelect(new Set(range(0, device.value.description.leds.length)))
+const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
 </script>
 
 <template>
-  <section class="page">
+  <section class="page wide">
     <RouterLink to="/devices" class="back">← Devices</RouterLink>
 
     <template v-if="device && desc">
       <header class="head">
         <div>
           <h1>{{ desc.info.name }}</h1>
-          <p class="muted">{{ kindLabel(desc.info.kind) }} · {{ desc.info.vendor }} · {{ STATUS_LABEL[statusOf(device)] }}</p>
+          <p class="muted">
+            {{ kindLabel(desc.info.kind) }} · {{ desc.info.vendor }} ·
+            {{ deviceHidden ? 'Hidden' : STATUS_LABEL[statusOf(device)] }}
+          </p>
         </div>
+        <label class="row toggle">
+          <input v-model="deviceState.showHiddenZones" type="checkbox" />
+          <span>Show hidden</span>
+        </label>
       </header>
+
+      <div v-if="deviceHidden" class="notice">
+        <p>This device is hidden, so CaseControl does not control it.</p>
+        <p class="muted small">To unhide it, turn on Show hidden on the Devices page and right-click the device.</p>
+      </div>
 
       <div v-if="device.status.state === 'faulted'" class="notice">
         <p>CaseControl stopped talking to this device after an error: {{ device.status.error }}</p>
@@ -279,13 +357,24 @@ const selectAll = () => device.value && onSelect(new Set(range(0, device.value.d
         </p>
       </div>
 
+      <div v-if="editingStatic" class="row selection">
+        <span>{{ selectionText }}</span>
+        <button type="button" class="link" :disabled="locked" @click="selectAll">All</button>
+        <button type="button" class="link" :disabled="locked" @click="onSelect(EMPTY)">None</button>
+        <span class="muted small">Click an LED, drag across several, Ctrl-click to add. Right-click a zone to hide it.</span>
+      </div>
+
       <div class="stage">
         <DevicePreview
+          variant="stage"
           :description="desc"
           :colors="colors"
           :selection="selection"
-          :interactive="editingStatic && !faulted"
+          :interactive="editingStatic && !locked"
+          :hidden-zones="hiddenZones"
+          :show-hidden="deviceState.showHiddenZones"
           @select="onSelect"
+          @zone-menu="onZoneMenu"
         />
       </div>
 
@@ -294,7 +383,7 @@ const selectAll = () => device.value && onSelect(new Set(range(0, device.value.d
           <span class="muted">Mode</span>
           <select
             :value="menuValue"
-            :disabled="faulted || busy"
+            :disabled="locked || busy"
             @change="onMenu(($event.target as HTMLSelectElement).value)"
           >
             <option v-if="menuValue === DEFAULT" :value="DEFAULT" disabled>Device default</option>
@@ -308,21 +397,13 @@ const selectAll = () => device.value && onSelect(new Set(range(0, device.value.d
           The device shows its own hardware mode until you pick a colour or a mode here.
         </p>
 
-        <template v-if="editingStatic">
-          <div class="row selection">
-            <span>{{ selectionText }}</span>
-            <button type="button" class="link" :disabled="faulted" @click="selectAll">All</button>
-            <button type="button" class="link" :disabled="faulted" @click="onSelect(EMPTY)">None</button>
-            <span class="muted small">Click an LED, drag across several, Ctrl-click to add.</span>
-          </div>
-          <ColorPicker :model-value="pickerColor" :disabled="faulted" @update:model-value="onColor" />
-        </template>
+        <ColorPicker v-if="editingStatic" :model-value="pickerColor" :disabled="locked" @update:model-value="onColor" />
 
         <ModeControls
           v-else-if="activeMode && activeState"
           :mode="activeMode"
           :state="activeState"
-          :disabled="faulted || busy"
+          :disabled="locked || busy"
           @update="sendMode"
         />
       </div>
@@ -334,17 +415,18 @@ const selectAll = () => device.value && onSelect(new Set(range(0, device.value.d
         <h2>LED count</h2>
         <p class="muted block">Set how many LEDs are connected to each header.</p>
         <div class="zones">
-          <label v-for="z in resizable" :key="z.index" class="zone row">
+          <label v-for="z in resizable" :key="z.index" class="zone row" :class="{ hidden: z.hidden }">
             <span class="zone-name">{{ z.zone.name }}</span>
             <input
               type="number"
               :min="z.zone.resizable?.start"
               :max="z.zone.resizable?.end"
               :value="z.zone.len"
-              :disabled="faulted || busy"
+              :disabled="locked || busy || z.hidden"
               @change="onResize(z.zone, z.index, ($event.target as HTMLInputElement).value)"
             />
             <span class="muted small">{{ z.zone.resizable?.start }} to {{ z.zone.resizable?.end }}</span>
+            <span v-if="z.hidden" class="muted small">Hidden</span>
           </label>
         </div>
       </div>
@@ -352,8 +434,8 @@ const selectAll = () => device.value && onSelect(new Set(range(0, device.value.d
       <div class="section">
         <h2>Device</h2>
         <div class="row">
-          <button type="button" :disabled="faulted || busy" @click="onRelease">Release</button>
-          <button v-if="saveable" type="button" :disabled="faulted || busy" @click="confirmSave = true">
+          <button type="button" :disabled="locked || busy" @click="onRelease">Release</button>
+          <button v-if="saveable" type="button" :disabled="locked || busy" @click="confirmSave = true">
             Save to device
           </button>
         </div>
@@ -371,6 +453,8 @@ const selectAll = () => device.value && onSelect(new Set(range(0, device.value.d
           <dd>{{ desc.leds.length }}</dd>
         </dl>
       </div>
+
+      <ContextMenu :at="menuAt" :items="menuItems" @close="menuAt = null" />
 
       <ConfirmDialog
         :open="confirmSave"
@@ -405,7 +489,17 @@ const selectAll = () => device.value && onSelect(new Set(range(0, device.value.d
 }
 
 .head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-6);
   margin-bottom: var(--space-8);
+}
+
+.toggle {
+  gap: var(--space-2);
+  color: var(--color-text-muted);
+  cursor: pointer;
 }
 
 .notice {
@@ -432,6 +526,7 @@ const selectAll = () => device.value && onSelect(new Set(range(0, device.value.d
 
 .selection {
   gap: var(--space-4);
+  margin-bottom: var(--space-4);
 }
 
 .block {
@@ -450,6 +545,10 @@ const selectAll = () => device.value && onSelect(new Set(range(0, device.value.d
 
 .zone input {
   width: 96px;
+}
+
+.zone.hidden {
+  opacity: 0.5;
 }
 
 .details {

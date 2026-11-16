@@ -28,6 +28,7 @@
   --radius: 8px;
   --radius-lg: 14px;
   --sidebar-width: 220px;
+  --titlebar-height: 40px;
   --content-width: 1040px;
 
   --font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
@@ -74,6 +75,11 @@ p {
 
 .page {
   max-width: var(--content-width);
+}
+
+/* Pages whose content scales with the window (Devices overview and device view, ADR 0001 #28). */
+.page.wide {
+  max-width: none;
 }
 
 .page-header {

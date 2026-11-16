@@ -5,16 +5,22 @@
 //! acknowledgement (up to 3 s) never stalls the window's event loop. The logic they share with the tray lives in
 //! the `*_now` functions.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use cc_config::Profile;
 use cc_conflicts::ScanOptions;
 use cc_core::{DeviceId, ModeState, Rgb};
-use cc_engine::{ApplyReport, DetectFailure, DeviceView};
+use cc_engine::{ApplyReport, DetectFailure, DeviceSetting, DeviceStatus, DeviceView, EngineHandle};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_autostart::ManagerExt as _;
 
 use crate::conflicts::{ConflictScan, KnownDevice, check_service, process_name, scan_view};
 use crate::events::{self, CONFLICTS_UPDATED, DEVICES_CHANGED, PROFILES_CHANGED};
+use crate::hidden::{
+    HiddenEntry, hidden_device_error, hidden_view, hidden_zones, is_device_hidden, mask_hidden_zones,
+    zone_write,
+};
 use crate::prefs::{SettingsPatch, SettingsView, apply_patch, record_zone_size};
 use crate::profiles::{clears_last, last_after_rename};
 use crate::state::AppState;
@@ -60,6 +66,8 @@ pub struct DeviceList {
     pub failures: Vec<DetectFailure>,
     /// Why the engine is not running, if it is not.
     pub engine_error: Option<String>,
+    /// What the user hid, by device id (also for devices that are not connected now).
+    pub hidden: BTreeMap<DeviceId, HiddenEntry>,
 }
 
 /// Outcome of releasing one device.
@@ -94,18 +102,35 @@ fn err_string(err: impl std::fmt::Display) -> String {
 
 /// The Devices page's data.
 pub fn device_list_now(state: &AppState) -> DeviceList {
+    let hidden = hidden_view(&state.settings());
     match state.engine() {
         Ok(engine) => DeviceList {
             devices: engine.devices(),
             failures: engine.failures(),
             engine_error: None,
+            hidden,
         },
         Err(_) => DeviceList {
             devices: Vec::new(),
             failures: Vec::new(),
             engine_error: state.engine_error(),
+            hidden,
         },
     }
+}
+
+/// Fails if device `id` is hidden; otherwise returns the names of its hidden zones.
+fn visible_device(state: &AppState, id: &DeviceId) -> Result<BTreeSet<String>, String> {
+    let settings = state.settings();
+    if is_device_hidden(&settings, id) {
+        return Err(hidden_device_error(id));
+    }
+    Ok(hidden_zones(&settings, id))
+}
+
+/// The engine's view of device `id`, or an error for an unknown device.
+fn describe(engine: &EngineHandle, id: &DeviceId) -> Result<DeviceView, String> {
+    engine.device(id).ok_or_else(|| format!("unknown device {id}"))
 }
 
 /// Tells the frontend and the tray that the profile list or the active profile changed.
@@ -127,7 +152,7 @@ pub fn apply_profile_now<R: Runtime>(
 ) -> Result<ApplyReport, String> {
     let engine = state.engine()?;
     let profile = state.storage()?.profiles.load(name).map_err(err_string)?;
-    let report = engine.apply(&profile.devices);
+    let report = state.apply_visible(engine, &profile);
     tracing::info!(
         profile = %profile.name,
         applied = report.applied.len(),
@@ -192,16 +217,27 @@ pub async fn list_devices<R: Runtime>(app: AppHandle<R>) -> Result<DeviceList, S
     blocking(app, |_, state| Ok(device_list_now(state))).await
 }
 
-/// Shows one colour per LED in direct mode (coalesced to the frame rate by the engine).
+/// Shows one colour per LED in direct mode (coalesced to the frame rate by the engine). Refused for a hidden
+/// device; hidden zones are sent black.
 #[tauri::command]
-pub async fn set_direct<R: Runtime>(app: AppHandle<R>, id: DeviceId, colors: Vec<Rgb>) -> Result<(), String> {
+pub async fn set_direct<R: Runtime>(
+    app: AppHandle<R>,
+    id: DeviceId,
+    mut colors: Vec<Rgb>,
+) -> Result<(), String> {
     blocking(app, move |_, state| {
-        state.engine()?.set_direct(&id, colors).map_err(err_string)
+        let engine = state.engine()?;
+        let hidden = visible_device(state, &id)?;
+        if !hidden.is_empty() {
+            mask_hidden_zones(&describe(engine, &id)?.description, &hidden, &mut colors);
+        }
+        engine.set_direct(&id, colors).map_err(err_string)
     })
     .await
 }
 
-/// Sets the colours of one zone in direct mode.
+/// Sets the colours of one zone in direct mode. Refused for a hidden device or a hidden zone; the other hidden
+/// zones are sent black.
 #[tauri::command]
 pub async fn set_zone<R: Runtime>(
     app: AppHandle<R>,
@@ -210,16 +246,27 @@ pub async fn set_zone<R: Runtime>(
     colors: Vec<Rgb>,
 ) -> Result<(), String> {
     blocking(app, move |_, state| {
-        state.engine()?.set_zone(&id, zone, colors).map_err(err_string)
+        let engine = state.engine()?;
+        let hidden = visible_device(state, &id)?;
+        if hidden.is_empty() {
+            return engine.set_zone(&id, zone, colors).map_err(err_string);
+        }
+        // The engine's buffer may still hold colours of a hidden zone (e.g. from before it was hidden), so send the
+        // whole masked buffer instead of patching one zone into it.
+        let view = describe(engine, &id)?;
+        let buffer = zone_write(&view.description, &hidden, &view.colors, zone, &colors)?;
+        engine.set_direct(&id, buffer).map_err(err_string)
     })
     .await
 }
 
-/// Switches a device to a hardware mode.
+/// Switches a device to a hardware mode. Refused for a hidden device.
 #[tauri::command]
 pub async fn set_mode<R: Runtime>(app: AppHandle<R>, id: DeviceId, state: ModeState) -> Result<(), String> {
     blocking(app, move |_, st| {
-        st.engine()?.set_mode(&id, state).map_err(err_string)
+        let engine = st.engine()?;
+        visible_device(st, &id)?;
+        engine.set_mode(&id, state).map_err(err_string)
     })
     .await
 }
@@ -235,6 +282,7 @@ pub async fn resize_zone<R: Runtime>(
 ) -> Result<DeviceView, String> {
     blocking(app, move |_, state| {
         let engine = state.engine()?;
+        visible_device(state, &id)?;
         let zone_name = engine
             .device(&id)
             .ok_or_else(|| format!("unknown device {id}"))?
@@ -261,8 +309,10 @@ pub async fn resize_zone<R: Runtime>(
 #[tauri::command]
 pub async fn save_to_hardware<R: Runtime>(app: AppHandle<R>, id: DeviceId) -> Result<(), String> {
     blocking(app, move |_, state| {
+        let engine = state.engine()?;
+        visible_device(state, &id)?;
         tracing::info!(%id, "saving to device flash on user request");
-        state.engine()?.save_to_hardware(&id).map_err(err_string)
+        engine.save_to_hardware(&id).map_err(err_string)
     })
     .await
 }
@@ -280,6 +330,76 @@ pub async fn release_device<R: Runtime>(app: AppHandle<R>, id: DeviceId) -> Resu
 #[tauri::command]
 pub async fn release_all<R: Runtime>(app: AppHandle<R>) -> Result<Vec<ReleaseResult>, String> {
     blocking(app, |_, state| release_all_now(state)).await
+}
+
+/// Hides or unhides a device (ADR 0001 #26) and saves that. Hiding releases the device to its own hardware mode;
+/// unhiding changes nothing on the hardware. Returns the new device list.
+#[tauri::command]
+pub async fn set_device_hidden<R: Runtime>(
+    app: AppHandle<R>,
+    id: DeviceId,
+    hidden: bool,
+) -> Result<DeviceList, String> {
+    blocking(app, move |_, state| {
+        state.update_settings(|s| {
+            crate::hidden::set_device_hidden(s, &id, hidden);
+            Ok(())
+        })?;
+        tracing::info!(%id, hidden, "device visibility changed");
+        if hidden
+            && let Ok(engine) = state.engine()
+            && engine
+                .device(&id)
+                .is_some_and(|v| v.status == DeviceStatus::Active)
+        {
+            engine
+                .release(&id)
+                .map_err(|err| format!("The device is hidden, but it could not be released: {err}"))?;
+        }
+        Ok(device_list_now(state))
+    })
+    .await
+}
+
+/// Hides or unhides zone `zone_name` of a device (ADR 0001 #26) and saves that. If the device shows direct colours,
+/// hiding a zone switches it off right away; unhiding leaves it off until the next colour change. Returns the new
+/// device list.
+#[tauri::command]
+pub async fn set_zone_hidden<R: Runtime>(
+    app: AppHandle<R>,
+    id: DeviceId,
+    zone_name: String,
+    hidden: bool,
+) -> Result<DeviceList, String> {
+    blocking(app, move |_, state| {
+        let engine = state.engine()?;
+        let view = describe(engine, &id)?;
+        if !view.description.zones.iter().any(|z| z.name == zone_name) {
+            return Err(format!("{} has no zone {zone_name}", view.description.info.name));
+        }
+        state.update_settings(|s| {
+            crate::hidden::set_zone_hidden(s, &id, &zone_name, hidden);
+            Ok(())
+        })?;
+        tracing::info!(%id, zone = %zone_name, hidden, "zone visibility changed");
+        let (device_hidden, zones) = {
+            let settings = state.settings();
+            (is_device_hidden(&settings, &id), hidden_zones(&settings, &id))
+        };
+        if hidden
+            && !device_hidden
+            && view.status == DeviceStatus::Active
+            && matches!(view.setting, Some(DeviceSetting::Direct { .. }))
+        {
+            let mut colors = view.colors;
+            mask_hidden_zones(&view.description, &zones, &mut colors);
+            engine
+                .set_direct(&id, colors)
+                .map_err(|err| format!("The zone is hidden, but it could not be switched off: {err}"))?;
+        }
+        Ok(device_list_now(state))
+    })
+    .await
 }
 
 /// Runs detection again; devices already under control are left alone.
@@ -515,8 +635,6 @@ mod tests {
             Bus, ColorMode, DeviceDescription, DeviceError, DeviceInfo, DeviceKind, Led, Mode, ModeCaps,
             Zone, ZoneKind,
         };
-        use cc_engine::{DeviceSetting, DeviceStatus};
-
         let red = Rgb::new(0xFF, 0, 0);
         let description = DeviceDescription {
             info: DeviceInfo {
@@ -578,8 +696,19 @@ mod tests {
                 error: DeviceError::Transport("busy".into()),
             }],
             engine_error: None,
+            hidden: BTreeMap::from([(
+                DeviceId::hid(0x1462, 0x7D75, None),
+                HiddenEntry {
+                    device: false,
+                    zones: vec!["JRAINBOW1".into()],
+                },
+            )]),
         };
         let json = serde_json::to_value(&list).expect("serializes");
+        assert_eq!(
+            json["hidden"],
+            serde_json::json!({ "hid:1462:7d75": { "device": false, "zones": ["JRAINBOW1"] } })
+        );
         let d = &json["devices"][0];
         assert_eq!(d["description"]["info"]["kind"], serde_json::json!("Motherboard"));
         assert_eq!(d["description"]["info"]["bus"], serde_json::json!("Hid"));

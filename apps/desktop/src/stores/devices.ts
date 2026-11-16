@@ -2,12 +2,29 @@
 // engine event, so hot-plug, faults and tray actions show up without a manual reload.
 
 import { reactive } from 'vue'
-import { errorText, listDevices, on, rescan, type DetectFailure, type DeviceId, type DeviceList, type DeviceView } from '../ipc'
+import {
+  errorText,
+  listDevices,
+  on,
+  rescan,
+  setDeviceHidden,
+  setZoneHidden,
+  type DetectFailure,
+  type DeviceId,
+  type DeviceList,
+  type DeviceView,
+  type HiddenEntry,
+} from '../ipc'
 
 interface DeviceState {
   devices: DeviceView[]
   failures: DetectFailure[]
   engineError: string | null
+  /** What the user hid, by device id. */
+  hidden: Record<DeviceId, HiddenEntry>
+  /** Session-only "Show hidden" toggles (ADR 0001 #27): overview (devices) and device view (zones). */
+  showHiddenDevices: boolean
+  showHiddenZones: boolean
   /** Last failure of `list_devices` itself. */
   error: string | null
   loaded: boolean
@@ -18,6 +35,9 @@ export const deviceState = reactive<DeviceState>({
   devices: [],
   failures: [],
   engineError: null,
+  hidden: {},
+  showHiddenDevices: false,
+  showHiddenZones: false,
   error: null,
   loaded: false,
   scanning: false,
@@ -27,6 +47,7 @@ function take(list: DeviceList) {
   deviceState.devices = list.devices
   deviceState.failures = list.failures
   deviceState.engineError = list.engine_error
+  deviceState.hidden = list.hidden
   deviceState.error = null
   deviceState.loaded = true
 }
@@ -70,6 +91,20 @@ export async function rescanDevices(): Promise<void> {
   } finally {
     deviceState.scanning = false
   }
+}
+
+export const isDeviceHidden = (id: DeviceId): boolean => deviceState.hidden[id]?.device ?? false
+
+export const hiddenZoneNames = (id: DeviceId): readonly string[] => deviceState.hidden[id]?.zones ?? []
+
+/** Hides or unhides a device; the backend releases a device it hides. Rejects with the error text. */
+export async function hideDevice(id: DeviceId, hidden: boolean): Promise<void> {
+  take(await setDeviceHidden(id, hidden))
+}
+
+/** Hides or unhides a zone by name; the backend switches a hidden zone off in direct colour. */
+export async function hideZone(id: DeviceId, zoneName: string, hidden: boolean): Promise<void> {
+  take(await setZoneHidden(id, zoneName, hidden))
 }
 
 export function findDevice(id: DeviceId): DeviceView | undefined {

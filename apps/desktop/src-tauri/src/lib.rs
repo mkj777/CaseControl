@@ -2,7 +2,9 @@
 //!
 //! One process (ADR 0001 #3): a window with the Devices, Profiles, Conflicts and Settings pages, a tray icon
 //! with Show / Apply profile / Release devices / Quit, close-to-tray, a single-instance guard, autostart
-//! registration, file logging, and the IPC commands and events the pages use.
+//! registration, file logging, and the IPC commands and events the pages use. The window has no Windows title bar
+//! (ADR 0001 #29); the frontend draws its own window controls. Devices and zones the user hid are kept out of
+//! control by the commands (see [`hidden`], ADR 0001 #26).
 //!
 //! On start it loads settings and profiles (`cc-config`), starts the device engine (`cc-engine`) with every
 //! compiled-in driver (`cc-drivers`) and re-applies the last applied profile. Every exit path (tray Quit, the
@@ -15,6 +17,7 @@
 pub mod commands;
 pub mod conflicts;
 pub mod events;
+pub mod hidden;
 pub mod logging;
 pub mod prefs;
 pub mod profiles;
@@ -114,6 +117,8 @@ pub fn run() {
             commands::release_device,
             commands::release_all,
             commands::rescan,
+            commands::set_device_hidden,
+            commands::set_zone_hidden,
             commands::list_profiles,
             commands::save_profile,
             commands::apply_profile,
