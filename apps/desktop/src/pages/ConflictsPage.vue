@@ -1,15 +1,18 @@
 <script setup lang="ts">
-// Conflicts: other software that may hold the same devices (ADR 0001 #12, #31). Per finding: what was found, how
-// it starts with Windows with Turn off / Re-enable, End process / Stop service behind a confirmation, and for RGB
-// suites "Don't ask again" for the start dialog. Every action that needs administrator rights runs behind at most
-// one Windows permission prompt; nothing changes without a click.
-import { computed, onMounted, ref } from 'vue'
+// Conflicts: other software that may hold the same devices (ADR 0001 #12, #31, #36). A list grouped by severity,
+// one compact row per finding: name, status, the affected devices, the actions (End process / Stop service behind a
+// confirmation, Turn off / Re-enable autostart) and a chevron that folds out the details below the row: what was
+// found, how it starts with Windows, the permission-prompt note and, for RGB suites, "Don't ask again" for the start
+// dialog. Every action that needs administrator rights runs behind at most one Windows permission prompt; nothing
+// changes without a click.
+import { computed, onMounted, reactive, ref } from 'vue'
 import {
   Button,
-  Card,
   ConfirmDialog,
   EmptyState,
+  IconButton,
   KeyValueList,
+  ListRow,
   Notice,
   PageHeader,
   StatusBadge,
@@ -59,6 +62,29 @@ onMounted(runScan)
 
 const affectsText = (f: Finding) =>
   f.affects.includes('all') ? 'All device families' : f.affects.map(familyLabel).join(', ')
+
+const affectedText = (f: Finding) =>
+  f.affected_devices.length > 0
+    ? f.affected_devices.map((d) => d.name).join(', ')
+    : 'None of your detected devices'
+
+const statusText = (f: Finding) => (f.running ? 'Running' : f.installed ? 'Installed, not running' : 'Not running')
+
+// ---- expanded rows -------------------------------------------------------------------------------------------------
+
+/** Entry ids whose details are shown; kept across scans so a row stays open after an action. */
+const expanded = reactive(new Set<string>())
+
+function toggle(f: Finding) {
+  if (expanded.has(f.entry_id)) expanded.delete(f.entry_id)
+  else expanded.add(f.entry_id)
+}
+
+const detailsId = (f: Finding) => `finding-${f.entry_id}`
+
+/** Segoe Fluent Icons ChevronDown / ChevronUp. */
+const CHEVRON_DOWN = ''
+const CHEVRON_UP = ''
 
 // ---- actions -----------------------------------------------------------------------------------------------------
 
@@ -147,74 +173,82 @@ async function onDontAsk(f: Finding, value: boolean) {
 
       <div v-for="group in groupBySeverity(scan.findings)" :key="group.severity" class="group">
         <h2>{{ SEVERITY_LABEL[group.severity] }}</h2>
-        <Card v-for="f in group.findings" :key="f.entry_id" as="article">
-          <div class="finding-head">
-            <div>
-              <div class="name">{{ f.name }}</div>
-              <div class="muted small">{{ f.vendor }}</div>
-            </div>
-            <StatusBadge :status="f.running ? 'running' : 'not-running'">
-              {{ f.running ? 'Running' : f.installed ? 'Installed, not running' : 'Not running' }}
-            </StatusBadge>
-          </div>
+        <ul>
+          <ListRow v-for="f in group.findings" :key="f.entry_id" :name="f.name">
+            <StatusBadge :status="f.running ? 'running' : 'not-running'">{{ statusText(f) }}</StatusBadge>
+            <span class="affected muted small">{{ affectedText(f) }}</span>
 
-          <p v-if="f.note" class="note">{{ f.note }}</p>
-
-          <KeyValueList class="small">
-            <dt>Affects</dt>
-            <dd>
-              <template v-if="f.affected_devices.length > 0">
-                {{ f.affected_devices.map((d) => d.name).join(', ') }}
-              </template>
-              <template v-else>None of your detected devices ({{ affectsText(f) }})</template>
-            </dd>
-            <dt>Found</dt>
-            <dd>
-              <ul>
-                <li v-for="(e, i) in f.evidence" :key="i" class="selectable">{{ evidenceText(e) }}</li>
-              </ul>
-            </dd>
-            <template v-if="f.autostart.length > 0">
-              <dt>Starts with Windows</dt>
-              <dd>
-                <ul>
-                  <li v-for="(item, i) in f.autostart" :key="i" class="selectable">
-                    {{ autostartText(item) }}
-                    <span v-if="item.command" class="command">{{ item.command }}</span>
-                  </li>
-                </ul>
-              </dd>
+            <template #actions>
+              <Button
+                v-for="t in f.close_targets"
+                :key="closeTargetKey(t)"
+                variant="danger"
+                size="sm"
+                :disabled="acting"
+                @click="pending = { finding: f, target: t }"
+              >
+                {{ closeTargetLabel(t) }}
+              </Button>
+              <Button v-if="f.autostart_on" size="sm" :disabled="acting" @click="toggleAutostart(f, false)">
+                Turn off autostart
+              </Button>
+              <Button v-if="f.can_reenable" variant="ghost" size="sm" :disabled="acting" @click="toggleAutostart(f, true)">
+                Re-enable autostart
+              </Button>
+              <IconButton
+                :label="expanded.has(f.entry_id) ? 'Hide details' : 'Show details'"
+                :glyph="expanded.has(f.entry_id) ? CHEVRON_UP : CHEVRON_DOWN"
+                :aria-expanded="expanded.has(f.entry_id)"
+                :aria-controls="detailsId(f)"
+                @click="toggle(f)"
+              />
             </template>
-          </KeyValueList>
 
-          <div v-if="f.close_targets.length > 0 || f.autostart_on || f.can_reenable" class="row">
-            <Button
-              v-for="t in f.close_targets"
-              :key="closeTargetKey(t)"
-              variant="danger"
-              :disabled="acting"
-              @click="pending = { finding: f, target: t }"
-            >
-              {{ closeTargetLabel(t) }}
-            </Button>
-            <Button v-if="f.autostart_on" :disabled="acting" @click="toggleAutostart(f, false)">
-              Turn off autostart
-            </Button>
-            <Button v-if="f.can_reenable" variant="ghost" :disabled="acting" @click="toggleAutostart(f, true)">
-              Re-enable autostart
-            </Button>
-          </div>
-          <p v-if="(f.autostart_on && needsAdmin(f, false)) || (f.can_reenable && needsAdmin(f, true))" class="muted small">
-            Changing autostart here shows a Windows permission prompt.
-          </p>
+            <template v-if="expanded.has(f.entry_id)" #details>
+              <div :id="detailsId(f)" class="details">
+                <p v-if="f.note" class="note">{{ f.note }}</p>
 
-          <Switch
-            v-if="f.class === 'suite'"
-            :model-value="f.dont_ask"
-            label="Don't ask again at start"
-            @update:model-value="(v: boolean) => onDontAsk(f, v)"
-          />
-        </Card>
+                <KeyValueList class="small">
+                  <dt>Vendor</dt>
+                  <dd>{{ f.vendor }}</dd>
+                  <dt>Device families</dt>
+                  <dd>{{ affectsText(f) }}</dd>
+                  <dt>Found</dt>
+                  <dd>
+                    <ul>
+                      <li v-for="(e, i) in f.evidence" :key="i" class="selectable">{{ evidenceText(e) }}</li>
+                    </ul>
+                  </dd>
+                  <template v-if="f.autostart.length > 0">
+                    <dt>Starts with Windows</dt>
+                    <dd>
+                      <ul>
+                        <li v-for="(item, i) in f.autostart" :key="i" class="selectable">
+                          {{ autostartText(item) }}
+                          <span v-if="item.command" class="command">{{ item.command }}</span>
+                        </li>
+                      </ul>
+                    </dd>
+                  </template>
+                </KeyValueList>
+
+                <p
+                  v-if="(f.autostart_on && needsAdmin(f, false)) || (f.can_reenable && needsAdmin(f, true))"
+                  class="muted small"
+                >
+                  Changing autostart here shows a Windows permission prompt.
+                </p>
+
+                <Switch
+                  v-if="f.class === 'suite'"
+                  :model-value="f.dont_ask"
+                  label="Don't ask again at start"
+                  @update:model-value="(v: boolean) => onDontAsk(f, v)"
+                />
+              </div>
+            </template>
+          </ListRow>
+        </ul>
       </div>
     </template>
     <p v-else-if="scanning" class="muted">Scanning…</p>
@@ -251,17 +285,15 @@ async function onDontAsk(f: Finding, value: boolean) {
   margin-top: var(--space-14);
 }
 
-.finding-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: var(--space-4);
+/* The affected devices take their own line under name and status when they do not fit beside them. */
+.affected {
+  min-width: 0;
 }
 
-.name {
-  font-size: var(--text-lg);
-  font-weight: var(--weight-strong);
-  line-height: var(--leading-tight);
+.details {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
 }
 
 .note {

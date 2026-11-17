@@ -11,6 +11,7 @@ use cc_config::Profile;
 use cc_core::{DeviceId, ModeState, Rgb};
 use cc_engine::{
     ApplyReport, DetectFailure, DeviceSetting, DeviceStatus, DeviceView, EngineHandle, LightingView,
+    ReleaseReport,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime};
@@ -23,8 +24,8 @@ use crate::conflict_actions::{
 use crate::conflicts::ConflictScan;
 use crate::events::{self, CONFLICTS_UPDATED, DEVICES_CHANGED, PROFILES_CHANGED};
 use crate::hidden::{
-    HiddenEntry, hidden_device_error, hidden_devices, hidden_view, hidden_zones, is_device_hidden,
-    mask_hidden_zones, zone_write,
+    HiddenEntry, hidden_device_error, hidden_devices, hidden_view, hidden_zone_map, hidden_zones,
+    is_device_hidden, mask_hidden_zones, zone_write,
 };
 use crate::prefs::{
     SettingsPatch, SettingsView, apply_patch, clear_brightness_overrides, record_brightness, record_zone_size,
@@ -80,15 +81,6 @@ pub struct DeviceList {
     pub hidden: BTreeMap<DeviceId, HiddenEntry>,
     /// Master brightness (from the settings while the engine is not running).
     pub lighting: LightingView,
-}
-
-/// Outcome of releasing one device.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ReleaseResult {
-    /// The device.
-    pub id: DeviceId,
-    /// Why the release failed, if it did.
-    pub error: Option<String>,
 }
 
 /// Runs `f` with the managed state on the blocking pool.
@@ -194,17 +186,15 @@ pub fn apply_profile_now<R: Runtime>(
     Ok(report)
 }
 
-/// Releases every device that is not faulted.
-pub fn release_all_now(state: &AppState) -> Result<Vec<ReleaseResult>, String> {
-    Ok(state
-        .engine()?
-        .release_all()
-        .into_iter()
-        .map(|(id, r)| ReleaseResult {
-            id,
-            error: r.err().map(|e| e.to_string()),
-        })
-        .collect())
+/// Releases every device that is not faulted; the report counts the devices that were driven and are released now.
+pub fn release_all_now(state: &AppState) -> Result<ReleaseReport, String> {
+    let report = state.engine()?.release_all();
+    tracing::info!(
+        released = report.released,
+        failed = report.failed.len(),
+        "release all"
+    );
+    Ok(report)
 }
 
 /// Returns name, version and build profile of the running app.
@@ -351,9 +341,10 @@ pub async fn release_device<R: Runtime>(app: AppHandle<R>, id: DeviceId) -> Resu
     .await
 }
 
-/// Hands every device back to its hardware mode.
+/// Hands every device back to its hardware mode. Returns how many devices were driven and are released now (for the
+/// "N devices released" toast) and the releases that failed.
 #[tauri::command]
-pub async fn release_all<R: Runtime>(app: AppHandle<R>) -> Result<Vec<ReleaseResult>, String> {
+pub async fn release_all<R: Runtime>(app: AppHandle<R>) -> Result<ReleaseReport, String> {
     blocking(app, |_, state| release_all_now(state)).await
 }
 
@@ -410,8 +401,8 @@ pub async fn set_master_brightness<R: Runtime>(
 }
 
 /// Connect all, the counterpart of Release all: takes control of every released device that is neither hidden nor
-/// faulted (its last setting, else the mode it shows on its own; a device with neither stays released). Returns the
-/// master brightness.
+/// faulted (its last setting, else the mode it shows on its own, else the default colour from the settings; ADR 0001
+/// #36). Returns the master brightness.
 #[tauri::command]
 pub async fn connect_all<R: Runtime>(app: AppHandle<R>) -> Result<LightingView, String> {
     blocking(app, |_, state| {
@@ -456,8 +447,8 @@ pub async fn set_device_hidden<R: Runtime>(
 }
 
 /// Hides or unhides zone `zone_name` of a device (ADR 0001 #26) and saves that. If the device shows direct colours,
-/// hiding a zone switches it off right away; unhiding leaves it off until the next colour change. Returns the new
-/// device list.
+/// hiding a zone switches it off right away; unhiding leaves it off until the next colour change. The engine learns
+/// the hidden zones, so a takeover with the default colour leaves them black. Returns the new device list.
 #[tauri::command]
 pub async fn set_zone_hidden<R: Runtime>(
     app: AppHandle<R>,
@@ -478,6 +469,7 @@ pub async fn set_zone_hidden<R: Runtime>(
         tracing::info!(%id, zone = %zone_name, hidden, "zone visibility changed");
         let (device_hidden, zones) = {
             let settings = state.settings();
+            engine.set_dark_zones(hidden_zone_map(&settings));
             (is_device_hidden(&settings, &id), hidden_zones(&settings, &id))
         };
         if hidden
@@ -707,8 +699,9 @@ pub async fn get_settings<R: Runtime>(app: AppHandle<R>) -> Result<SettingsView,
     .await
 }
 
-/// Applies a partial settings change, saves it, and carries it over to the running app: frame rate and detector
-/// switches go to the engine, autostart to the HKCU Run key.
+/// Applies a partial settings change, saves it, and carries it over to the running app: frame rate, detector switches
+/// and the takeover default colour go to the engine (the colour is used from the next takeover on; devices already
+/// driven keep what they show), autostart to the HKCU Run key.
 #[tauri::command]
 pub async fn set_settings<R: Runtime>(
     app: AppHandle<R>,
@@ -738,6 +731,9 @@ pub async fn set_settings<R: Runtime>(
             }
             if effects.family_enabled {
                 engine.rescan();
+            }
+            if let Some(color) = effects.default_color {
+                engine.set_default_color(color);
             }
         }
         Ok(SettingsView::of(&state.settings(), state.settings_error()))
@@ -917,14 +913,17 @@ mod tests {
     }
 
     #[test]
-    fn release_result_serializes() {
-        let r = ReleaseResult {
-            id: DeviceId::hid(0x31E3, 0x1310, None),
-            error: None,
+    fn release_report_serializes() {
+        let r = ReleaseReport {
+            released: 2,
+            failed: vec![cc_engine::ApplyFailure {
+                id: DeviceId::hid(0x31E3, 0x1310, None),
+                error: "busy".into(),
+            }],
         };
         assert_eq!(
             serde_json::to_value(r).expect("serializes"),
-            serde_json::json!({ "id": "hid:31e3:1310", "error": null })
+            serde_json::json!({ "released": 2, "failed": [{ "id": "hid:31e3:1310", "error": "busy" }] })
         );
     }
 }

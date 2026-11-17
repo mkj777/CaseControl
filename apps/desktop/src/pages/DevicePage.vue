@@ -48,7 +48,6 @@ import { BLACK } from '../lib/color'
 import {
   STATUS_LABEL,
   brightnessMode,
-  canDim,
   canSaveToHardware,
   currentHardwareMode,
   hardwareModes,
@@ -265,15 +264,7 @@ const dimMode = computed(() => {
 })
 /** In a hardware mode without a brightness parameter the device brightness has no effect. */
 const brightnessUnsupported = computed(() => dimMode.value !== null && !hasCap(dimMode.value, 'BRIGHTNESS'))
-/** A released device whose own lighting is unknown and that has no setting: there is nothing to dim. */
-const nothingToDim = computed(() => intent.value === null && device.value !== undefined && !canDim(device.value))
-const brightnessHint = computed(() =>
-  nothingToDim.value
-    ? 'Set a colour or mode first.'
-    : brightnessUnsupported.value
-      ? 'This mode has no brightness setting.'
-      : undefined,
-)
+const brightnessHint = computed(() => (brightnessUnsupported.value ? 'This mode has no brightness setting.' : undefined))
 
 async function sendBrightness(percent: number, persist: boolean) {
   await setDeviceBrightness(props.id, percent, persist)
@@ -402,7 +393,7 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
             label="Brightness"
             :value="device.brightness"
             :send="sendBrightness"
-            :disabled="locked || brightnessUnsupported || nothingToDim"
+            :disabled="locked || brightnessUnsupported"
             :hint="brightnessHint"
             @error="brightnessFailed"
           />

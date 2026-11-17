@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use cc_core::DeviceId;
+use cc_core::{DeviceId, Rgb};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::error::{ConfigError, Result};
@@ -17,6 +17,8 @@ pub const DEFAULT_FRAME_RATE: u32 = 30;
 pub const FRAME_RATE_RANGE: std::ops::RangeInclusive<u32> = 1..=60;
 /// Full brightness in percent: the default of the master and every device brightness (ADR 0001 #33).
 pub const FULL_BRIGHTNESS: u8 = 100;
+/// Default of [`Settings::default_color`]: white (ADR 0001 #36).
+pub const DEFAULT_COLOR: Rgb = Rgb::WHITE;
 /// Top-level keys of earlier versions that are no longer used: dropped on load instead of being kept in
 /// [`Settings::extra`], so they leave the file on the next save. `all_off` was the All off switch (ADR 0001 #33),
 /// removed by ADR 0001 #35.
@@ -51,6 +53,10 @@ pub struct Settings {
         skip_serializing_if = "is_full_brightness"
     )]
     pub master_brightness: u8,
+    /// The colour a takeover shows on a device that has neither a stored setting nor a hardware readback (ADR 0001
+    /// #36). Written only when it is not white; a value that is not a colour loads as white.
+    #[serde(deserialize_with = "lenient_color", skip_serializing_if = "is_white")]
+    pub default_color: Rgb,
     /// Per-device overrides, keyed by device id.
     pub devices: BTreeMap<DeviceId, DeviceOverrides>,
     /// Unknown top-level keys, preserved across a load/save cycle.
@@ -68,6 +74,7 @@ impl Default for Settings {
             conflicts: ConflictSettings::default(),
             last_profile: None,
             master_brightness: FULL_BRIGHTNESS,
+            default_color: DEFAULT_COLOR,
             devices: BTreeMap::new(),
             extra: toml::Table::new(),
         }
@@ -138,6 +145,21 @@ fn clamped_frame_rate<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<u3
 
 fn is_full_brightness(v: &u8) -> bool {
     *v == FULL_BRIGHTNESS
+}
+
+fn is_white(c: &Rgb) -> bool {
+    *c == DEFAULT_COLOR
+}
+
+fn lenient_color<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Rgb, D::Error> {
+    let raw = toml::Value::deserialize(d)?;
+    match raw.as_str().map(str::parse::<Rgb>) {
+        Some(Ok(color)) => Ok(color),
+        _ => {
+            tracing::warn!(%raw, "default_color is not a colour, using white");
+            Ok(DEFAULT_COLOR)
+        }
+    }
 }
 
 fn clamp_percent(raw: i64, key: &str) -> u8 {
@@ -563,6 +585,57 @@ brightness = -4
         assert_eq!(
             s.devices[&DeviceId::hid(0x1462, 0x7D75, None)].brightness,
             Some(0)
+        );
+    }
+
+    #[test]
+    fn default_color_round_trips_and_is_written_only_when_not_white() {
+        let (_tmp, paths) = temp_paths();
+        let mut s = full_settings();
+        s.default_color = Rgb::new(0xFF, 0x88, 0x00);
+        let text = s.to_toml().expect("serialize");
+        assert!(text.contains("default_color = \"#FF8800\""), "{text}");
+        assert_eq!(Settings::from_toml(&text).expect("parse"), s);
+        s.save(&paths).expect("save");
+        assert_eq!(Settings::load(&paths).expect("load"), s);
+
+        // Back to white: the key leaves the file again.
+        s.default_color = DEFAULT_COLOR;
+        s.save(&paths).expect("save");
+        let text = std::fs::read_to_string(paths.config_file()).expect("read");
+        assert!(!text.contains("default_color"), "{text}");
+        assert_eq!(Settings::load(&paths).expect("reload"), s);
+
+        // Short and lower-case forms parse; anything else is white, not a broken file.
+        let s = Settings::from_toml("default_color = \"#0f0\"\n").expect("parse");
+        assert_eq!(s.default_color, Rgb::new(0, 0xFF, 0));
+        for bad in ["\"nope\"", "12", "[1, 2]"] {
+            let s =
+                Settings::from_toml(&format!("autostart = true\ndefault_color = {bad}\n")).expect("parse");
+            assert!(s.autostart);
+            assert_eq!(s.default_color, DEFAULT_COLOR, "{bad}");
+        }
+    }
+
+    #[test]
+    fn old_files_load_with_white_and_stay_identical() {
+        let (_tmp, paths) = temp_paths();
+        // Every key a Settings with the white default serializes to, so nothing is appended.
+        let original = "# mine\nautostart = true\nstart_minimized = false\nframe_rate = 30\nmaster_brightness = 40\n\n\
+                        [conflicts]\ncheck_openrgb_port = false\n\n[detectors]\n\n[devices]\n";
+        std::fs::write(paths.config_file(), original).expect("write");
+        let s = Settings::load(&paths).expect("load");
+        assert_eq!(s.default_color, DEFAULT_COLOR);
+        s.save(&paths).expect("save");
+        assert_eq!(
+            std::fs::read_to_string(paths.config_file()).expect("read"),
+            original
+        );
+        assert!(
+            !Settings::default()
+                .to_toml()
+                .expect("serialize")
+                .contains("default_color")
         );
     }
 

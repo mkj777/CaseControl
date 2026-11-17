@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use cc_config::{DeviceOverrides, FRAME_RATE_RANGE, FULL_BRIGHTNESS, Profile, Settings};
-use cc_core::{DeviceId, family};
+use cc_core::{DeviceId, Rgb, family};
 use cc_engine::EngineConfig;
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,8 @@ pub struct SettingsView {
     pub check_openrgb_port: bool,
     /// Profile applied last (re-applied on start).
     pub last_profile: Option<String>,
+    /// The colour a takeover shows on a device with neither a stored setting nor a hardware readback (ADR 0001 #36).
+    pub default_color: Rgb,
     /// Why settings are not saved this session, if they are not (shown as a notice).
     pub save_error: Option<String>,
 }
@@ -45,6 +47,7 @@ impl SettingsView {
                 .collect(),
             check_openrgb_port: settings.conflicts.check_openrgb_port,
             last_profile: settings.last_profile.clone(),
+            default_color: settings.default_color,
             save_error,
         }
     }
@@ -64,6 +67,8 @@ pub struct SettingsPatch {
     pub detectors: Option<BTreeMap<String, bool>>,
     /// New OpenRGB port check flag.
     pub check_openrgb_port: Option<bool>,
+    /// New takeover default colour.
+    pub default_color: Option<Rgb>,
 }
 
 /// Which parts of the running app must follow a patch.
@@ -77,6 +82,8 @@ pub struct PatchEffects {
     pub family_enabled: bool,
     /// The autostart intent changed to this value.
     pub autostart: Option<bool>,
+    /// The takeover default colour changed to this value.
+    pub default_color: Option<Rgb>,
 }
 
 /// Applies `patch` to `settings` and reports what changed. Fails without touching `settings` if the patch names an
@@ -116,6 +123,12 @@ pub fn apply_patch(settings: &mut Settings, patch: &SettingsPatch) -> Result<Pat
     }
     if let Some(on) = patch.check_openrgb_port {
         settings.conflicts.check_openrgb_port = on;
+    }
+    if let Some(color) = patch.default_color
+        && color != settings.default_color
+    {
+        settings.default_color = color;
+        effects.default_color = Some(color);
     }
     Ok(effects)
 }
@@ -160,7 +173,8 @@ pub fn start_brightness(last_profile: Option<&Profile>, settings: &Settings) -> 
 
 /// The engine configuration for `settings`: frame rate, disabled families, remembered zone sizes, master
 /// brightness, the per-device brightness changes (the last profile's own map is laid underneath when it is
-/// re-applied), the hidden devices (never taken over by brightness changes), hot-plug and resume handling on.
+/// re-applied), the hidden devices (never taken over by brightness changes), the takeover default colour and the
+/// hidden zones it leaves black, hot-plug and resume handling on.
 pub fn engine_config(settings: &Settings) -> EngineConfig {
     EngineConfig {
         frame_rate: settings
@@ -178,6 +192,8 @@ pub fn engine_config(settings: &Settings) -> EngineConfig {
         master_brightness: settings.master_brightness.min(FULL_BRIGHTNESS),
         brightness: start_brightness(None, settings),
         excluded: crate::hidden::hidden_devices(settings),
+        default_color: settings.default_color,
+        dark_zones: crate::hidden::hidden_zone_map(settings),
     }
 }
 
@@ -208,6 +224,7 @@ mod tests {
         assert_eq!(json["frame_rate"], serde_json::json!(30));
         assert_eq!(json["detectors"]["wooting"], serde_json::json!(true));
         assert_eq!(json["last_profile"], serde_json::Value::Null);
+        assert_eq!(json["default_color"], serde_json::json!("#FFFFFF"));
         assert_eq!(json["save_error"], serde_json::json!("x"));
     }
 
@@ -225,6 +242,25 @@ mod tests {
     }
 
     #[test]
+    fn default_color_patch_changes_settings_and_reports_only_a_change() {
+        let mut s = Settings::default();
+        let p: SettingsPatch =
+            serde_json::from_value(serde_json::json!({ "default_color": "#ff8800" })).expect("parses");
+        let orange = Rgb::new(0xFF, 0x88, 0);
+        assert_eq!(p.default_color, Some(orange));
+        let fx = apply_patch(&mut s, &p).expect("valid patch");
+        assert_eq!(fx.default_color, Some(orange));
+        assert_eq!(s.default_color, orange);
+        assert_eq!(SettingsView::of(&s, None).default_color, orange);
+        assert_eq!(engine_config(&s).default_color, orange);
+        let fx = apply_patch(&mut s, &p).expect("valid patch");
+        assert_eq!(fx.default_color, None, "unchanged colour is not an effect");
+        assert!(
+            serde_json::from_value::<SettingsPatch>(serde_json::json!({ "default_color": "red" })).is_err()
+        );
+    }
+
+    #[test]
     fn patch_reports_effects() {
         let mut s = Settings::default();
         let fx = apply_patch(
@@ -235,6 +271,7 @@ mod tests {
                 detectors: Some(BTreeMap::from([(family::WOOTING.into(), false)])),
                 check_openrgb_port: Some(true),
                 start_minimized: Some(true),
+                default_color: None,
             },
         )
         .expect("valid patch");

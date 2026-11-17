@@ -3,14 +3,15 @@
 // sits at the top of the sidebar, the window controls at the top right of the page area, and that top strip drags
 // the window (double-click toggles maximise; both are handled by Tauri's drag-region script). The shell also owns
 // the start dialog for conflicting RGB programs and the hint shown while one of them still starts with Windows
-// (ADR 0001 #31).
+// (ADR 0001 #31), and the window's one toast (ADR 0001 #36).
 import { computed, onMounted } from 'vue'
 import { RouterLink, RouterView, useRoute } from 'vue-router'
 import StartupConflictsDialog from './components/StartupConflictsDialog.vue'
 import WindowControls from './components/WindowControls.vue'
-import { Button, Notice } from './components/ui'
+import { Button, Notice, Toast } from './components/ui'
 import { conflictState, hintPrograms, openDialog, startConflictWatch } from './stores/conflicts'
 import { listenForDeviceEvents, refreshDevices } from './stores/devices'
+import { dismissToast, toastState } from './stores/toast'
 
 const nav = [
   { to: '/devices', label: 'Devices' },
@@ -66,6 +67,7 @@ const hintNames = computed(() => {
         <RouterView />
       </main>
       <StartupConflictsDialog />
+      <Toast :toast="toastState.current" @dismiss="dismissToast" />
     </div>
   </div>
 </template>
@@ -87,7 +89,7 @@ const hintNames = computed(() => {
   border-right: 1px solid var(--border);
 }
 
-/* The app name sits below the window's top edge with room above it (--space-8; it does not have to line up with the
+/* The app name sits below the window's top edge with room above it (--space-4; it does not have to line up with the
    content's title strip), inset by --space-6 like the nav item text below (sidebar --space-3 + item --space-3).
    All sizes are tokens in px, so the proportions hold at every display scaling. */
 .brand {
@@ -97,7 +99,7 @@ const hintNames = computed(() => {
   min-height: var(--control-height);
   /* Reach the sidebar's edges so the whole block, including the space above, drags the window. */
   margin: 0 calc(-1 * var(--space-3));
-  padding: var(--space-8) var(--space-6) 0;
+  padding: var(--space-4) var(--space-6) 0;
   font-size: var(--text-lg);
   font-weight: var(--weight-strong);
 }

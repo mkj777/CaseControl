@@ -149,8 +149,18 @@ re-plug of the device while the app runs (hot-plug, profile re-association by `D
 - Brightness (ADR 0001 #33, #35): a device brightness per device and a master brightness (0-100 %) scale what goes
   to the device (direct colours, or a hardware mode's brightness parameter inside its range); the stored settings
   stay unscaled. Brightness 0 is the off state: black in direct colours, in a hardware mode the device's "Off" mode,
-  else black in its direct mode. A brightness change takes over a released, non-hidden device with its last
-  setting, else the mode its driver read back; the device stays `Active` at 0.
+  else black in its direct mode. The device stays `Active` at 0.
+- Takeover (ADR 0001 #33, #35, #36): brightness changes (device and master) and Connect all take over a released,
+  non-hidden, non-faulted device in this order: its stored setting, else the mode its driver read back
+  (`DeviceView::hardware`), else the default colour (`Settings::default_color`, white by default;
+  `EngineConfig::default_color`, `EngineHandle::set_default_color`) as a static colour on every LED in its direct
+  mode, scaled by brightness as usual. A device without a direct mode gets its first mode that takes a colour (per
+  LED or mode-wide), set to the default colour with speed in the middle and brightness at the top of their ranges;
+  only a device without either stays released (none of the current drivers: every MSI, Lightspeed, G560, Wooting and
+  NVIDIA description has a direct mode or a per-LED mode). Hidden zones (`EngineConfig::dark_zones`,
+  `EngineHandle::set_dark_zones`) stay black in the default colour. Changing the default colour does not repaint
+  driven devices. `release_all` returns a `ReleaseReport { released, failed }`: `released` counts the devices that
+  were driven (or being taken over) before.
 - Error policy: write errors back off exponentially (50 ms .. 5 s), after 10 consecutive failures the device is marked
   `Faulted` and shown as such; never retried in a tight loop.
 - Shutdown: `Release` on every device, join threads with timeout, then exit. Ctrl-C/WM_CLOSE/tray Quit all funnel here.
@@ -233,7 +243,12 @@ Settings: `autostart`, `start_minimized`, `frame_rate`, `detectors.<family> = tr
 - Commands: `list_devices`, `set_direct`, `set_zone`, `set_mode`, `resize_zone`, `save_to_hardware`, `release_device`,
   `release_all`, `connect_all`, `set_device_brightness`, `set_master_brightness`, `rescan`, `set_device_hidden`, `set_zone_hidden`, `list_profiles/save_profile/apply_profile/
   rename_profile/delete_profile`, `scan_conflicts`, `startup_conflicts`, `resolve_conflicts`, `close_program`,
-  `set_autostart`, `set_dont_ask`, `get_settings/set_settings`. Events: `device-added` (`DeviceInfo`),
+  `set_autostart`, `set_dont_ask`, `get_settings/set_settings`. Shapes that changed with ADR 0001 #36: `release_all`
+  returns `{ released: number, failed: { id, error }[] }` (the frontend shows "N devices released" when `released`
+  is above 0); `get_settings` / `set_settings` carry `default_color` (`"#RRGGBB"`) in the view and the patch;
+  `connect_all` and `set_device_brightness` take over with the default colour as above; `set_zone_hidden` also hands
+  the hidden zones to the engine. Hiding a driven device (`set_device_hidden`) releases it; the frontend shows
+  "Device released" when the device was Active before. Events: `device-added` (`DeviceInfo`),
   `device-removed` (`{ id }`), `device-faulted` (`{ id, error }`), `device-state-changed`
   (`{ id, active, state: ModeState | null }`: `active` is whether CaseControl drives the device now, `state` the
   hardware mode it was switched to when that was the change), `devices-changed` (no payload), `profiles-changed`,

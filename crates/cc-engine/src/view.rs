@@ -60,7 +60,8 @@ pub struct DetectFailure {
     pub error: DeviceError,
 }
 
-/// One entry of [`EngineHandle::apply`](crate::EngineHandle::apply) that failed.
+/// One device a request failed for: an entry of [`EngineHandle::apply`](crate::EngineHandle::apply), or a release of
+/// [`EngineHandle::release_all`](crate::EngineHandle::release_all).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApplyFailure {
     /// The device.
@@ -77,5 +78,14 @@ pub struct ApplyReport {
     /// Devices not present; their settings are kept as pending and applied when they appear.
     pub missing: Vec<DeviceId>,
     /// Devices that rejected the setting.
+    pub failed: Vec<ApplyFailure>,
+}
+
+/// Result of [`EngineHandle::release_all`](crate::EngineHandle::release_all).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ReleaseReport {
+    /// How many devices were driven (or being taken over) and are released now.
+    pub released: usize,
+    /// Devices whose release failed.
     pub failed: Vec<ApplyFailure>,
 }

@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1090,10 +1090,47 @@ fn release_all_and_frame_rate_and_send_sync() {
     let e = engine(30, vec![Box::new(b)]);
     e.set_frame_rate(0); // clamped to 1
     e.set_frame_rate(500); // clamped to 60
-    let results = e.release_all();
-    assert_eq!(results, vec![(id(1), Ok(())), (id(2), Ok(()))]);
+    // Neither device was driven: both get a release, but none counts as released.
+    let report = e.release_all();
+    assert_eq!(report.released, 0);
+    assert!(report.failed.is_empty());
+    assert_eq!(entries(&log, "release").len(), 2);
     assert!(e.devices().iter().all(|v| v.status == DeviceStatus::Released));
     assert!(format!("{e:?}").contains("devices: 2"));
+
+    // Both driven: both count.
+    drive(&e, &log, 1);
+    drive(&e, &log, 2);
+    assert_eq!(e.release_all().released, 2);
+    assert!(e.devices().iter().all(|v| v.status == DeviceStatus::Released));
+}
+
+#[test]
+fn release_all_counts_only_driven_devices_and_reports_failures() {
+    let log = Log::default();
+    let failing = spec(id(3), "C", DeviceKind::Light);
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            spec(id(2), "B", DeviceKind::Light),
+            failing.clone(),
+        ],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    drive(&e, &log, 1);
+    drive(&e, &log, 3);
+    failing.behavior.lock().fail_release = true;
+    let report = e.release_all();
+    assert_eq!(report.released, 1, "device 1 only: 2 was not driven, 3 failed");
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(report.failed[0].id, id(3));
+    assert!(
+        report.failed[0].error.contains("release failed"),
+        "{}",
+        report.failed[0].error
+    );
 }
 
 #[test]
@@ -1584,15 +1621,24 @@ fn brightness_adopts_the_hardware_readback_of_a_device_without_a_setting() {
         Some(DeviceSetting::Mode { state: breathing(80) })
     );
 
-    // Without a setting or a readback there is nothing to scale: the device keeps its own lighting.
+    // Without a setting or a readback the device is taken with the default colour (white), dimmed:
+    // 255 * 0.3 = 76.5 -> 77, then with master 50 %: 255 * 0.15 = 38.25 -> 38.
     e.set_device_brightness(&id(2), 30).unwrap();
+    assert!(shows(&log, 2, &[Rgb::new(77, 77, 77); 7]));
     e.set_master_brightness(50);
     // 1 + (80 - 1) * 0.25 = 20.75 -> 21
     assert!(shows_mode(&log, 1, "2 b=21"));
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(calls_since(&log, 2, 0).is_empty(), "nothing sent to device 2");
-    assert_eq!(e.device(&id(2)).unwrap().status, DeviceStatus::Released);
-    assert_eq!(e.device(&id(2)).unwrap().brightness, 30, "kept for later");
+    assert!(shows(&log, 2, &[Rgb::new(38, 38, 38); 7]));
+    assert!(wait_until(SECOND, || e.device(&id(2)).unwrap().status
+        == DeviceStatus::Active));
+    assert_eq!(
+        e.device(&id(2)).unwrap().setting,
+        Some(DeviceSetting::Direct {
+            colors: vec![Rgb::WHITE; 7]
+        }),
+        "stored unscaled"
+    );
+    assert_eq!(e.device(&id(2)).unwrap().brightness, 30);
 
     // A per-LED readback also seeds the colour buffer.
     let log = Log::default();
@@ -1660,7 +1706,7 @@ fn master_brightness_zero_takes_over_visible_devices_and_shows_off() {
 }
 
 #[test]
-fn connect_all_takes_over_released_devices_with_setting_or_readback_only() {
+fn connect_all_takes_over_released_devices_with_setting_readback_or_default_colour() {
     let log = Log::default();
     let wave_hw = with_effects(spec(id(2), "B", DeviceKind::Light), true);
     wave_hw.behavior.lock().hardware = Some(wave());
@@ -1708,10 +1754,12 @@ fn connect_all_takes_over_released_devices_with_setting_or_readback_only() {
         ev,
         EngineEvent::DeviceStateChanged { id: got, active: true, .. } if got == id(2)
     ))));
-    // Nothing to show, hidden, faulted: left alone.
+    // Neither a setting nor a readback: the default colour on every LED.
+    assert!(shows(&log, 3, &[Rgb::WHITE; 7]));
+    assert!(wait_until(SECOND, || e.device(&id(3)).unwrap().status
+        == DeviceStatus::Active));
+    // Hidden, faulted: left alone.
     std::thread::sleep(Duration::from_millis(50));
-    assert!(calls_since(&log, 3, 0).is_empty(), "nothing sent to device 3");
-    assert_eq!(e.device(&id(3)).unwrap().status, DeviceStatus::Released);
     assert!(
         calls_since(&log, 4, 0).is_empty(),
         "excluded devices are left alone"
@@ -1727,6 +1775,128 @@ fn connect_all_takes_over_released_devices_with_setting_or_readback_only() {
     e.connect_all();
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(log.lock().len(), n);
+}
+
+/// Device `n` without a direct mode: its modes are Breathing (one colour, brightness 1..=100) after Wave (none), so
+/// Breathing is the first that takes a colour.
+fn without_direct(n: u16) -> Spec {
+    let mut s = with_effects(spec(id(n), "X", DeviceKind::Light), false);
+    s.desc.direct_mode = None;
+    s.desc.modes.retain(|m| m.id >= 2);
+    s.desc.modes.sort_by_key(|m| std::cmp::Reverse(m.id));
+    s
+}
+
+#[test]
+fn takeover_prefers_setting_then_readback_then_the_configured_default_colour() {
+    let log = Log::default();
+    // 1: setting and readback; 2: readback only; 3: neither; 4: neither, hidden zone "ARGB 1"; 5: neither and no
+    // direct mode; 6: no direct mode and no mode that takes a colour.
+    let with_both = with_effects(spec(id(1), "A", DeviceKind::Light), true);
+    with_both.behavior.lock().hardware = Some(wave());
+    let readback = with_effects(spec(id(2), "B", DeviceKind::Light), true);
+    readback.behavior.lock().hardware = Some(wave());
+    let mut colourless = without_direct(6);
+    colourless.desc.modes.retain(|m| m.color_mode == ColorMode::None);
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            with_both,
+            readback,
+            spec(id(3), "C", DeviceKind::Light),
+            spec(id(4), "D", DeviceKind::Light),
+            without_direct(5),
+            colourless,
+        ],
+        &log,
+    );
+    let e = start_with(
+        EngineConfig {
+            default_color: GREEN,
+            ..cfg(60)
+        },
+        vec![Box::new(b)],
+        None,
+        fast_timing(),
+    )
+    .unwrap();
+    drive(&e, &log, 1);
+    e.release(&id(1)).unwrap();
+    e.set_default_color(BLUE);
+    e.set_dark_zones(BTreeMap::from([(id(4), BTreeSet::from(["ARGB 1".to_owned()]))]));
+
+    e.connect_all();
+    assert!(shows(&log, 1, &[RED; 7]), "the setting wins over the readback");
+    assert!(
+        shows_mode(&log, 2, "3"),
+        "the readback wins over the default colour"
+    );
+    assert!(shows(&log, 3, &[BLUE; 7]), "the latest default colour");
+    let dark = Rgb::BLACK;
+    assert!(
+        shows(&log, 4, &[BLUE, dark, dark, dark, BLUE, BLUE, BLUE]),
+        "dark zones stay black"
+    );
+    assert!(shows_mode(&log, 5, "2 b=100"), "first mode that takes a colour");
+    assert!(wait_until(SECOND, || e.device(&id(5)).unwrap().setting
+        == Some(DeviceSetting::Mode {
+            state: ModeState {
+                mode: 2,
+                speed: None,
+                brightness: Some(100),
+                direction: None,
+                colors: vec![BLUE],
+            }
+        })));
+    for n in 1..=5 {
+        assert!(wait_until(SECOND, || e.device(&id(n)).unwrap().status
+            == DeviceStatus::Active));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(calls_since(&log, 6, 0).is_empty(), "nothing it could show");
+    assert_eq!(e.device(&id(6)).unwrap().status, DeviceStatus::Released);
+
+    // A new default colour does not repaint driven devices.
+    let n = log.lock().len();
+    e.set_default_color(RED);
+    e.connect_all();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(log.lock().len(), n);
+
+    // Taken over again later, a device with a setting from the default colour keeps it.
+    e.release(&id(3)).unwrap();
+    let before = frames(&log, 3).len();
+    e.set_device_brightness(&id(3), 100).unwrap();
+    assert!(
+        wait_until(SECOND, || frames(&log, 3).len() > before),
+        "taken over again"
+    );
+    assert!(
+        shows(&log, 3, &[BLUE; 7]),
+        "its last setting, not the new default"
+    );
+}
+
+#[test]
+fn brightness_takes_a_device_with_nothing_known_over_with_the_default_colour() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        vec![spec(id(1), "A", DeviceKind::Light), without_direct(2)],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_default_color(GREEN);
+    e.set_device_brightness(&id(1), 50).unwrap();
+    // 255 * 0.5 = 127.5 -> 128
+    assert!(shows(&log, 1, &[Rgb::new(0, 128, 0); 7]));
+    e.set_device_brightness(&id(2), 50).unwrap();
+    // 1 + (100 - 1) * 0.5 = 50.5 -> 51
+    assert!(shows_mode(&log, 2, "2 b=51"));
+    for n in [1, 2] {
+        assert!(wait_until(SECOND, || e.device(&id(n)).unwrap().status
+            == DeviceStatus::Active));
+    }
 }
 
 #[test]

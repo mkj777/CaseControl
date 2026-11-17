@@ -1,7 +1,8 @@
 <script setup lang="ts">
-// Settings: startup, update rate, device detectors, the OpenRGB port check and information about this build.
-// Every change is saved and applied right away.
+// Settings: startup, update rate, the default colour of a takeover (ADR 0001 #36), device detectors, the OpenRGB port
+// check and information about this build. Every change is saved and applied right away.
 import { computed, onMounted, ref } from 'vue'
+import ColorPicker from '../components/ColorPicker.vue'
 import {
   appInfo,
   errorText,
@@ -14,12 +15,15 @@ import {
 } from '../ipc'
 import { Button, Field, KeyValueList, Notice, NumberField, PageHeader, Slider, Switch } from '../components/ui'
 import { familyLabel } from '../lib/device'
+import { latestSender } from '../lib/throttle'
 
 const settings = ref<SettingsView | null>(null)
 const info = ref<AppInfo | null>(null)
 const error = ref<string | null>(null)
 const saving = ref(false)
 const frameRate = ref(30)
+/** Shown in the picker; follows the pointer while the sends catch up. */
+const defaultColor = ref('#FFFFFF')
 /** Controls are off while saving, or for the whole session when settings cannot be saved. */
 const locked = computed(() => saving.value || settings.value?.save_error != null)
 
@@ -28,6 +32,7 @@ onMounted(async () => {
     const [s, i] = await Promise.all([getSettings(), appInfo()])
     settings.value = s
     frameRate.value = s.frame_rate
+    defaultColor.value = s.default_color
     info.value = i
   } catch (e) {
     error.value = errorText(e)
@@ -58,6 +63,29 @@ async function patch(p: SettingsPatch) {
 function onFrameRate(fps: number) {
   frameRate.value = fps
   if (settings.value && fps !== settings.value.frame_rate) void patch({ frame_rate: fps })
+}
+
+// The picker emits while dragging, so the default colour is sent through a coalescing sender instead of `patch`,
+// which would lock the controls mid-drag. Devices already driven keep their colours; the next takeover uses it.
+const colorSender = latestSender<string>(
+  async (hex) => {
+    settings.value = await setSettings({ default_color: hex })
+  },
+  async (e) => {
+    error.value = errorText(e)
+    try {
+      settings.value = await getSettings()
+      defaultColor.value = settings.value.default_color
+    } catch {
+      // keep the error shown above
+    }
+  },
+)
+
+function onDefaultColor(hex: string) {
+  error.value = null
+  defaultColor.value = hex
+  colorSender.push(hex)
 }
 
 async function onHide() {
@@ -121,6 +149,18 @@ async function onHide() {
             :disabled="locked"
             @update:model-value="onFrameRate"
           />
+        </Field>
+      </div>
+
+      <div class="group">
+        <h2>Lighting</h2>
+        <Field
+          label="Default colour"
+          hint="Devices without a saved colour or a readable mode of their own show this colour when CaseControl takes them over."
+          layout="stacked"
+          group
+        >
+          <ColorPicker :model-value="defaultColor" :disabled="locked" @update:model-value="onDefaultColor" />
         </Field>
       </div>
 
