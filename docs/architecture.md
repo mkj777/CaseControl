@@ -54,7 +54,8 @@ pub struct DeviceInfo { pub id: DeviceId, pub name: String, pub vendor: String, 
 
 pub enum ZoneKind { Single, Linear, Matrix { width: u32, height: u32, map: Vec<Option<u32>> } }
 pub struct Zone { pub name: String, pub kind: ZoneKind, pub start: usize, pub len: usize,
-                  pub resizable: Option<std::ops::RangeInclusive<usize>> }
+                  pub resizable: Option<std::ops::RangeInclusive<usize>>,
+                  #[serde(default)] pub brightness_only: bool }   // fixed colour, takes only an intensity
 pub struct Led { pub name: String }
 
 bitflags! ModeCaps { SPEED, DIRECTION_LR, DIRECTION_UD, DIRECTION_HV, BRIGHTNESS, PER_LED_COLOR,
@@ -150,11 +151,18 @@ re-plug of the device while the app runs (hot-plug, profile re-association by `D
   to the device (direct colours, or a hardware mode's brightness parameter inside its range); the stored settings
   stay unscaled. Brightness 0 is the off state: black in direct colours, in a hardware mode the device's "Off" mode,
   else black in its direct mode. The device stays `Active` at 0.
-- Takeover (ADR 0001 #33, #35, #36): brightness changes (device and master) and Connect all take over a released,
-  non-hidden, non-faulted device in this order: its stored setting, else the mode its driver read back
-  (`DeviceView::hardware`), else the default colour (`Settings::default_color`, white by default;
-  `EngineConfig::default_color`, `EngineHandle::set_default_color`) as a static colour on every LED in its direct
-  mode, scaled by brightness as usual. A device without a direct mode gets its first mode that takes a colour (per
+- Brightness-only LEDs (`Zone::brightness_only`, set by `nvidia_illumination` for SINGLE_COLOR / COLOR_FIXED zones;
+  the RTX 5080 FE is white only, ADR 0001 #37): a colour counts only as its intensity, the highest channel
+  (`Rgb::intensity`). The engine reduces direct colours (and per-LED colours of a mode) for those LEDs to white at
+  that intensity (`DeviceDescription::reduce_fixed_colors`) in the buffer, the recorded setting and the output, then
+  brightness scales them as usual. A takeover with the default colour drives them at full white, so only brightness
+  matters. The device view hides colour picker and LED selection for a device whose LEDs are all brightness-only
+  (`DeviceDescription::is_brightness_only`) and draws them as white at the output intensity.
+- Takeover (ADR 0001 #33, #35, #36, #37): brightness changes (device and master) and Take over all (`connect_all`)
+  take over a released, non-hidden, non-faulted device in this order: its stored setting, else the mode its driver
+  read back (`DeviceView::hardware`), else the default colour (`Settings::default_color`, "Fallback colour" in the
+  UI, white by default; `EngineConfig::default_color`, `EngineHandle::set_default_color`) as a static colour on
+  every LED in its direct mode, scaled by brightness as usual. A device without a direct mode gets its first mode that takes a colour (per
   LED or mode-wide), set to the default colour with speed in the middle and brightness at the top of their ranges;
   only a device without either stays released (none of the current drivers: every MSI, Lightspeed, G560, Wooting and
   NVIDIA description has a direct mode or a per-LED mode). A mode-wide colour counts only with room for at least one
@@ -274,7 +282,8 @@ Settings: `autostart`, `start_minimized`, `frame_rate`, `detectors.<family> = tr
   with Windows, the shell shows a warning notice that reopens the dialog. Vendor tools appear only on the Conflicts
   page, which offers End process / Stop service (`close_program`), Turn off / Re-enable autostart and the
   "Don't ask again" switch.
-- Frontend: Vue 3 + TS + Vite, pnpm, `@tauri-apps/api`. English UI. Pages: Devices, Profiles, Conflicts, Settings.
+- Frontend: Vue 3 + TS + Vite, pnpm, `@tauri-apps/api`. English UI. Pages: Lighting (the devices overview,
+  `/lighting`; called Devices until ADR 0001 #37), Profiles, Conflicts, Settings.
   Visual direction: dark and spacious, few large elements, device preview in focus (ADR 0001 #15); components from
   the design system (`docs/design-system.md`, ADR 0001 #30).
 

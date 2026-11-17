@@ -3,10 +3,12 @@
 // single zones as one larger swatch. Everything scales with the width of the preview (ADR 0001 #28): dots and keys
 // grow with the space up to a cap, long rows wrap. In the device view it is also where LEDs are selected
 // (ADR 0001 #22) and where a right-click on a zone opens its menu (ADR 0001 #26). Without colours (`null`: a device
-// showing its own lighting that cannot be read back) the LEDs are drawn empty, never in made-up colours.
+// showing its own lighting that cannot be read back) the LEDs are drawn empty, never in made-up colours. LEDs of
+// brightness-only zones (a fixed white, e.g. the RTX 5080 FE) are drawn white at the colour's intensity (its highest
+// channel) times `intensity`.
 import { computed, onBeforeUnmount, ref } from 'vue'
 import type { DeviceDescription, Zone } from '../ipc'
-import { BLACK } from '../lib/color'
+import { BLACK, parseHex, toHex } from '../lib/color'
 import { matrixCells } from '../lib/device'
 import { beginSweep, selectZone, sweepOver, zoneIndices, EMPTY, type Selection, type SweepMode } from '../lib/selection'
 import { Button, StatusBadge } from './ui'
@@ -25,8 +27,17 @@ const props = withDefaults(
     hiddenZones?: ReadonlySet<number>
     /** Draw hidden zones (greyed, labelled, not selectable) instead of leaving them out. */
     showHidden?: boolean
+    /** Output factor (0 to 1, device x master brightness) brightness-only LEDs are drawn at. */
+    intensity?: number
   }>(),
-  { selection: () => EMPTY, interactive: false, variant: 'tile', hiddenZones: () => new Set<number>(), showHidden: false },
+  {
+    selection: () => EMPTY,
+    interactive: false,
+    variant: 'tile',
+    hiddenZones: () => new Set<number>(),
+    showHidden: false,
+    intensity: 1,
+  },
 )
 
 const emit = defineEmits<{
@@ -57,10 +68,27 @@ const layout = computed<ZoneLayout[]>(() =>
   }),
 )
 
-/** The fill is exactly the device colour; an LED that is off is drawn as --led-off so it stays visible. */
+/** LEDs of brightness-only zones. */
+const fixedLeds = computed(() => {
+  const leds = new Set<number>()
+  for (const zone of props.description.zones) if (zone.brightness_only) zoneIndices(zone).forEach((i) => leds.add(i))
+  return leds
+})
+
+/** White at `hex`'s intensity (highest channel) times the output factor. */
+function fixedWhite(hex: string): string {
+  const c = parseHex(hex) ?? { r: 0, g: 0, b: 0 }
+  const k = Math.min(1, Math.max(0, props.intensity))
+  const v = Math.round(Math.max(c.r, c.g, c.b) * k)
+  return toHex({ r: v, g: v, b: v })
+}
+
+/** The fill is exactly the device colour (white at its intensity on brightness-only LEDs); an LED that is off is
+ * drawn as --led-off so it stays visible. */
 function color(led: number): string | undefined {
   if (props.colors === null) return undefined
-  const c = props.colors[led] ?? BLACK
+  const raw = props.colors[led] ?? BLACK
+  const c = fixedLeds.value.has(led) ? fixedWhite(raw) : raw
   return c.toUpperCase() === BLACK ? 'var(--led-off)' : c
 }
 const isSelected = (leds: number[]) => leds.length > 0 && leds.every((i) => props.selection.has(i))

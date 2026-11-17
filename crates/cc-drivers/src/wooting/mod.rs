@@ -184,6 +184,7 @@ pub fn description(id: DeviceId, info: &HidDeviceInfo) -> (DeviceDescription, Ve
             start: 0,
             len: leds.len(),
             resizable: None,
+            brightness_only: false,
         }],
         leds,
         modes: vec![Mode {

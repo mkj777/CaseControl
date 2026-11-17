@@ -84,8 +84,15 @@ fn zone_name(index: usize, kind: ZoneKind) -> String {
     format!("{index} - {ty}")
 }
 
+/// Whether NvAPI zones of type `kind` show a fixed colour and take only a brightness (`SINGLE_COLOR`, `COLOR_FIXED`).
+#[must_use]
+pub fn is_brightness_only(kind: ZoneKind) -> bool {
+    matches!(kind, ZoneKind::SingleColor | ZoneKind::ColorFixed)
+}
+
 /// The device description for a GPU whose `GetControl` reported `zones`: one single-LED zone per NvAPI zone (LED
 /// name "Entire Zone"), modes "Off" and "Direct" (brightness 0..=100, per-LED colour), as the reference exposes.
+/// `SINGLE_COLOR` and `COLOR_FIXED` zones are marked [`brightness_only`](cc_core::Zone::brightness_only).
 #[must_use]
 pub fn describe(id: DeviceId, name: &str, location: String, zones: &[ZoneKind]) -> DeviceDescription {
     DeviceDescription {
@@ -108,6 +115,7 @@ pub fn describe(id: DeviceId, name: &str, location: String, zones: &[ZoneKind]) 
                 start: i,
                 len: 1,
                 resizable: None,
+                brightness_only: is_brightness_only(kind),
             })
             .collect(),
         leds: zones
@@ -501,6 +509,9 @@ mod tests {
             ["0 - SINGLE COLOR", "1 - SINGLE COLOR", "2 - SINGLE COLOR"]
         );
         assert!(d.leds.iter().all(|l| l.name == "Entire Zone"));
+        // SINGLE COLOR zones show a fixed colour: brightness only, so the whole device is.
+        assert!(d.zones.iter().all(|z| z.brightness_only));
+        assert!(d.is_brightness_only());
         assert_eq!(d.direct_mode, Some(MODE_DIRECT));
         assert_eq!(d.mode(MODE_DIRECT).expect("direct").brightness, Some(0..=100));
         assert_eq!(d.mode(MODE_OFF).expect("off").color_mode, ColorMode::None);
@@ -522,6 +533,9 @@ mod tests {
         );
         let names: Vec<_> = d.zones.iter().map(|z| z.name.as_str()).collect();
         assert_eq!(names, ["0 - RGB", "1 - RGBW", "2 - FIXED COLOR", "3 - UNKNOWN"]);
+        let fixed: Vec<_> = d.zones.iter().map(|z| z.brightness_only).collect();
+        assert_eq!(fixed, [false, false, true, false]);
+        assert!(!d.is_brightness_only());
         assert_eq!(d.validate(), Ok(()));
     }
 

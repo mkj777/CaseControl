@@ -212,6 +212,7 @@ mod tests {
             start,
             len,
             resizable: None,
+            brightness_only: false,
         }
     }
 

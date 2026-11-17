@@ -66,6 +66,8 @@ export interface Zone {
   start: number
   len: number
   resizable: RangeInclusive | null
+  /** The zone's LEDs show a fixed colour and only take a brightness (a colour counts as its highest channel). */
+  brightness_only?: boolean
 }
 
 export interface Led {
@@ -146,9 +148,9 @@ export interface DeviceView {
   family: string
   /** Device brightness in percent (ADR 0001 #33); `colors` and `setting` are unscaled. */
   brightness: number
-  /** What a takeover (brightness, Connect all) drives the device with, as the engine picks it: what it drives it with
-   * now, else its last setting, its own lighting, or the default colour. `null` when it cannot be taken over. Does
-   * not consider whether the device is hidden. */
+  /** What a takeover (brightness, Take over all) drives the device with, as the engine picks it: what it drives it
+   * with now, else its last setting, its own lighting, or the fallback colour. `null` when it cannot be taken over.
+   * Does not consider whether the device is hidden. */
   takeover: Takeover | null
 }
 
@@ -408,8 +410,9 @@ export const setDeviceBrightness = (id: DeviceId, percent: number, persist: bool
   invoke<void>('set_device_brightness', { id, percent, persist })
 export const setMasterBrightness = (percent: number, persist: boolean) =>
   invoke<LightingView>('set_master_brightness', { percent, persist })
-/** Connect all, the counterpart of Release all: takes control of every released device that is neither hidden nor
- * faulted (its last setting, else its own mode, else the default colour from the settings). */
+/** Take over all (`connect_all`), the counterpart of Release all: takes control of every released device that is
+ * neither hidden nor faulted (its last setting, else its own mode, else the fallback colour, the `default_color`
+ * setting). */
 export const connectAll = () => invoke<LightingView>('connect_all')
 export const rescan = () => invoke<DeviceList>('rescan')
 export const setDeviceHidden = (id: DeviceId, hidden: boolean) =>
@@ -438,8 +441,8 @@ export const setDontAsk = (entry: string, dontAsk: boolean) => invoke<ConflictSc
 
 export const getSettings = () => invoke<SettingsView>('get_settings')
 export const setSettings = (patch: SettingsPatch) => invoke<SettingsView>('set_settings', { patch })
-/** The takeover default colour (ADR 0001 #36): `persist = false` while the picker is dragged (used, not saved), `true`
- * for the final value (saved). Resolves with the colour now in effect. */
+/** The takeover fallback colour, the `default_color` setting (ADR 0001 #36, #37): `persist = false` while the picker
+ * is dragged (used, not saved), `true` for the final value (saved). Resolves with the colour now in effect. */
 export const setDefaultColor = (color: Rgb, persist: boolean) =>
   invoke<Rgb>('set_default_color', { color, persist })
 

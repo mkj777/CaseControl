@@ -1,24 +1,34 @@
 <script setup lang="ts">
 // The shell: sidebar navigation and the page area. The window has no Windows title bar (ADR 0001 #29): the app name
 // sits at the top of the sidebar, the window controls at the top right of the page area, and that top strip drags
-// the window (double-click toggles maximise; both are handled by Tauri's drag-region script). The shell also owns
+// the window (double-click toggles maximise; both are handled by Tauri's drag-region script). The app icon sits left
+// of the name and the version at the bottom left of the sidebar (ADR 0001 #37). The shell also owns
 // the start dialog for conflicting RGB programs and the hint shown while one of them still starts with Windows
 // (ADR 0001 #31), and the window's one toast (ADR 0001 #36).
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { RouterLink, RouterView, useRoute } from 'vue-router'
 import StartupConflictsDialog from './components/StartupConflictsDialog.vue'
 import WindowControls from './components/WindowControls.vue'
+import icon32 from '../src-tauri/icons/32x32.png'
+import icon44 from '../src-tauri/icons/Square44x44Logo.png'
+import icon128 from '../src-tauri/icons/128x128.png'
+import { appInfo } from './ipc'
 import { Button, Notice, Toast } from './components/ui'
 import { conflictState, hintPrograms, openDialog, startConflictWatch } from './stores/conflicts'
 import { listenForDeviceEvents, refreshDevices } from './stores/devices'
 import { dismissToast, toastState } from './stores/toast'
 
 const nav = [
-  { to: '/devices', label: 'Devices' },
+  { to: '/lighting', label: 'Lighting' },
   { to: '/profiles', label: 'Profiles' },
   { to: '/conflicts', label: 'Conflicts' },
   { to: '/settings', label: 'Settings' },
 ]
+
+// The bundle's icon files; the browser picks the one that is sharp at the display scaling (32 px at 100 %, 44 px at
+// 150 % for the 24 px icon).
+const iconSrcset = `${icon32} 32w, ${icon44} 44w, ${icon128} 128w`
+const version = ref<string | null>(null)
 
 const route = useRoute()
 const isActive = (to: string) => route.path === to || route.path.startsWith(`${to}/`)
@@ -27,6 +37,12 @@ onMounted(() => {
   listenForDeviceEvents()
   void refreshDevices()
   void startConflictWatch()
+  appInfo().then(
+    (info) => (version.value = info.version),
+    () => {
+      // No version line; Settings > About shows the error.
+    },
+  )
 })
 
 const hint = computed(() => (conflictState.dialogOpen ? [] : hintPrograms()))
@@ -39,7 +55,10 @@ const hintNames = computed(() => {
 <template>
   <div class="shell">
     <aside class="sidebar">
-      <div class="brand" data-tauri-drag-region="deep">CaseControl</div>
+      <div class="brand" data-tauri-drag-region="deep">
+        <img class="brand-icon" :src="icon32" :srcset="iconSrcset" sizes="24px" alt="" draggable="false" />
+        CaseControl
+      </div>
       <nav class="nav">
         <RouterLink
           v-for="item in nav"
@@ -52,6 +71,7 @@ const hintNames = computed(() => {
           {{ item.label }}
         </RouterLink>
       </nav>
+      <p v-if="version" class="version">v{{ version }}</p>
     </aside>
     <div class="main">
       <header class="titlebar" data-tauri-drag-region="deep">
@@ -100,8 +120,24 @@ const hintNames = computed(() => {
   /* Reach the sidebar's edges so the whole block, including the space above, drags the window. */
   margin: 0 calc(-1 * var(--space-3));
   padding: var(--space-4) var(--space-6) 0;
+  gap: var(--space-2);
   font-size: var(--text-lg);
   font-weight: var(--weight-strong);
+}
+
+/* Between the name's cap height and the control height; the srcset keeps it sharp at 100 % and 150 %. */
+.brand-icon {
+  flex: none;
+  width: var(--brand-icon-size);
+  height: var(--brand-icon-size);
+}
+
+/* Bottom left, inset like the nav item text. */
+.version {
+  margin-top: auto;
+  padding: 0 var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
 }
 
 .nav {
