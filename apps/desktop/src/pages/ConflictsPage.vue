@@ -174,7 +174,13 @@ async function onDontAsk(f: Finding, value: boolean) {
       <div v-for="group in groupBySeverity(scan.findings)" :key="group.severity" class="group">
         <h2>{{ SEVERITY_LABEL[group.severity] }}</h2>
         <ul>
-          <ListRow v-for="f in group.findings" :key="f.entry_id" :name="f.name">
+          <ListRow
+            v-for="f in group.findings"
+            :key="f.entry_id"
+            :name="f.name"
+            :details-id="detailsId(f)"
+            wrap-actions
+          >
             <StatusBadge :status="f.running ? 'running' : 'not-running'">{{ statusText(f) }}</StatusBadge>
             <span class="affected muted small">{{ affectedText(f) }}</span>
 
@@ -205,47 +211,45 @@ async function onDontAsk(f: Finding, value: boolean) {
             </template>
 
             <template v-if="expanded.has(f.entry_id)" #details>
-              <div :id="detailsId(f)" class="details">
-                <p v-if="f.note" class="note">{{ f.note }}</p>
+              <p v-if="f.note" class="note">{{ f.note }}</p>
 
-                <KeyValueList class="small">
-                  <dt>Vendor</dt>
-                  <dd>{{ f.vendor }}</dd>
-                  <dt>Device families</dt>
-                  <dd>{{ affectsText(f) }}</dd>
-                  <dt>Found</dt>
+              <KeyValueList class="small">
+                <dt>Vendor</dt>
+                <dd>{{ f.vendor }}</dd>
+                <dt>Device families</dt>
+                <dd>{{ affectsText(f) }}</dd>
+                <dt>Found</dt>
+                <dd>
+                  <ul>
+                    <li v-for="(e, i) in f.evidence" :key="i" class="selectable">{{ evidenceText(e) }}</li>
+                  </ul>
+                </dd>
+                <template v-if="f.autostart.length > 0">
+                  <dt>Starts with Windows</dt>
                   <dd>
                     <ul>
-                      <li v-for="(e, i) in f.evidence" :key="i" class="selectable">{{ evidenceText(e) }}</li>
+                      <li v-for="(item, i) in f.autostart" :key="i" class="selectable">
+                        {{ autostartText(item) }}
+                        <span v-if="item.command" class="command">{{ item.command }}</span>
+                      </li>
                     </ul>
                   </dd>
-                  <template v-if="f.autostart.length > 0">
-                    <dt>Starts with Windows</dt>
-                    <dd>
-                      <ul>
-                        <li v-for="(item, i) in f.autostart" :key="i" class="selectable">
-                          {{ autostartText(item) }}
-                          <span v-if="item.command" class="command">{{ item.command }}</span>
-                        </li>
-                      </ul>
-                    </dd>
-                  </template>
-                </KeyValueList>
+                </template>
+              </KeyValueList>
 
-                <p
-                  v-if="(f.autostart_on && needsAdmin(f, false)) || (f.can_reenable && needsAdmin(f, true))"
-                  class="muted small"
-                >
-                  Changing autostart here shows a Windows permission prompt.
-                </p>
+              <p
+                v-if="(f.autostart_on && needsAdmin(f, false)) || (f.can_reenable && needsAdmin(f, true))"
+                class="muted small"
+              >
+                Changing autostart here shows a Windows permission prompt.
+              </p>
 
-                <Switch
-                  v-if="f.class === 'suite'"
-                  :model-value="f.dont_ask"
-                  label="Don't ask again at start"
-                  @update:model-value="(v: boolean) => onDontAsk(f, v)"
-                />
-              </div>
+              <Switch
+                v-if="f.class === 'suite'"
+                :model-value="f.dont_ask"
+                label="Don't ask again at start"
+                @update:model-value="(v: boolean) => onDontAsk(f, v)"
+              />
             </template>
           </ListRow>
         </ul>
@@ -288,12 +292,6 @@ async function onDontAsk(f: Finding, value: boolean) {
 /* The affected devices take their own line under name and status when they do not fit beside them. */
 .affected {
   min-width: 0;
-}
-
-.details {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
 }
 
 .note {

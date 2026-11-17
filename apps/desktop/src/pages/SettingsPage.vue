@@ -8,6 +8,7 @@ import {
   errorText,
   getSettings,
   hideToTray,
+  setDefaultColor,
   setSettings,
   type AppInfo,
   type SettingsPatch,
@@ -20,6 +21,8 @@ import { latestSender } from '../lib/throttle'
 const settings = ref<SettingsView | null>(null)
 const info = ref<AppInfo | null>(null)
 const error = ref<string | null>(null)
+/** An error of the default colour, kept apart so a colour change clears only its own error. */
+const colorError = ref<string | null>(null)
 const saving = ref(false)
 const frameRate = ref(30)
 /** Shown in the picker; follows the pointer while the sends catch up. */
@@ -65,27 +68,41 @@ function onFrameRate(fps: number) {
   if (settings.value && fps !== settings.value.frame_rate) void patch({ frame_rate: fps })
 }
 
-// The picker emits while dragging, so the default colour is sent through a coalescing sender instead of `patch`,
-// which would lock the controls mid-drag. Devices already driven keep their colours; the next takeover uses it.
-const colorSender = latestSender<string>(
-  async (hex) => {
-    settings.value = await setSettings({ default_color: hex })
-  },
-  async (e) => {
-    error.value = errorText(e)
-    try {
-      settings.value = await getSettings()
-      defaultColor.value = settings.value.default_color
-    } catch {
-      // keep the error shown above
-    }
-  },
-)
+// The default colour works like the brightness sliders: while the picker is dragged the value goes live to the engine
+// through a coalescing sender (not saved, and not through `patch`, which would lock the controls mid-drag); the final
+// value of a gesture is saved once. The responses only ever touch `default_color`, so they cannot overwrite other
+// settings with an older state. Devices already driven keep their colours; the next takeover uses it.
+async function colorFailed(e: unknown) {
+  colorError.value = errorText(e)
+  try {
+    const stored = (await getSettings()).default_color
+    defaultColor.value = stored
+    if (settings.value) settings.value.default_color = stored
+  } catch {
+    // keep the error shown above
+  }
+}
+
+const colorSender = latestSender<string>((hex) => setDefaultColor(hex, false), colorFailed)
 
 function onDefaultColor(hex: string) {
-  error.value = null
+  colorError.value = null
   defaultColor.value = hex
   colorSender.push(hex)
+}
+
+async function onDefaultColorCommit(hex: string) {
+  colorError.value = null
+  defaultColor.value = hex
+  // The final value replaces whatever live value is still queued.
+  colorSender.cancel()
+  try {
+    await colorSender.flush()
+    const stored = await setDefaultColor(hex, true)
+    if (settings.value) settings.value.default_color = stored
+  } catch (e) {
+    await colorFailed(e)
+  }
 }
 
 async function onHide() {
@@ -103,6 +120,7 @@ async function onHide() {
 
     <Notice v-if="settings?.save_error" variant="error">{{ settings.save_error }}</Notice>
     <Notice v-if="error && error !== settings?.save_error" variant="error">{{ error }}</Notice>
+    <Notice v-if="colorError && colorError !== settings?.save_error" variant="error">{{ colorError }}</Notice>
 
     <template v-if="settings">
       <div class="group">
@@ -160,7 +178,12 @@ async function onHide() {
           layout="stacked"
           group
         >
-          <ColorPicker :model-value="defaultColor" :disabled="locked" @update:model-value="onDefaultColor" />
+          <ColorPicker
+            :model-value="defaultColor"
+            :disabled="locked"
+            @update:model-value="onDefaultColor"
+            @change="onDefaultColorCommit"
+          />
         </Field>
       </div>
 

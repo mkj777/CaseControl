@@ -2,8 +2,14 @@
 // One row of a plain list (docs/design-system.md, "List row"); use inside a <ul>. Name on the left followed by the
 // default slot (a badge, a muted detail), actions on the right (slot `actions`, `sm` buttons: one secondary, the
 // rest ghost). Leave `name` out and put an inline form into the default slot for the editing state. Slot `details`
-// is shown below the row, inside its divider (an expandable row, e.g. a conflict finding); the page decides when.
-withDefaults(defineProps<{ name?: string }>(), { name: undefined })
+// is shown below the row, inside its divider (an expandable row, e.g. a conflict finding); the page decides when and
+// passes `detailsId` for the toggle's `aria-controls`. `wrapActions` lets many actions wrap, right aligned, instead of
+// pushing the row wider (a finding with several processes); by default they keep their width.
+withDefaults(defineProps<{ name?: string; detailsId?: string; wrapActions?: boolean }>(), {
+  name: undefined,
+  detailsId: undefined,
+  wrapActions: false,
+})
 </script>
 
 <template>
@@ -13,9 +19,9 @@ withDefaults(defineProps<{ name?: string }>(), { name: undefined })
         <span v-if="name" class="name">{{ name }}</span>
         <slot />
       </div>
-      <div v-if="$slots.actions" class="actions"><slot name="actions" /></div>
+      <div v-if="$slots.actions" class="actions" :class="{ wrap: wrapActions }"><slot name="actions" /></div>
     </div>
-    <div v-if="$slots.details" class="details"><slot name="details" /></div>
+    <div v-if="$slots.details" :id="detailsId" class="details"><slot name="details" /></div>
   </li>
 </template>
 
@@ -53,14 +59,18 @@ withDefaults(defineProps<{ name?: string }>(), { name: undefined })
   line-height: var(--leading-tight);
 }
 
-/* Many actions (a finding with several processes) wrap, right aligned, instead of pushing the row wider. */
 .actions {
   display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Opt-in: many actions wrap, right aligned, instead of pushing the row wider. */
+.actions.wrap {
   flex: 0 1 auto;
   flex-wrap: wrap;
   justify-content: flex-end;
-  align-items: center;
-  gap: var(--space-2);
 }
 
 .details {

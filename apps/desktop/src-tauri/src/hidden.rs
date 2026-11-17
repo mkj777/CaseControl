@@ -1,14 +1,17 @@
 //! Hidden devices and zones (ADR 0001 #26, #27).
 //!
 //! A hidden device is not controlled: it is released when hidden, every write command refuses it and profiles skip
-//! it. A hidden zone is kept black in direct colour: every direct buffer the app sends has the slices of the hidden
-//! zones set to black. Hardware modes act on the whole board and are left alone. The flags live in
+//! it. A hidden zone is kept black in direct colour: the engine knows the hidden zones as its dark zones and blacks
+//! them out in every direct output (`cc_engine::mask_hidden_zones`, the one masking implementation); the app also
+//! masks the buffers it builds, so they read right before they reach the engine. Hardware modes act on the whole
+//! board and are left alone. The flags live in
 //! `cc_config::DeviceOverrides` (by device id and zone name); this module holds the pure functions over them.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use cc_config::{DeviceSetting, Settings};
 use cc_core::{DeviceDescription, DeviceId, Rgb};
+use cc_engine::mask_hidden_zones;
 use serde::Serialize;
 
 /// What is hidden of one device, as the frontend sees it.
@@ -48,7 +51,7 @@ pub fn hidden_devices(settings: &Settings) -> HashSet<DeviceId> {
         .collect()
 }
 
-/// The hidden zones of every device that has some (the engine's dark zones: the default colour leaves them black).
+/// The hidden zones of every device that has some (the engine's dark zones: every direct output has them black).
 pub fn hidden_zone_map(settings: &Settings) -> BTreeMap<DeviceId, BTreeSet<String>> {
     settings
         .devices
@@ -118,20 +121,6 @@ pub fn hidden_zone_indices(desc: &DeviceDescription, hidden: &BTreeSet<String>) 
         .filter(|(_, z)| hidden.contains(&z.name))
         .map(|(i, _)| i)
         .collect()
-}
-
-/// Sets the LEDs of every zone of `desc` named in `hidden` to black. Slices beyond the end of `colors` are ignored,
-/// so a buffer that does not match the layout cannot panic here (the engine rejects it afterwards).
-pub fn mask_hidden_zones(desc: &DeviceDescription, hidden: &BTreeSet<String>, colors: &mut [Rgb]) {
-    if hidden.is_empty() {
-        return;
-    }
-    let len = colors.len();
-    for zone in desc.zones.iter().filter(|z| hidden.contains(&z.name)) {
-        let range = zone.range();
-        let (start, end) = (range.start.min(len), range.end.min(len));
-        colors[start..end].fill(Rgb::BLACK);
-    }
 }
 
 /// The full buffer for writing `zone_colors` into zone `zone` of `buffer`, with the hidden zones masked. Fails for a
@@ -253,33 +242,6 @@ mod tests {
 
     fn names(list: &[&str]) -> BTreeSet<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
-    }
-
-    #[test]
-    fn mask_blacks_out_hidden_zones_only() {
-        let mut colors = vec![RED; 6];
-        mask_hidden_zones(&board(), &names(&["JRGB1", "JRAINBOW2"]), &mut colors);
-        assert_eq!(colors, vec![B, RED, RED, RED, B, B]);
-    }
-
-    #[test]
-    fn mask_without_hidden_zones_changes_nothing() {
-        let mut colors = vec![RED, GREEN, RED, GREEN, RED, GREEN];
-        let before = colors.clone();
-        mask_hidden_zones(&board(), &BTreeSet::new(), &mut colors);
-        assert_eq!(colors, before);
-        mask_hidden_zones(&board(), &names(&["NOPE"]), &mut colors);
-        assert_eq!(colors, before, "unknown zone names are ignored");
-    }
-
-    #[test]
-    fn mask_tolerates_a_short_buffer() {
-        let mut colors = vec![RED; 5];
-        mask_hidden_zones(&board(), &names(&["JRAINBOW2"]), &mut colors);
-        assert_eq!(colors, vec![RED, RED, RED, RED, B]);
-        let mut empty: Vec<Rgb> = Vec::new();
-        mask_hidden_zones(&board(), &names(&["JRAINBOW2"]), &mut empty);
-        assert!(empty.is_empty());
     }
 
     #[test]

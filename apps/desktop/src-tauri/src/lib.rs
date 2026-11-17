@@ -215,6 +215,7 @@ pub fn run() {
             commands::close_program,
             commands::get_settings,
             commands::set_settings,
+            commands::set_default_color,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event

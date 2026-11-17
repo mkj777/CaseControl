@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use crate::engine::{EngineConfig, EngineHandle, start_with};
 use crate::error::EngineError;
 use crate::hotplug::HotplugSource;
-use crate::view::DeviceStatus;
+use crate::view::{DeviceStatus, Takeover};
 use crate::worker::Timing;
 
 const RED: Rgb = Rgb::new(255, 0, 0);
@@ -2227,4 +2227,150 @@ fn reassert_reopens_a_device_removed_during_sleep() {
         entries(&log, "release").is_empty(),
         "a fresh controller needs no reset"
     );
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Dark zones and takeover info (review of ADR 0001 #36)
+
+fn argb_dark(n: u16) -> BTreeMap<DeviceId, BTreeSet<String>> {
+    BTreeMap::from([(id(n), BTreeSet::from(["ARGB 1".to_owned()]))])
+}
+
+/// Red with zone "ARGB 1" (LEDs 1..4) black.
+const RED_ARGB_DARK: [Rgb; 7] = [RED, Rgb::BLACK, Rgb::BLACK, Rgb::BLACK, RED, RED, RED];
+
+#[test]
+fn dark_zone_stays_black_when_a_stored_direct_setting_is_taken_over() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+    let e = engine(60, vec![Box::new(b)]);
+    drive(&e, &log, 1);
+    e.release(&id(1)).unwrap();
+    // Hidden while released: nothing is sent now.
+    let n = frames(&log, 1).len();
+    e.set_dark_zones(argb_dark(1));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(frames(&log, 1).len(), n);
+
+    e.connect_all();
+    assert!(shows(&log, 1, &RED_ARGB_DARK), "taken over with the zone black");
+    e.release(&id(1)).unwrap();
+    e.set_device_brightness(&id(1), 100).unwrap();
+    assert!(shows(&log, 1, &RED_ARGB_DARK), "brightness takeover too");
+}
+
+#[test]
+fn dark_zone_stays_black_in_a_queued_setting_and_in_colour_edits() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+    let plugged = Arc::clone(&b.plugged);
+    let hp = FakeHotplug::default();
+    let e = start_with(
+        EngineConfig {
+            dark_zones: argb_dark(2),
+            ..cfg(60)
+        },
+        vec![Box::new(b)],
+        Some(Box::new(hp.clone())),
+        fast_timing(),
+    )
+    .unwrap();
+    let report = e.apply(&BTreeMap::from([(
+        id(2),
+        DeviceSetting::Direct { colors: vec![RED] },
+    )]));
+    assert_eq!(report.missing, [id(2)]);
+
+    plugged.lock().push(spec(id(2), "B", DeviceKind::Light));
+    hp.inject(HotplugAction::Arrived, r"\\?\hid#whatever");
+    assert!(wait_until(SECOND, || e.device(&id(2)).is_some()));
+    assert!(
+        shows(&log, 2, &RED_ARGB_DARK),
+        "the pending setting with the zone black"
+    );
+
+    e.set_direct(&id(2), vec![GREEN; 7]).unwrap();
+    let mut want = [GREEN; 7];
+    want[1..4].fill(Rgb::BLACK);
+    assert!(shows(&log, 2, &want), "a colour edit with the zone black");
+}
+
+#[test]
+fn new_dark_zones_re_send_a_device_driven_with_direct_colours() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            with_effects(spec(id(2), "B", DeviceKind::Light), false),
+        ],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    drive(&e, &log, 1);
+    e.set_mode(&id(2), static_red()).unwrap();
+    let modes_2 = modes(&log, 2).len();
+
+    let mut dark = argb_dark(1);
+    dark.extend(argb_dark(2));
+    e.set_dark_zones(dark);
+    assert!(shows(&log, 1, &RED_ARGB_DARK), "re-sent with the zone black");
+    assert_eq!(e.device(&id(1)).unwrap().colors, RED_ARGB_DARK);
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(modes(&log, 2).len(), modes_2, "a hardware mode is left alone");
+
+    // The same zones again change nothing, so nothing is sent.
+    let n = frames(&log, 1).len();
+    e.set_dark_zones(argb_dark(1));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(frames(&log, 1).len(), n);
+}
+
+#[test]
+fn device_view_reports_what_a_takeover_would_use() {
+    let log = Log::default();
+    let readback = with_effects(spec(id(2), "B", DeviceKind::Light), true);
+    readback.behavior.lock().hardware = Some(wave());
+    let mut colourless = without_direct(4);
+    colourless.desc.modes.retain(|m| m.color_mode == ColorMode::None);
+    let broken = spec(id(5), "E", DeviceKind::Light);
+    broken.behavior.lock().fatal_direct = true;
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            readback,
+            without_direct(3),
+            colourless,
+            broken,
+        ],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    let takeover = |n: u16| e.device(&id(n)).unwrap().takeover;
+    let direct = Some(Takeover { mode_id: None });
+    let mode = |m: u32| Some(Takeover { mode_id: Some(m) });
+
+    assert_eq!(takeover(1), direct, "the default colour in direct mode");
+    assert_eq!(takeover(2), mode(3), "the mode read back");
+    assert_eq!(takeover(3), mode(2), "the first mode that takes a colour");
+    assert_eq!(takeover(4), None, "nothing it could show");
+
+    // Driven: what it is driven with; released afterwards: its last setting.
+    e.set_mode(&id(1), static_red()).unwrap();
+    assert_eq!(takeover(1), mode(1));
+    e.release(&id(1)).unwrap();
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting
+        == Some(DeviceSetting::Mode { state: static_red() })));
+    assert_eq!(takeover(1), mode(1));
+    drive(&e, &log, 1);
+    assert_eq!(takeover(1), direct);
+
+    // Faulted: cannot be taken over.
+    e.set_direct(&id(5), vec![RED; 7]).unwrap();
+    assert!(wait_until(SECOND, || matches!(
+        e.device(&id(5)).unwrap().status,
+        DeviceStatus::Faulted { .. }
+    )));
+    assert_eq!(takeover(5), None);
 }

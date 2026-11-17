@@ -111,38 +111,18 @@ export function lightingLabel(view: DeviceView): string | null {
 }
 
 /**
- * The mode a takeover with the default colour uses on a device without a direct mode (ADR 0001 #36): its first
- * mode that takes a colour (per LED or mode-wide), as the engine picks it. `null` when the device has a direct mode
- * (the default colour then goes out as direct colours) or no such mode.
- */
-export function defaultColorMode(desc: DeviceDescription): Mode | null {
-  if (desc.direct_mode !== null) return null
-  return (
-    desc.modes.find(
-      (m) => m.color_mode === 'PerLed' || (m.color_mode === 'ModeSpecific' && m.colors !== null && bounds(m.colors)[1] >= 1),
-    ) ?? null
-  )
-}
-
-/**
- * The mode a brightness change acts on: the hardware mode the device is driven with, or for a released device the
- * mode it would be taken over with (its last setting, else its own lighting, else the default colour's mode).
- * `null` for direct colours, which are always dimmed.
+ * The mode a brightness change acts on: the hardware mode the engine reports for a takeover (the one the device is
+ * driven with, or for a released device the one it would be taken over with). `null` for direct colours, which are
+ * always dimmed, and for a device that cannot be taken over.
  */
 export function brightnessMode(view: DeviceView): Mode | null {
-  const s = view.setting
-  if (!s && !view.hardware) return defaultColorMode(view.description)
-  const id = s?.kind === 'mode' ? s.state.mode : s ? null : (view.hardware?.mode ?? null)
+  const id = view.takeover?.mode_id ?? null
   if (id === null || id === view.description.direct_mode) return null
   return view.description.modes.find((m) => m.id === id) ?? null
 }
 
-/** Whether a takeover (Connect all, brightness) can drive the device: with its setting, its own lighting as read
- * back, or the default colour, which needs a direct mode or a mode that takes a colour. */
-export function canTakeOver(view: DeviceView): boolean {
-  const d = view.description
-  return view.setting !== null || view.hardware !== null || d.direct_mode !== null || defaultColorMode(d) !== null
-}
+/** Whether a takeover (Connect all, brightness) can drive the device, as the engine reports it. */
+export const canTakeOver = (view: DeviceView): boolean => view.takeover !== null
 
 /** Whether any mode can be saved to the device's flash on request. */
 export function canSaveToHardware(desc: DeviceDescription): boolean {
