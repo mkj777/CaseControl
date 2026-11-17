@@ -148,12 +148,10 @@ export interface DeviceView {
   brightness: number
 }
 
-/** Master brightness and All off (ADR 0001 #33). */
+/** Master brightness (ADR 0001 #33). */
 export interface LightingView {
   /** Percent, multiplied into every device. */
   master_brightness: number
-  /** Every controlled device is faded to black and kept dark (also while the fade still runs). */
-  all_off: boolean
 }
 
 export interface DetectFailure {
@@ -339,7 +337,7 @@ export interface DeviceList {
   engine_error: string | null
   /** Devices with something hidden, by id; devices with nothing hidden are absent. */
   hidden: Record<DeviceId, HiddenEntry>
-  /** Master brightness and All off (the saved values while the engine is not running). */
+  /** Master brightness (the saved value while the engine is not running). */
   lighting: LightingView
 }
 
@@ -394,10 +392,8 @@ export const setDeviceBrightness = (id: DeviceId, percent: number, persist: bool
   invoke<void>('set_device_brightness', { id, percent, persist })
 export const setMasterBrightness = (percent: number, persist: boolean) =>
   invoke<LightingView>('set_master_brightness', { percent, persist })
-/** All off fades every controlled device to black (and keeps it dark after a restart); `false` fades back. */
-export const setAllOff = (off: boolean) => invoke<LightingView>('set_all_off', { off })
 /** Connect all, the counterpart of Release all: takes control of every released device that is neither hidden nor
- * faulted (its last setting, else its own mode; a device with neither stays released) and turns All off off. */
+ * faulted (its last setting, else its own mode; a device with neither stays released). */
 export const connectAll = () => invoke<LightingView>('connect_all')
 export const rescan = () => invoke<DeviceList>('rescan')
 export const setDeviceHidden = (id: DeviceId, hidden: boolean) =>

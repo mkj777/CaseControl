@@ -159,8 +159,8 @@ pub fn start_brightness(last_profile: Option<&Profile>, settings: &Settings) -> 
 }
 
 /// The engine configuration for `settings`: frame rate, disabled families, remembered zone sizes, master
-/// brightness, All off, the per-device brightness changes (the last profile's own map is laid underneath when it is
-/// re-applied), the hidden devices (never taken over by brightness or All off), hot-plug and resume handling on.
+/// brightness, the per-device brightness changes (the last profile's own map is laid underneath when it is
+/// re-applied), the hidden devices (never taken over by brightness changes), hot-plug and resume handling on.
 pub fn engine_config(settings: &Settings) -> EngineConfig {
     EngineConfig {
         frame_rate: settings
@@ -177,7 +177,6 @@ pub fn engine_config(settings: &Settings) -> EngineConfig {
         resume: true,
         master_brightness: settings.master_brightness.min(FULL_BRIGHTNESS),
         brightness: start_brightness(None, settings),
-        all_off: settings.all_off,
         excluded: crate::hidden::hidden_devices(settings),
     }
 }
@@ -310,15 +309,12 @@ mod tests {
         assert_eq!(cfg.zone_sizes.len(), 1, "devices without zone sizes are left out");
         assert_eq!(cfg.zone_sizes[&msi()]["JRAINBOW1"], 60);
         assert_eq!(cfg.master_brightness, 100);
-        assert!(!cfg.all_off);
         assert!(cfg.brightness.is_empty());
 
         s.master_brightness = 40;
-        s.all_off = true;
         record_brightness(&mut s, &msi(), 70);
         let cfg = engine_config(&s);
         assert_eq!(cfg.master_brightness, 40);
-        assert!(cfg.all_off);
         assert_eq!(cfg.brightness, BTreeMap::from([(msi(), 70)]));
     }
 

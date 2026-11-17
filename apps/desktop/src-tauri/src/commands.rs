@@ -78,7 +78,7 @@ pub struct DeviceList {
     pub engine_error: Option<String>,
     /// What the user hid, by device id (also for devices that are not connected now).
     pub hidden: BTreeMap<DeviceId, HiddenEntry>,
-    /// Master brightness and All off (from the settings while the engine is not running).
+    /// Master brightness (from the settings while the engine is not running).
     pub lighting: LightingView,
 }
 
@@ -120,7 +120,6 @@ pub fn device_list_now(state: &AppState) -> DeviceList {
             hidden_view(&settings),
             LightingView {
                 master_brightness: settings.master_brightness,
-                all_off: settings.all_off,
             },
         )
     };
@@ -386,7 +385,7 @@ pub async fn set_device_brightness<R: Runtime>(
 }
 
 /// Sets the master brightness in percent, multiplied into every device (ADR 0001 #33). `persist` as for
-/// [`set_device_brightness`]. Returns the master brightness and All off state.
+/// [`set_device_brightness`]. Returns the master brightness.
 #[tauri::command]
 pub async fn set_master_brightness<R: Runtime>(
     app: AppHandle<R>,
@@ -410,54 +409,22 @@ pub async fn set_master_brightness<R: Runtime>(
     .await
 }
 
-/// All off (`true`) fades every controlled device to black and keeps it dark, also after a restart; All on fades
-/// back (ADR 0001 #33). Returns the master brightness and All off state.
-#[tauri::command]
-pub async fn set_all_off<R: Runtime>(app: AppHandle<R>, off: bool) -> Result<LightingView, String> {
-    blocking(app, move |_, state| {
-        let engine = state.engine()?;
-        engine.set_all_off(off);
-        tracing::info!(off, "all off changed");
-        state
-            .update_settings(|s| {
-                s.all_off = off;
-                Ok(())
-            })
-            .map_err(|err| {
-                format!(
-                    "The lights were switched {}, but this could not be saved: {err}",
-                    if off { "off" } else { "on" }
-                )
-            })?;
-        Ok(engine.lighting())
-    })
-    .await
-}
-
 /// Connect all, the counterpart of Release all: takes control of every released device that is neither hidden nor
-/// faulted (its last setting, else the mode it shows on its own; a device with neither stays released) and turns All
-/// off off, fading up, and saves that. Returns the master brightness and All off state.
+/// faulted (its last setting, else the mode it shows on its own; a device with neither stays released). Returns the
+/// master brightness.
 #[tauri::command]
 pub async fn connect_all<R: Runtime>(app: AppHandle<R>) -> Result<LightingView, String> {
     blocking(app, |_, state| {
         let engine = state.engine()?;
         engine.connect_all();
         tracing::info!("connect all");
-        if state.settings().all_off {
-            state
-                .update_settings(|s| {
-                    s.all_off = false;
-                    Ok(())
-                })
-                .map_err(|err| format!("The lights were switched on, but this could not be saved: {err}"))?;
-        }
         Ok(engine.lighting())
     })
     .await
 }
 
 /// Hides or unhides a device (ADR 0001 #26) and saves that. Hiding releases the device to its own hardware mode;
-/// unhiding changes nothing on the hardware. Either way the engine learns which devices brightness and All off must
+/// unhiding changes nothing on the hardware. Either way the engine learns which devices brightness changes must
 /// not take over. Returns the new device list.
 #[tauri::command]
 pub async fn set_device_hidden<R: Runtime>(
@@ -898,7 +865,6 @@ mod tests {
             )]),
             lighting: LightingView {
                 master_brightness: 80,
-                all_off: true,
             },
         };
         let json = serde_json::to_value(&list).expect("serializes");
@@ -939,10 +905,7 @@ mod tests {
         );
         assert_eq!(d["family"], serde_json::json!("msi_mystic_light"));
         assert_eq!(d["brightness"], serde_json::json!(55));
-        assert_eq!(
-            json["lighting"],
-            serde_json::json!({ "master_brightness": 80, "all_off": true })
-        );
+        assert_eq!(json["lighting"], serde_json::json!({ "master_brightness": 80 }));
         assert_eq!(
             json["failures"][0]["error"],
             serde_json::json!({ "Transport": "busy" })

@@ -8,10 +8,10 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum DeviceStatus {
-    /// Under software control: CaseControl is outputting a setting (or holding it dark for All off).
+    /// Under software control: CaseControl is outputting a setting (also at brightness 0).
     Active,
     /// Showing its own lighting: never taken since it was detected, or handed back. Any lighting control (colours,
-    /// mode, brightness, All off) takes control again.
+    /// mode, brightness) takes control again.
     Released,
     /// Taken out of service; the engine no longer talks to it until it is re-plugged or rescanned after removal.
     Faulted {
@@ -33,8 +33,8 @@ pub struct DeviceView {
     /// can read them (see `hardware`), else black.
     pub colors: Vec<Rgb>,
     /// What the device shows on its own (its hardware mode), as its driver read it, if it can (see
-    /// `cc_core::Controller::hardware_mode`). This is what a released device shows, and what a brightness or All off
-    /// change adopts as the setting of a device that has none.
+    /// `cc_core::Controller::hardware_mode`). This is what a released device shows, and what a brightness change
+    /// adopts as the setting of a device that has none.
     pub hardware: Option<ModeState>,
     /// Family id of the backend that detected the device (`Backend::name()`).
     pub family: String,
@@ -42,13 +42,11 @@ pub struct DeviceView {
     pub brightness: u8,
 }
 
-/// Master brightness and the All off state (ADR 0001 #33).
+/// Master brightness (ADR 0001 #33).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LightingView {
     /// Master brightness in percent.
     pub master_brightness: u8,
-    /// All off is on (also while the fade to black is still running).
-    pub all_off: bool,
 }
 
 /// One device a backend found but could not bring up.

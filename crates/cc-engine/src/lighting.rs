@@ -1,18 +1,17 @@
-//! Brightness and All off (ADR 0001 #33): what a device is actually sent for what the engine wants it to show.
+//! Brightness (ADR 0001 #33, #35): what a device is actually sent for what the engine wants it to show.
 //!
 //! The engine keeps every setting unscaled (colour buffer, [`DeviceSetting`], `current_settings()`), so turning a
 //! brightness back up restores the colours exactly. Only the output that goes to the device is scaled:
 //!
-//! - **Direct colours:** every channel is multiplied by device brightness x master brightness x fade factor and
-//!   rounded. At a factor of 0 the device is sent black.
+//! - **Direct colours:** every channel is multiplied by device brightness x master brightness and rounded. At a
+//!   factor of 0 the device is sent black.
 //! - **Hardware modes with a brightness parameter** ([`ModeCaps::BRIGHTNESS`]): the same factor scales the mode's own
 //!   brightness inside its range, from the range minimum (factor 0) up to the stored brightness (factor 1; the range
 //!   maximum when the state has none). A mode that declares the capability without a range is taken as `0..=100`.
 //! - **Hardware modes without one** are sent unchanged; device and master brightness do not affect them.
-//! - **Off** (fade factor 0) in a hardware mode: the device's mode named "Off" if it has one that takes no colours,
-//!   else black in its direct mode; a device with neither keeps its mode at the lowest brightness.
-//! - **Held dark** ([`Want::Off`]): a device All off took over without anything to show (no setting and no hardware
-//!   readback) is sent the off output at every level; All on hands it back to its own lighting.
+//! - **Off** (a factor of 0, i.e. device or master brightness 0; ADR 0001 #35) in a hardware mode: the device's mode
+//!   named "Off" if it has one that takes no colours, else black in its direct mode; a device with neither keeps its
+//!   mode at the lowest brightness.
 
 use std::ops::RangeInclusive;
 
@@ -27,11 +26,9 @@ pub(crate) const FULL: u8 = 100;
 pub(crate) enum Want {
     /// The colour buffer in direct mode.
     Direct,
-    /// A hardware mode as the user set it (or as the device showed it on its own when a brightness or All off
-    /// change took it over).
+    /// A hardware mode as the user set it (or as the device showed it on its own when a brightness change took it
+    /// over).
     Mode(ModeState),
-    /// Dark, without a setting: All off took the device over while there was nothing known to show.
-    Off,
 }
 
 /// What goes to the device.
@@ -46,22 +43,19 @@ pub(crate) enum Out {
 /// One output for a device: what is sent (`out`) and the unscaled setting the engine records once it was sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Output {
-    /// The unscaled setting (recorded as the device's setting after the write); `None` for [`Want::Off`], which
-    /// stands for no setting.
-    pub stored: Option<DeviceSetting>,
+    /// The unscaled setting (recorded as the device's setting after the write).
+    pub stored: DeviceSetting,
     /// What the device is sent.
     pub out: Out,
 }
 
-/// The three brightness levels that multiply into one device's output.
+/// The two brightness levels that multiply into one device's output.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Levels {
     /// Device brightness, percent.
     pub device: u8,
     /// Master brightness, percent.
     pub master: u8,
-    /// Fade factor, 0 (off) to 1 (on).
-    pub fade: f64,
 }
 
 impl Levels {
@@ -70,13 +64,12 @@ impl Levels {
     pub(crate) const FULL: Levels = Levels {
         device: FULL,
         master: FULL,
-        fade: 1.0,
     };
 
-    /// The product of the three levels, 0 to 1.
+    /// The product of the levels, 0 to 1.
     pub(crate) fn factor(&self) -> f64 {
         let pct = |v: u8| f64::from(v.min(FULL)) / f64::from(FULL);
-        pct(self.device) * pct(self.master) * self.fade.clamp(0.0, 1.0)
+        pct(self.device) * pct(self.master)
     }
 }
 
@@ -134,33 +127,23 @@ pub(crate) fn off_output(desc: &DeviceDescription) -> Option<Out> {
         .map(|_| Out::Direct(vec![Rgb::BLACK; desc.led_count()]))
 }
 
-/// What device `desc` is sent for `want` (direct colours from `colors`) at `levels`. `None` only for [`Want::Off`] on
-/// a device that has neither an "Off" mode nor a direct mode (the engine never holds such a device dark).
-pub(crate) fn output(
-    desc: &DeviceDescription,
-    want: &Want,
-    colors: &[Rgb],
-    levels: Levels,
-) -> Option<Output> {
+/// What device `desc` is sent for `want` (direct colours from `colors`) at `levels`.
+pub(crate) fn output(desc: &DeviceDescription, want: &Want, colors: &[Rgb], levels: Levels) -> Output {
     let factor = levels.factor();
-    Some(match want {
+    match want {
         Want::Direct => Output {
-            stored: Some(DeviceSetting::Direct {
+            stored: DeviceSetting::Direct {
                 colors: colors.to_vec(),
-            }),
+            },
             out: Out::Direct(scale_colors(colors, factor)),
         },
-        Want::Off => Output {
-            stored: None,
-            out: off_output(desc)?,
-        },
         Want::Mode(state) => {
-            let stored = Some(DeviceSetting::Mode { state: state.clone() });
+            let stored = DeviceSetting::Mode { state: state.clone() };
             let range = desc.mode(state.mode).and_then(brightness_range);
-            if levels.fade <= 0.0
+            if factor <= 0.0
                 && let Some(off) = off_output(desc)
             {
-                return Some(Output { stored, out: off });
+                return Output { stored, out: off };
             }
             let out = match range {
                 Some(range) => ModeState {
@@ -174,7 +157,7 @@ pub(crate) fn output(
                 out: Out::Mode(out),
             }
         }
-    })
+    }
 }
 
 #[cfg(test)]
@@ -236,17 +219,18 @@ mod tests {
         }
     }
 
-    fn levels(device: u8, master: u8, fade: f64) -> Levels {
-        Levels { device, master, fade }
+    fn levels(device: u8, master: u8) -> Levels {
+        Levels { device, master }
     }
 
     #[test]
     fn factor_multiplies_and_clamps() {
         assert_eq!(Levels::FULL.factor(), 1.0);
-        assert_eq!(levels(50, 50, 1.0).factor(), 0.25);
-        assert_eq!(levels(100, 100, 0.5).factor(), 0.5);
-        assert_eq!(levels(0, 100, 1.0).factor(), 0.0);
-        assert_eq!(levels(200, 100, 3.0).factor(), 1.0);
+        assert_eq!(levels(50, 50).factor(), 0.25);
+        assert_eq!(levels(100, 50).factor(), 0.5);
+        assert_eq!(levels(0, 100).factor(), 0.0);
+        assert_eq!(levels(100, 0).factor(), 0.0);
+        assert_eq!(levels(200, 100).factor(), 1.0);
     }
 
     #[test]
@@ -292,20 +276,20 @@ mod tests {
             Some(0),
         );
         let colors = [Rgb::new(200, 100, 50), Rgb::WHITE];
-        let o = output(&d, &Want::Direct, &colors, levels(50, 100, 1.0)).expect("output");
+        let o = output(&d, &Want::Direct, &colors, levels(50, 100));
         assert_eq!(
             o.stored,
-            Some(DeviceSetting::Direct {
+            DeviceSetting::Direct {
                 colors: colors.to_vec()
-            })
+            }
         );
         assert_eq!(
             o.out,
             Out::Direct(vec![Rgb::new(100, 50, 25), Rgb::new(128, 128, 128)])
         );
-        let full = output(&d, &Want::Direct, &colors, Levels::FULL).expect("output");
+        let full = output(&d, &Want::Direct, &colors, Levels::FULL);
         assert_eq!(full.out, Out::Direct(colors.to_vec()));
-        let off = output(&d, &Want::Direct, &colors, levels(100, 100, 0.0)).expect("output");
+        let off = output(&d, &Want::Direct, &colors, levels(0, 100));
         assert_eq!(off.out, Out::Direct(vec![Rgb::BLACK; 2]));
     }
 
@@ -328,51 +312,48 @@ mod tests {
             vec![direct.clone(), breathing.clone(), wave.clone(), off.clone()],
             Some(0),
         );
-        let o = output(&d, &want, &[], levels(50, 100, 1.0)).expect("output");
+        let o = output(&d, &want, &[], levels(50, 100));
         assert_eq!(
             o.stored,
-            Some(DeviceSetting::Mode {
+            DeviceSetting::Mode {
                 state: state(2, Some(80), vec![red])
-            })
+            }
         );
         // 1 + (80 - 1) * 0.5 = 40.5 -> 41
         assert_eq!(o.out, Out::Mode(state(2, Some(41), vec![red])));
         assert_eq!(
-            output(&d, &want, &[], Levels::FULL).expect("output").out,
+            output(&d, &want, &[], Levels::FULL).out,
             Out::Mode(state(2, Some(80), vec![red]))
         );
         // Without a brightness parameter the mode goes out unchanged.
         let w = Want::Mode(state(3, None, vec![]));
         assert_eq!(
-            output(&d, &w, &[], levels(10, 10, 0.5)).expect("output").out,
+            output(&d, &w, &[], levels(10, 10)).out,
             Out::Mode(state(3, None, vec![]))
         );
         // Off: the "Off" mode, else direct black, else the lowest brightness.
         assert_eq!(
-            output(&d, &want, &[], levels(100, 100, 0.0)).expect("output").out,
+            output(&d, &want, &[], levels(0, 100)).out,
+            Out::Mode(state(9, None, vec![]))
+        );
+        // Master brightness 0 is off too, and so is 0 for a mode without a brightness parameter.
+        assert_eq!(
+            output(&d, &want, &[], levels(100, 0)).out,
+            Out::Mode(state(9, None, vec![]))
+        );
+        assert_eq!(
+            output(&d, &w, &[], levels(0, 100)).out,
             Out::Mode(state(9, None, vec![]))
         );
         let d = desc(vec![direct, breathing.clone()], Some(0));
         assert_eq!(
-            output(&d, &want, &[], levels(100, 100, 0.0)).expect("output").out,
+            output(&d, &want, &[], levels(0, 100)).out,
             Out::Direct(vec![Rgb::BLACK; 2])
         );
         let d = desc(vec![breathing], None);
         assert_eq!(
-            output(&d, &want, &[], levels(100, 100, 0.0)).expect("output").out,
+            output(&d, &want, &[], levels(0, 100)).out,
             Out::Mode(state(2, Some(1), vec![red]))
         );
-        // Held dark: the off output at every level, no setting; impossible without an Off or direct mode.
-        assert_eq!(output(&d, &Want::Off, &[], Levels::FULL), None);
-        let d = desc(
-            vec![
-                mode(0, "Direct", ModeCaps::PER_LED_COLOR, ColorMode::PerLed, None),
-                off,
-            ],
-            Some(0),
-        );
-        let held = output(&d, &Want::Off, &[], Levels::FULL).expect("output");
-        assert_eq!(held.stored, None);
-        assert_eq!(held.out, Out::Mode(state(9, None, vec![])));
     }
 }

@@ -23,7 +23,7 @@ interface DeviceState {
   engineError: string | null
   /** What the user hid, by device id. */
   hidden: Record<DeviceId, HiddenEntry>
-  /** Master brightness and All off (ADR 0001 #33). */
+  /** Master brightness (ADR 0001 #33). */
   lighting: LightingView
   /** Session-only "Show hidden" toggles (ADR 0001 #27): overview (devices) and device view (zones). */
   showHiddenDevices: boolean
@@ -39,7 +39,7 @@ export const deviceState = reactive<DeviceState>({
   failures: [],
   engineError: null,
   hidden: {},
-  lighting: { master_brightness: 100, all_off: false },
+  lighting: { master_brightness: 100 },
   showHiddenDevices: false,
   showHiddenZones: false,
   error: null,

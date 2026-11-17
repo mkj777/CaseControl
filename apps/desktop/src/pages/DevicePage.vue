@@ -6,8 +6,7 @@
 //
 // The status badge is the engine's real status. While released the preview shows the device's own lighting (its
 // colours if they can be read, else empty LEDs) and the mode menu names its own mode; every control still works and
-// takes the device over. While All off holds the device dark the preview is dark and a notice offers to turn the
-// lights back on.
+// takes the device over.
 //
 // Every colour and mode change goes through one ordered sender, so the last user action always wins. While changes
 // are queued or in flight, the page shows its own latest intent instead of the store, so a refresh that raced an
@@ -39,7 +38,6 @@ import {
   releaseDevice,
   resizeZone,
   saveToHardware,
-  setAllOff,
   setDeviceBrightness,
   setDirect,
   setMode,
@@ -146,13 +144,10 @@ const colors = computed<readonly string[]>(() =>
   intent.value?.kind === 'direct' ? intent.value.colors : (device.value?.colors ?? []),
 )
 
-/** All off holds this device dark. */
-const heldOff = computed(() => deviceState.lighting.all_off && device.value?.status.state === 'active')
-
 /** What the preview shows: the latest local edit, else what the device shows (`null`: its own, unknown lighting). */
 const previewColors = computed<readonly string[] | null>(() => {
-  if (intent.value?.kind === 'direct') return heldOff.value ? intent.value.colors.map(() => BLACK) : intent.value.colors
-  return device.value ? shownColors(device.value, deviceState.lighting.all_off) : []
+  if (intent.value?.kind === 'direct') return intent.value.colors
+  return device.value ? shownColors(device.value) : []
 })
 
 // ---- selection and colour --------------------------------------------------------------------------------------
@@ -211,8 +206,8 @@ const DEFAULT = ''
 const RELEASED = 'released'
 
 /**
- * `'static'`, a hardware mode id, `'released'` while the device shows its own lighting, or `''` while All off holds
- * it dark without a setting. Any real choice differs from `'released'` and `''`, so it always takes control.
+ * `'static'`, a hardware mode id, `'released'` while the device shows its own lighting, or `''` while it is driven
+ * without a known setting. Any real choice differs from `'released'` and `''`, so it always takes control.
  */
 const menuValue = computed(() => {
   const w = intent.value
@@ -288,23 +283,6 @@ async function sendBrightness(percent: number, persist: boolean) {
 function brightnessFailed(e: unknown) {
   error.value = errorText(e)
   void refreshDevices()
-}
-
-// ---- All off (ADR 0001 #33) ------------------------------------------------------------------------------------
-
-const turningOn = ref(false)
-
-async function onAllOn() {
-  error.value = null
-  turningOn.value = true
-  try {
-    deviceState.lighting = await setAllOff(false)
-  } catch (e) {
-    error.value = errorText(e)
-  } finally {
-    turningOn.value = false
-    void refreshDevices()
-  }
 }
 
 // ---- zones -----------------------------------------------------------------------------------------------------
@@ -435,13 +413,6 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
         This device is hidden, so CaseControl does not control it.
         <template #details>
           To unhide it, turn on Show hidden on the Devices page and right-click the device.
-        </template>
-      </Notice>
-
-      <Notice v-if="heldOff && !deviceHidden">
-        All lights are off.
-        <template #details>
-          <div><Button size="sm" :disabled="turningOn" @click="onAllOn">Turn on</Button></div>
         </template>
       </Notice>
 

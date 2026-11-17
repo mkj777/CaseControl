@@ -90,21 +90,19 @@ export function ownLighting(view: DeviceView): { mode: Mode | null; colors: stri
 }
 
 /**
- * What the LEDs show, for the previews: the device's colours while CaseControl drives it (black while All off holds
- * it dark), its own per-LED colours while released, and `null` when that is unknown (the preview then draws empty
- * LEDs instead of made-up colours).
+ * What the LEDs show, for the previews: the device's colours while CaseControl drives it, its own per-LED colours
+ * while released, and `null` when that is unknown (the preview then draws empty LEDs instead of made-up colours).
  */
-export function shownColors(view: DeviceView, allOff: boolean): readonly string[] | null {
-  if (view.status.state === 'active') return allOff ? view.colors.map(() => BLACK) : view.colors
+export function shownColors(view: DeviceView): readonly string[] | null {
+  if (view.status.state === 'active') return view.colors
   if (view.status.state === 'released') return ownLighting(view).colors
   return view.colors
 }
 
-/** One line about what the device shows, for its tile: "All off", the own mode's name while released, the hardware
- * mode's name while driven in one; `null` when the preview says it already (direct colours, unknown lighting). */
-export function lightingLabel(view: DeviceView, allOff: boolean): string | null {
+/** One line about what the device shows, for its tile: the own mode's name while released, the hardware mode's name
+ * while driven in one; `null` when the preview says it already (direct colours, unknown lighting). */
+export function lightingLabel(view: DeviceView): string | null {
   if (view.status.state === 'active') {
-    if (allOff) return 'All off'
     const id = currentHardwareMode(view)
     return id === null ? null : (view.description.modes.find((m) => m.id === id)?.name ?? null)
   }

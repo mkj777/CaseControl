@@ -88,8 +88,8 @@ impl AppState {
     }
 
     /// Re-applies the last applied profile if it still exists (ADR 0001 #24), with its device brightness overlaid by
-    /// the changes made since (ADR 0001 #33). Without one, devices stay in their hardware mode. With All off saved,
-    /// the engine already holds every device dark, so the profile is applied underneath without a coloured frame.
+    /// the changes made since (ADR 0001 #33). Without one, devices stay in their hardware mode. With master brightness
+    /// 0 saved, the engine outputs every device dark, so the profile is applied underneath without a coloured frame.
     pub fn apply_last_profile(&self) {
         let Some(name) = self.settings.lock().last_profile.clone() else {
             return;
