@@ -1,10 +1,12 @@
 <script setup lang="ts">
 // Swatches for quick clicks plus a free picker that folds out below: saturation/value area, hue bar and hex input
-// (ADR 0001 #20). Emits every change while dragging (`update:modelValue`); the caller throttles what it sends.
-// `change` comes with the final value of a gesture: when a drag ends, and with every click, key step or hex entry.
+// (ADR 0001 #20). The last circle in the swatch row (eyedropper icon, "Custom colour", pressed while open) folds the
+// free picker out and in (ADR 0001 #37). Emits every change while dragging (`update:modelValue`); the caller
+// throttles what it sends. `change` comes with the final value of a gesture: when a drag ends, and with every
+// click, key step or hex entry.
 import { computed, ref, watch } from 'vue'
 import { SWATCHES, hexToHsv, hsvToHex, normalizeHex, sameColor, type Hsv } from '../lib/color'
-import { Button, TextField } from './ui'
+import { TextField } from './ui'
 
 const props = withDefaults(defineProps<{ modelValue: string; disabled?: boolean }>(), { disabled: false })
 const emit = defineEmits<{ 'update:modelValue': [hex: string]; change: [hex: string] }>()
@@ -107,9 +109,33 @@ function onHex() {
         :disabled="disabled"
         @click="pick(s.hex)"
       />
-      <Button variant="ghost" class="more" :aria-expanded="open" :disabled="disabled" @click="open = !open">
-        {{ open ? 'Fewer options' : 'Custom colour' }}
-      </Button>
+      <!-- Folds the free picker out below; it does not sample the screen (ADR 0001 #37). -->
+      <button
+        type="button"
+        class="swatch custom-toggle"
+        aria-label="Custom colour"
+        title="Custom colour"
+        :aria-pressed="open"
+        :disabled="disabled"
+        @click="open = !open"
+      >
+        <!-- Eyedropper, after Lucide "pipette" (ISC). -->
+        <svg
+          viewBox="0 0 24 24"
+          width="16"
+          height="16"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="m2 22 1-1h3l9-9" />
+          <path d="M3 21v-3l9-9" />
+          <path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.4.4a2.1 2.1 0 1 1-3 3l-3.8-3.8a2.1 2.1 0 1 1 3-3l.4.4Z" />
+        </svg>
+      </button>
     </div>
 
     <div v-if="open" class="custom">
@@ -191,8 +217,25 @@ function onHex() {
   outline-offset: 2px;
 }
 
-.more {
-  margin-left: var(--space-2);
+/* The custom toggle has the swatch's size and edge but no colour of its own: a raised surface with the icon. */
+.custom-toggle {
+  color: var(--text-muted);
+  background: var(--surface-raised);
+  transition:
+    color var(--transition),
+    background-color var(--transition),
+    border-color var(--transition);
+}
+
+.custom-toggle:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.custom-toggle[aria-pressed='true'] {
+  color: var(--text);
+  background: var(--surface-pressed);
+  border-color: var(--text-muted);
 }
 
 .custom {

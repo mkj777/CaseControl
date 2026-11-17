@@ -1,30 +1,42 @@
 <script setup lang="ts">
-// Devices overview (ADR 0001 #18): one large tile per device with a small live preview; a tile opens the device
-// view. Tiles fill the window width (ADR 0001 #28). Right-click a tile to hide or unhide the device; hidden devices
-// are shown greyed only with "Show hidden" on (ADR 0001 #26, #27). No visible title (the sidebar says where you are;
-// the h1 stays for screen readers); the page starts with one toolbar row: All brightness, Connect all and Release
-// all (ADR 0001 #33, #35) on the left, Show hidden and Rescan on the right. Each tile shows the real status and what
+// Lighting, the devices overview (ADR 0001 #18, renamed from Devices in #37): one large tile per device with a small
+// live preview; a tile opens the device view. Tiles fill the window width (ADR 0001 #28). Right-click a tile to hide
+// or unhide the device; hidden devices are shown greyed only with "Show hidden" on (ADR 0001 #26, #27). No visible
+// title (the sidebar says where you are; the h1 stays for screen readers); the page starts with one toolbar row:
+// Take over all, the fallback colour with its help tooltip, All brightness and Release all (ADR 0001 #33, #35, #37)
+// on the left, Show hidden and Rescan on the right. Each tile shows the real status and what
 // the device shows: its colours, the name of its own mode while released, empty LEDs when that is unknown.
 // While Rescan runs the page is inactive (controls disabled, tiles dimmed and inert, `aria-busy`). Hiding a driven
 // device and Release all confirm with a toast, since the change is not visible where the user clicked (ADR 0001 #36).
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import BrightnessSlider from '../components/BrightnessSlider.vue'
+import ColorButton from '../components/ColorButton.vue'
 import DevicePreview from '../components/DevicePreview.vue'
 import {
   Button,
   ContextMenu,
   EmptyState,
+  IconButton,
   ListRow,
   Notice,
   PageHeader,
   StatusBadge,
   Switch,
   Tile,
+  Tooltip,
   menuPoint,
   type MenuItem,
 } from '../components/ui'
-import { connectAll, errorText, releaseAll, setMasterBrightness, type DeviceView } from '../ipc'
+import {
+  connectAll,
+  errorText,
+  getSettings,
+  releaseAll,
+  setDefaultColor,
+  setMasterBrightness,
+  type DeviceView,
+} from '../ipc'
 import {
   STATUS_LABEL,
   canTakeOver,
@@ -44,6 +56,7 @@ import {
   refreshDevices,
   rescanDevices,
 } from '../stores/devices'
+import { latestSender } from '../lib/throttle'
 import { releasedText, showToast } from '../stores/toast'
 
 const deviceLink = (id: string) => ({ name: 'device', params: { id } })
@@ -83,18 +96,18 @@ async function toggleHidden(id: string, hidden: boolean) {
   }
 }
 
-// ---- All brightness, Connect all, Release all (ADR 0001 #33) ---------------------------------------------------
+// ---- Take over all, All brightness, Release all (ADR 0001 #33, #37) -----------------------------------------
 
-const connecting = ref(false)
+const takingOver = ref(false)
 const releasing = ref(false)
 /** The lighting controls need a running engine and are off while a rescan runs. */
 const engineDown = computed(() => !deviceState.loaded || deviceState.engineError !== null)
 const scanning = computed(() => deviceState.scanning)
 /** Nothing to release: no device is driven. */
 const noneActive = computed(() => !deviceState.devices.some((d) => statusOf(d) === 'active'))
-/** Connect all has something to do: a released, visible device the engine says it can take over (with its setting,
- * its own mode or the default colour; ADR 0001 #36). */
-const canConnect = computed(() =>
+/** Take over all has something to do: a released, visible device the engine says it can take over (with its
+ * setting, its own mode or the fallback colour; ADR 0001 #36, #37). */
+const canTakeOverAll = computed(() =>
   deviceState.devices.some(
     (d) => statusOf(d) === 'released' && !isDeviceHidden(d.description.info.id) && canTakeOver(d),
   ),
@@ -109,15 +122,72 @@ function lightingFailed(e: unknown) {
   void refreshDevices()
 }
 
-async function onConnectAll() {
+async function onTakeOverAll() {
   error.value = null
-  connecting.value = true
+  takingOver.value = true
   try {
     deviceState.lighting = await connectAll()
   } catch (e) {
     lightingFailed(e)
   } finally {
-    connecting.value = false
+    takingOver.value = false
+  }
+}
+
+// ---- Fallback colour (ADR 0001 #36, #37; the `default_color` setting) -----------------------------------------
+// Works like the brightness sliders: while the picker is dragged the value goes live to the engine through a
+// coalescing sender (not saved); the final value of a gesture is saved once. It only feeds later takeovers; devices
+// already driven keep their colours. Its errors are its own Notice, so a colour change clears only those.
+
+/** Segoe Fluent Icons "Help" (a question mark). */
+const HELP = ''
+const FALLBACK_HELP =
+  'Take over all gives CaseControl control of every device. A device with nothing else selected shows this colour.'
+
+/** Shown in the circle and the picker; follows the pointer while the sends catch up. */
+const fallbackColor = ref('#FFFFFF')
+const colorError = ref<string | null>(null)
+/** Not loaded yet, or settings cannot be saved this session (the error shows on the Settings page). */
+const colorUnavailable = ref(true)
+const colorLocked = computed(() => colorUnavailable.value || scanning.value)
+
+onMounted(async () => {
+  try {
+    const s = await getSettings()
+    fallbackColor.value = s.default_color
+    colorUnavailable.value = s.save_error !== null
+  } catch (e) {
+    colorError.value = errorText(e)
+  }
+})
+
+async function colorFailed(e: unknown) {
+  colorError.value = errorText(e)
+  try {
+    fallbackColor.value = (await getSettings()).default_color
+  } catch {
+    // keep the error shown above
+  }
+}
+
+const colorSender = latestSender<string>((hex) => setDefaultColor(hex, false), colorFailed)
+
+function onFallbackColor(hex: string) {
+  colorError.value = null
+  fallbackColor.value = hex
+  colorSender.push(hex)
+}
+
+async function onFallbackColorCommit(hex: string) {
+  colorError.value = null
+  fallbackColor.value = hex
+  // The final value replaces whatever live value is still queued.
+  colorSender.cancel()
+  try {
+    await colorSender.flush()
+    fallbackColor.value = await setDefaultColor(hex, true)
+  } catch (e) {
+    await colorFailed(e)
   }
 }
 
@@ -142,7 +212,7 @@ async function onReleaseAll() {
 
 <template>
   <section class="page wide" :aria-busy="scanning">
-    <PageHeader title="Devices" title-hidden>
+    <PageHeader title="Lighting" title-hidden wrap-controls>
       <template #actions>
         <Switch v-model="deviceState.showHiddenDevices" label="Show hidden" compact :disabled="scanning" />
         <Button :disabled="scanning" @click="rescanDevices">
@@ -150,6 +220,19 @@ async function onReleaseAll() {
         </Button>
       </template>
       <template #controls>
+        <Button :disabled="engineDown || scanning || takingOver || releasing || !canTakeOverAll" @click="onTakeOverAll">
+          Take over all
+        </Button>
+        <ColorButton
+          :model-value="fallbackColor"
+          label="Fallback colour"
+          :disabled="colorLocked"
+          @update:model-value="onFallbackColor"
+          @change="onFallbackColorCommit"
+        />
+        <Tooltip v-slot="{ describedBy }" :text="FALLBACK_HELP">
+          <IconButton label="Help" :glyph="HELP" no-title :aria-describedby="describedBy" />
+        </Tooltip>
         <BrightnessSlider
           label="All brightness"
           :value="deviceState.lighting.master_brightness"
@@ -157,10 +240,7 @@ async function onReleaseAll() {
           :disabled="engineDown || scanning || releasing"
           @error="lightingFailed"
         />
-        <Button :disabled="engineDown || scanning || connecting || releasing || !canConnect" @click="onConnectAll">
-          Connect all
-        </Button>
-        <Button :disabled="engineDown || scanning || connecting || releasing || noneActive" @click="onReleaseAll">
+        <Button :disabled="engineDown || scanning || takingOver || releasing || noneActive" @click="onReleaseAll">
           {{ releasing ? 'Releasing…' : 'Release all' }}
         </Button>
       </template>
@@ -172,6 +252,7 @@ async function onReleaseAll() {
     </Notice>
     <Notice v-if="deviceState.error" variant="error">Could not load the device list: {{ deviceState.error }}</Notice>
     <Notice v-if="error" variant="error">{{ error }}</Notice>
+    <Notice v-if="colorError" variant="error">{{ colorError }}</Notice>
 
     <div v-if="tiles.length > 0" class="grid" :class="{ busy: scanning }" :inert="scanning">
       <Tile

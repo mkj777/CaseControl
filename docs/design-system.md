@@ -114,14 +114,14 @@ Running text stops at `--measure` (60ch). Numbers that change (values next to sl
 
 **Elevation.** No shadows in the page. Depth is surface step plus border: page `--bg`, cards `--surface` with
 `--border`, interactive cards hover to `--surface-raised` with `--border-strong`. Only overlays (context menu,
-dialog, toast) add `--shadow-overlay`, to separate them from what they cover.
+dialog, toast, popover, tooltip) add `--shadow-overlay`, to separate them from what they cover.
 
 **Motion.** `--duration` 120 ms, `--ease` ease-out, for `color`, `background-color` and `border-color` only.
 Nothing moves, slides, fades in or scales, except the switch thumb (position, same duration). LED colours in the
 preview do **not** transition: they mirror the hardware, which is already throttled by the engine (ADR #21), and a
 fade makes the preview lag behind the device. `prefers-reduced-motion` sets `--duration` to 0.
 
-**Stacking:** `--z-titlebar` 10, `--z-menu` 20 (also the toast), `--z-dialog` 30, `--z-dialog-menu` 40. Nothing
+**Stacking:** `--z-titlebar` 10, `--z-menu` 20 (also the toast, popover and tooltip), `--z-dialog` 30, `--z-dialog-menu` 40. Nothing
 else sets a z-index.
 
 ## Layout
@@ -130,13 +130,14 @@ The window is at least 860 x 560 (`tauri.conf.json`).
 
 ```
 ┌───────────────┬──────────────────────────────────────────────┐
-│ CaseControl   │  (drag region)                   ─   □   ✕   │  32 px, --titlebar-height
+│ ◉ CaseControl │  (drag region)                   ─   □   ✕   │  32 px, --titlebar-height
 │               │                                              │
-│ Devices       │   Page title                      [Action]   │  page header (Devices: title hidden)
+│ Lighting      │   Page title                      [Action]   │  page header (Lighting: title hidden)
 │ Profiles      │   [Lighting controls]       [View actions]   │  toolbar row (optional)
 │ Conflicts     │                                              │  --space-10
 │ Settings      │   content                                    │
 │               │                                              │
+│ v0.1.0        │                                              │  version, bottom left
 └───────────────┴──────────────────────────────────────────────┘
   220 px           --page-pad-x on both sides
 ```
@@ -170,9 +171,15 @@ unless noted.
 
 ### App shell, sidebar and title bar
 
-- **Anatomy:** grid of sidebar (`--sidebar-width`) and content. Sidebar: "CaseControl" at the top
+- **Anatomy:** grid of sidebar (`--sidebar-width`) and content. Sidebar: the app icon and "CaseControl" at the top
   (`--text-lg`, 600, in the drag region) with `--space-4` above it, so it does not sit under the window edge (it
-  does not line up with the content's title strip), then the nav `--space-6` below. Content: a 32 px top strip that is a drag region, with
+  does not line up with the content's title strip), then the nav `--space-6` below. At the bottom left the app
+  version ("v0.1.0", from `app_info`), `--text-sm`, `--text-muted`, inset `--space-3` like the nav item text; it is
+  left out when `app_info` fails.
+- **Brand icon** (ADR #37): the bundle icon from `src-tauri/icons`, `--brand-icon-size` (24 px, between the name's
+  cap height and the control height), vertically centred, `--space-2` left of the name, decorative (`alt=""`). A
+  `srcset` of `32x32.png`, `Square44x44Logo.png` and `128x128.png` lets the browser take 32 px at 100 % and 44 px
+  at 150 %, so it stays sharp at both. Content: a 32 px top strip that is a drag region, with
   minimise, maximise/restore and close at the top right, each `--window-button-width` x `--titlebar-height`. The
   shell also renders the window's one Toast.
 - **Nav item:** `--control-height`, padding `--space-3`, `--radius-md`, `--text-muted`. Hover and current:
@@ -186,21 +193,25 @@ unless noted.
 
 ### Page header
 
-- **Anatomy:** optional back link (`← Devices`, `--text-muted`, hover `--text`, `--space-6` below), h1 with an
+- **Anatomy:** optional back link (`← Lighting`, `--text-muted`, hover `--text`, `--space-6` below), h1 with an
   optional status badge next to it, at most one description line in `--text-muted` up to `--measure`, and the
   view actions (slot `actions`) at the top right.
 - **Hidden title** (`titleHidden`): a top-level page whose name the sidebar already shows and whose header is only
-  a toolbar (the Devices overview) has no visible title. The h1 stays as a visually hidden heading, so the page
+  a toolbar (the Lighting overview) has no visible title. The h1 stays as a visually hidden heading, so the page
   keeps its accessible name, and the toolbar row is the first thing on the page (no gap above it).
 - **Toolbar row:** a page with page-wide lighting controls (slot `controls`) gets one toolbar row under the title
   (`--space-6` above it, none with a hidden title): the lighting controls grouped on the left, the view actions
   grouped on the right in the same row instead of next to the title. Gap `--space-4` inside a group, `--space-6`
   between the groups. The brightness slider is the flexible part: it is `--toolbar-control-width` (200 px) when
   there is room and shrinks to `--toolbar-control-min-width` (80 px) before anything wraps; only then do the view
-  actions move to a second row (left aligned). The Devices page: All brightness, Connect all, Release all | Show
-  hidden, Rescan; it stays on one row from about 1000 px window width (the default 1100 px included) and wraps
-  below that, since its fixed parts alone (labels, buttons, switch, readout) measure about 560 px and the content
-  at the 860 px minimum is 576 px. A device page: Brightness | Show hidden.
+  actions move to a second row (left aligned). The Lighting page (ADR #37): Take over all, the fallback colour
+  button, the help "?" (IconButton in a Tooltip), All brightness, Release all | Show hidden, Rescan. Its lighting
+  group measures about 585 px at its narrowest and the view group about 255 px, so the whole toolbar is one row
+  from about 1200 px window width and the view actions take a second row below that (the default 1100 px
+  included). With `wrapControls` (Lighting only), below 964 px window width (content under 680 px; a media query,
+  since custom properties cannot be used there) the lighting group takes the first row on its own and its
+  controls wrap, so at the 860 px minimum (576 px content) nothing runs past the edge. A device page: Brightness |
+  Show hidden.
 - **Variants:** list page (title, optional description, actions), detail page (back link, title, status badge).
   There is no metadata line under the title; facts such as kind and vendor go into the page's key-value list.
 - **Rules:** at most two actions, secondary style (Rescan, Scan, the compact Show hidden switch). The primary
@@ -229,7 +240,7 @@ unless noted.
 |---|---|---|
 | `secondary` (default) | `--surface-raised`, 1 px `--border`, `--text` | Almost everything |
 | `primary` | `--accent` fill, `--accent-text`; hover `--accent-hover` | The one main action of a view: "Save current as…", the empty-state Rescan |
-| `ghost` | no fill or border, `--text-muted`; hover `--text` | Low-weight actions in rows: All, None, Rename, Custom colour |
+| `ghost` | no fill or border, `--text-muted`; hover `--text` | Low-weight actions in rows: All, None, Rename |
 | `danger` | like `secondary` (`--surface-raised`, 1 px `--border`), text in `--danger`; hover border `--danger` | End process, Stop service, Save to device, Delete, and the confirm button of their dialogs |
 
 - **Sizes:** `md` `--control-height` (36 px), padding 0 `--space-4`; `sm` `--control-height-sm` (28 px), padding
@@ -246,9 +257,47 @@ unless noted.
 - **Anatomy:** `--icon-button-size` square, `--radius-md`, one `--font-icon` glyph at 12 to 16 px,
   `--text-muted`.
 - **Props:** `label` is required and becomes `aria-label` and `title` (the native tooltip; no tooltip library).
+  `noTitle` drops the native `title` when a Tooltip wraps the button, so the two do not show at once.
 - **States:** hover `--surface-hover` + `--text`, pressed, focus ring, disabled.
 - **Rules:** only for actions every Windows user reads from the glyph alone: window buttons, close in a dialog,
-  back. Anything else gets a text button.
+  back, help ("?", glyph `E897`, label "Help", inside a Tooltip). Anything else gets a text button.
+
+### Tooltip
+
+- **Anatomy** (`components/ui/Tooltip.vue`, ADR #37): a box below the trigger, `--space-2` gap, left aligned to it:
+  `--text-sm` `--text` on `--surface-raised`, 1 px `--border-strong`, `--radius-md`, `--shadow-overlay`, padding
+  `--space-2` `--space-3`, up to `--tooltip-max-width` (280 px), `--z-menu`. Text only.
+- **In code:** prop `text`; the default slot is the trigger and gets `describedBy`, the tooltip's id, for its
+  `aria-describedby`. The tooltip has `role="tooltip"` and stays in the DOM while hidden (`visibility`), so screen
+  readers read it with the trigger.
+- **Behaviour:** shows on hover and on keyboard focus (`:focus-visible`, not after a click), stays while the
+  pointer is on the trigger or the tooltip (the gap belongs to the tooltip), Escape hides it (WCAG 1.4.13). No
+  delay and no animation.
+- **Rules:** for a short explanation that does not fit a label (the Lighting help "?"). Never the only place of
+  information a control needs to work, never interactive content. An IconButton trigger sets `noTitle`.
+
+### Colour button
+
+- **Anatomy** (`components/ColorButton.vue`, ADR #37): a circle `--control-height` across, filled with the current
+  colour, 1 px `--led-border` (hover `--text-muted`), like a swatch. While its popover is open it has the selection
+  outline (2 px `--selection`, 2 px offset). Below it a popover with a ColorPicker: `--surface`, 1 px
+  `--border-strong`, `--radius-md`, `--shadow-overlay`, padding `--space-4`, width `--popover-width` (320 px: the
+  swatches in rows of six and five), `--space-2` below the circle, `--z-menu`.
+- **In code:** props `modelValue`, `label` (the accessible name of the circle and the popover), `disabled`; emits
+  the picker's `update:modelValue` (live while dragging) and `change` (final value of a gesture).
+- **Behaviour:** the circle toggles the popover (`aria-haspopup="dialog"`, `aria-expanded`). On open, focus moves
+  to the current swatch (else the first). The popover is non-modal: Escape closes it and returns focus to the
+  circle; a click outside or moving focus out closes it. Disabled: 50 % opacity, the popover closes.
+- **Use:** the fallback colour in the Lighting toolbar ("Fallback colour", see Device states).
+
+### Colour picker
+
+- **Anatomy** (`components/ColorPicker.vue`, ADR #20): a row of swatch circles (`--control-height`), then the free
+  picker folded out below it: saturation/value area, hue bar, hex field.
+- **Custom toggle** (ADR #37): the last circle of the swatch row, same size and edge, `--surface-raised` with an
+  eyedropper icon (inline SVG, 16 px, `currentColor`, `--text-muted`; hover `--surface-hover` + `--text`).
+  Accessible name "Custom colour", `aria-pressed` while the free picker is open; pressed look `--surface-pressed`,
+  `--text` icon, `--text-muted` edge. It only folds the free picker out and in; it does not sample the screen.
 
 ### Switch
 
@@ -291,15 +340,15 @@ unless noted.
   it shows its own value, so a device refresh in between cannot pull the thumb back.
 - **Layout:** the inline Field layout (label at its own width, slider `--toolbar-control-width` down to
   `--toolbar-control-min-width`, readout), since it always sits in a page toolbar.
-- **States:** disabled (engine down, device locked, a rescan or Release all running on the Devices page, a device
+- **States:** disabled (engine down, device locked, a rescan or Release all running on the Lighting page, a device
   the engine cannot take over: "Set a colour or mode first.", a hardware mode without a brightness parameter: "This
   mode has no brightness setting."). A failed send is emitted as `error`; the page shows it as an inline Notice.
 - **Takes over:** on a released device it takes control like every lighting control: with its last setting, else
-  its own mode as read back, else the default colour from Settings (ADR #36), as the engine reports it
+  its own mode as read back, else the fallback colour (ADR #36, #37), as the engine reports it
   (`DeviceView.takeover`). Only a device the engine cannot take over at all (no direct mode and no mode that takes a
   colour, nothing stored or read back) gets a disabled slider with the hint "Set a colour or mode first."
 - **Rules:** every brightness control is this component (master brightness, labelled "All brightness", on the
-  Devices page; device brightness on a device page), usually in the PageHeader `controls` row. The `send` callback decides what `persist` saves;
+  Lighting page; device brightness on a device page), usually in the PageHeader `controls` row. The `send` callback decides what `persist` saves;
   the slider never saves on its own.
 
 ### Number field
@@ -355,6 +404,18 @@ unless noted.
   hidden tile is not a link but stays focusable (`tabindex="0"`) so its menu (Unhide) is reachable by keyboard.
 - **Rules:** the browser menu is suppressed app-wide except in text fields. Every action in a context menu is
   also reachable another way or harmless (Hide / Unhide).
+
+### Menu button
+
+- **Anatomy:** an IconButton with the "More" glyph (`E712`, a horizontal ellipsis) that opens the context menu
+  `--space-1` under itself, right aligned to the button at `--menu-min-width` (a wider menu reaches further right,
+  kept inside the window). `components/ui/MenuButton.vue`, props `label`, `items`, `disabled`;
+  `aria-haspopup="menu"` and `aria-expanded` on the button.
+- **Behaviour:** the context menu's keyboard and close rules; Esc returns focus to the button, a second press on the
+  button closes the menu.
+- **Rules:** for the less common actions of one list row, so the row shows one action button. Its items are the
+  same labels the buttons would carry; a danger item still opens its ConfirmDialog. Not shown when a row has no more
+  actions. Unlike a context menu, its items need not be reachable elsewhere: the button is visible and focusable.
 
 ### Dialog
 
@@ -436,25 +497,41 @@ Severity group headings on the Conflicts page stay headings, not badges.
   top line, so the list itself needs no border.
 - **States:** default, current (badge "Active"), editing (the row turns into an inline form with the same height),
   disabled while busy, expanded (slot `details`, below the row inside its divider, `--space-4` above).
-- **Actions:** stay on the right at their width. Opt-in (`wrapActions`, used by Conflicts only): when there are more
-  than fit they wrap, right aligned, instead of widening the row.
+- **Actions:** stay on the right at their width. Opt-in (`stackActions`, used by Conflicts): the row is a size
+  container (`container: list-row / inline-size`); when the row is narrower than 640 px the actions take their own
+  line under the name and the row's text, left aligned, `--space-3` below, and wrap if they still do not fit. A text
+  page is 576 px wide at the 860 px minimum window and 760 px from about 1050 px, so findings stack in narrow
+  windows and keep one line from about 940 px. A page sets it only on rows that have an action besides the chevron.
 - **Expandable row** (Conflicts, ADR #36): the last action is an IconButton chevron (glyph `E70D` down / `E70E` up,
   label "Show details" / "Hide details", `aria-expanded`, `aria-controls` on the details: the page passes the id
   as `detailsId`, which ListRow puts on its details wrapper). The page decides what is open; open rows stay open
   across a rescan.
-- **Rules:** rows are not cards. Used for profiles, for conflict findings (grouped under the severity h2s) and for
-  "Found but not started" on Devices (no actions).
+- **Rules:** rows are not cards. Used for profiles, for conflict findings (grouped under the severity h2s, see
+  [Conflicts list](#conflicts-list)) and for
+  "Found but not started" on Lighting (no actions).
 
 ### Conflicts list
 
-One `ul` of ListRows per severity group (High, Medium, Low, Info), under the group's h2, groups `--space-14` apart.
-One compact row per finding: name, status badge (Running / Installed, not running / Not running), the affected
-devices in `--text-sm` muted ("None of your detected devices" when none), then the actions as `sm` buttons: End
-process / Stop service (danger, behind the confirm dialog), Turn off autostart (secondary), Re-enable autostart
-(ghost), and the chevron. The details below the row: the catalogue note (muted, up to `--measure`), a key-value list
-(Vendor, Device families, Found, Starts with Windows with each entry's command in `--font-mono`; evidence and
-commands selectable), the permission-prompt note when an autostart change needs one, and "Don't ask again at start"
-for RGB suites.
+One `ul` of ListRows per severity group (High, Medium, Low, Info), under the group's h2, groups `--space-10` apart
+(subsections of one list, so closer than page sections). One compact row per finding, with `stackActions`:
+
+```
+SignalRGB  [Running]                         [End process SignalRgb.exe]  [⋯]  [⌄]
+Corsair K70, ASUS mainboard
+```
+
+- **Line 1:** name and status badge (Running / Installed, not running / Not running). **Line 2:** the affected
+  devices in `--text-sm` muted, always on their own line ("None of your detected devices" when none).
+- **Actions:** one `sm` button, the first in this order: End process / Stop service (danger, behind the confirm
+  dialog, one per close target), Turn off autostart (secondary), Re-enable autostart (ghost). The other actions go
+  into a Menu button ("More actions"), shown only when there are any. The chevron is last and keeps the row's right
+  edge, also when the actions stack under the text at narrow widths.
+- **Result:** the outcome Notice of an action ("Done.", "Some steps did not work.", "Some steps are not confirmed
+  yet. Scan again in a moment.", with the result lines) shows under the row it was taken on, above its details,
+  until the next action; only when that row is gone after the rescan does it show above the list.
+- **Details** (chevron): the catalogue note (muted, up to `--measure`), a key-value list (Vendor, Device families,
+  Found, Starts with Windows with each entry's command in `--font-mono`; evidence and commands selectable), the
+  permission-prompt note when an autostart change needs one, and "Don't ask again at start" for RGB suites.
 
 ### Key-value list
 
@@ -489,18 +566,23 @@ The preview is the focus of the app (ADR #15), so it gets the most room and the 
   own colours or unknown LEDs. Every control stays usable and takes the device over.
 - **Off** (ADR #35): brightness 0 (a device's Brightness or All brightness) turns lights off;
   the device stays Active.
-- **Connect all / Release all** (Devices toolbar, secondary buttons): Release all hands every device back, is
-  disabled while no device is Active, and confirms with a toast ("N devices released"). While it runs it reads
-  "Releasing…" and All brightness and Connect all are disabled. Connect all takes every
-  released, visible, non-faulted device over with the same rules as brightness (ADR #36): last setting, else its own
-  mode as read back, else the default colour from Settings (white unless changed) on every LED, or, without a direct
-  mode, in its first mode that takes a colour; it is disabled when every such device is already Active.
-- **Default colour** (Settings, "Lighting"): one ColorPicker in a stacked group Field "Default colour". It only
+- **Take over all / Release all** (Lighting toolbar, secondary buttons; Take over all was "Connect all" before
+  ADR #37): Release all hands every device back, is disabled while no device is Active, and confirms with a toast
+  ("N devices released"). While it runs it reads "Releasing…" and All brightness and Take over all are disabled.
+  Take over all takes every released, visible, non-faulted device over with the same rules as brightness (ADR #36):
+  last setting, else its own mode as read back, else the fallback colour (white unless changed) on every LED, or,
+  without a direct mode, in its first mode that takes a colour; it is disabled when every such device is already
+  Active.
+- **Fallback colour** (Lighting toolbar, ADR #37; the `default_color` setting, called "Default colour" before): a
+  Colour button "Fallback colour" next to Take over all, followed by the help "?" whose Tooltip reads "Take over
+  all gives CaseControl control of every device. A device with nothing else selected shows this colour." It only
   feeds later takeovers; changing it does not repaint devices that are already driven. Like a brightness slider it
   goes live while dragging and is saved once with the final value (ColorPicker's `change` event: end of a drag, a
-  click, a key step or a hex entry). Its errors are its own Notice, so a colour change clears only those.
-- **Rescan busy** (Devices): while a rescan runs the Rescan button reads "Scanning…" and is disabled, the toolbar
-  controls (All brightness, Connect all, Release all, Show hidden) are disabled, and the tile grid is dimmed to
+  click, a key step or a hex entry). Its errors are its own Notice, so a colour change clears only those. Disabled
+  while a rescan runs, until the settings are loaded, and for the session when settings cannot be saved.
+- **Rescan busy** (Lighting): while a rescan runs the Rescan button reads "Scanning…" and is disabled, the toolbar
+  controls (Take over all, Fallback colour, All brightness, Release all, Show hidden) are disabled (the help "?"
+  stays usable), and the tile grid is dimmed to
   50 % opacity (the disabled look of Switch and ColorPicker) and `inert` (no clicks, focus or context menu). The
   page section carries `aria-busy` while it runs.
 

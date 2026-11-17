@@ -8,6 +8,10 @@
 // colours if they can be read, else empty LEDs) and the mode menu names its own mode; every control still works and
 // takes the device over.
 //
+// Brightness-only LEDs (zones with `brightness_only`, a fixed white such as the RTX 5080 FE) take no colour: a device
+// made only of them shows no colour picker and no LED selection, just brightness and its modes, and its preview is
+// white at the output intensity. On a mixed device the colour controls apply to the colour LEDs only.
+//
 // Every colour and mode change goes through one ordered sender, so the last user action always wins. While changes
 // are queued or in flight, the page shows its own latest intent instead of the store, so a refresh that raced an
 // edit cannot roll the controls back; the intent is dropped once the sender is idle and a fresh reload has landed.
@@ -62,7 +66,16 @@ import {
   visibleLeds,
   zoneIndicesNamed,
 } from '../lib/device'
-import { EMPTY, blackOut, clampSelection, paint, selectionColor, without, type Selection } from '../lib/selection'
+import {
+  EMPTY,
+  blackOut,
+  clampSelection,
+  paint,
+  selectionColor,
+  without,
+  zoneIndices,
+  type Selection,
+} from '../lib/selection'
 import { latestSender } from '../lib/throttle'
 import {
   deviceState,
@@ -90,6 +103,17 @@ const hiddenZones = computed(() =>
 )
 const hiddenLeds = computed(() => (desc.value ? ledsOfZones(desc.value, hiddenZones.value) : new Set<number>()))
 const visibleScope = computed(() => new Set(desc.value ? visibleLeds(desc.value, hiddenZones.value) : []))
+/** LEDs of brightness-only zones, which take no colour. */
+const fixedLeds = computed(
+  () => new Set((desc.value?.zones ?? []).filter((z) => z.brightness_only).flatMap((z) => zoneIndices(z))),
+)
+/** Every zone with LEDs is brightness-only: the device takes no colour at all. */
+const brightnessOnly = computed(() => {
+  const lit = (desc.value?.zones ?? []).filter((z) => z.len > 0)
+  return lit.length > 0 && lit.every((z) => z.brightness_only)
+})
+/** The visible LEDs that take a colour. */
+const colorScope = computed(() => without(visibleScope.value, fixedLeds.value))
 const hasDirect = computed(() => desc.value?.direct_mode != null)
 const modes = computed(() => (desc.value ? hardwareModes(desc.value) : []))
 
@@ -195,7 +219,10 @@ const selectionText = computed(() => {
 function onColor(hex: string) {
   if (!device.value) return
   pickerColor.value = hex
-  const painted = paint(colors.value, selection.value, hex, visibleScope.value)
+  // Only colour LEDs take the colour; a selection of brightness-only LEDs alone changes nothing.
+  const target = without(selection.value, fixedLeds.value)
+  if (selection.value.size > 0 && target.size === 0) return
+  const painted = paint(colors.value, target, hex, colorScope.value)
   write({ kind: 'direct', colors: blackOut(painted, hiddenLeds.value) })
 }
 
@@ -228,6 +255,8 @@ const releasedLabel = computed(() => {
 
 /** Colour editing is shown in static mode, and also while the device runs on its own (a colour takes control). */
 const editingStatic = computed(() => hasDirect.value && [STATIC, DEFAULT, RELEASED].includes(menuValue.value))
+/** The colour picker and LED selection: static editing on a device with colour LEDs. */
+const editingColors = computed(() => editingStatic.value && !brightnessOnly.value)
 
 const activeMode = computed(() => modes.value.find((m) => String(m.id) === menuValue.value))
 /** The state the mode controls edit: the latest local one while edits are pending, else the device's. */
@@ -384,13 +413,30 @@ async function onSave() {
   }
 }
 
-const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
+const selectAll = () => device.value && onSelect(new Set(colorScope.value))
+
+/**
+ * The output factor brightness-only LEDs are drawn at: device x master brightness while driven; while released, the
+ * own mode's brightness within its range (the device's own lighting does not follow the app's levels).
+ */
+const previewIntensity = computed(() => {
+  const d = device.value
+  if (!d) return 1
+  if (d.status.state === 'released') {
+    const hw = d.hardware
+    const mode = hw ? d.description.modes.find((m) => m.id === hw.mode) : undefined
+    if (!hw || hw.brightness === null || !mode || !hasCap(mode, 'BRIGHTNESS')) return 1
+    const max = mode.brightness?.end ?? 100
+    return max > 0 ? hw.brightness / max : 1
+  }
+  return (d.brightness / 100) * (deviceState.lighting.master_brightness / 100)
+})
 </script>
 
 <template>
   <section class="page wide">
     <template v-if="device && desc">
-      <PageHeader :title="desc.info.name" :back="{ to: '/devices', label: 'Devices' }">
+      <PageHeader :title="desc.info.name" :back="{ to: '/lighting', label: 'Lighting' }">
         <template #badge>
           <StatusBadge v-if="deviceHidden" status="hidden">Hidden</StatusBadge>
           <StatusBadge v-else :status="statusOf(device)">{{ STATUS_LABEL[statusOf(device)] }}</StatusBadge>
@@ -413,18 +459,18 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
       <Notice v-if="deviceHidden">
         This device is hidden, so CaseControl does not control it.
         <template #details>
-          To unhide it, turn on Show hidden on the Devices page and right-click the device.
+          To unhide it, turn on Show hidden on the Lighting page and right-click the device.
         </template>
       </Notice>
 
       <Notice v-if="device.status.state === 'faulted'" variant="error">
         CaseControl stopped talking to this device after an error: {{ device.status.error }}
         <template #details>
-          Close other software that uses it or re-plug it, then press Rescan on the Devices page to retry.
+          Close other software that uses it or re-plug it, then press Rescan on the Lighting page to retry.
         </template>
       </Notice>
 
-      <div v-if="editingStatic" class="row selection">
+      <div v-if="editingColors" class="row selection">
         <span>{{ selectionText }}</span>
         <Button variant="ghost" size="sm" :disabled="locked" @click="selectAll">All</Button>
         <Button variant="ghost" size="sm" :disabled="locked" @click="onSelect(EMPTY)">None</Button>
@@ -437,9 +483,10 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
           :description="desc"
           :colors="previewColors"
           :selection="selection"
-          :interactive="editingStatic && !locked"
+          :interactive="editingColors && !locked"
           :hidden-zones="hiddenZones"
           :show-hidden="deviceState.showHiddenZones"
+          :intensity="previewIntensity"
           @select="onSelect"
           @zone-menu="onZoneMenu"
         />
@@ -455,10 +502,10 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
           </Select>
         </Field>
 
-        <ColorPicker v-if="editingStatic" :model-value="pickerColor" :disabled="locked" @update:model-value="onColor" />
+        <ColorPicker v-if="editingColors" :model-value="pickerColor" :disabled="locked" @update:model-value="onColor" />
 
         <ModeControls
-          v-else-if="activeMode && activeState"
+          v-else-if="!editingStatic && activeMode && activeState"
           :mode="activeMode"
           :state="activeState"
           :disabled="locked || busy"
@@ -533,7 +580,7 @@ const selectAll = () => device.value && onSelect(new Set(visibleScope.value))
     </template>
 
     <template v-else-if="deviceState.loaded">
-      <PageHeader :back="{ to: '/devices', label: 'Devices' }" />
+      <PageHeader :back="{ to: '/lighting', label: 'Lighting' }" />
       <EmptyState title="Device not found" :level="1">
         This device is not connected any more, or its detector is switched off in Settings.
       </EmptyState>

@@ -152,6 +152,7 @@ fn description(id: DeviceId, name: &str, kind: DeviceKind) -> DeviceDescription 
         start,
         len,
         resizable,
+        brightness_only: false,
     };
     DeviceDescription {
         info: DeviceInfo {
@@ -2373,4 +2374,34 @@ fn device_view_reports_what_a_takeover_would_use() {
         DeviceStatus::Faulted { .. }
     )));
     assert_eq!(takeover(5), None);
+}
+
+/// `spec` with every zone brightness-only (a GPU whose LEDs show a fixed white, like the RTX 5080 FE).
+fn white_only(n: u16) -> Spec {
+    let mut s = spec(id(n), "GPU", DeviceKind::Gpu);
+    for z in &mut s.desc.zones {
+        z.brightness_only = true;
+    }
+    s
+}
+
+#[test]
+fn brightness_only_device_takes_over_at_full_white_and_reduces_colours_to_intensity() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![white_only(1)], &log);
+    let e = engine(60, vec![Box::new(b)]);
+    // The default colour does not matter: the takeover drives full white, scaled by brightness only.
+    e.set_default_color(GREEN);
+    e.set_device_brightness(&id(1), 50).unwrap();
+    assert!(shows(&log, 1, &[Rgb::new(128, 128, 128); 7]));
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().colors == vec![Rgb::WHITE; 7]));
+
+    // A colour is reduced to its highest channel: (40, 200, 10) -> 200, at 50 % -> 100.
+    e.set_direct(&id(1), vec![Rgb::new(40, 200, 10); 7]).unwrap();
+    assert!(shows(&log, 1, &[Rgb::new(100, 100, 100); 7]));
+    let grey = DeviceSetting::Direct {
+        colors: vec![Rgb::new(200, 200, 200); 7],
+    };
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting == Some(grey.clone())));
+    assert_eq!(e.device(&id(1)).unwrap().colors, vec![Rgb::new(200, 200, 200); 7]);
 }

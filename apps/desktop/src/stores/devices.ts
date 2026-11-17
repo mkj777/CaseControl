@@ -1,4 +1,4 @@
-// Shared device state for the Devices overview and the device view. Refreshes from `list_devices` and on every
+// Shared device state for the Lighting overview and the device view. Refreshes from `list_devices` and on every
 // engine event, so hot-plug, faults and tray actions show up without a manual reload.
 
 import { reactive } from 'vue'

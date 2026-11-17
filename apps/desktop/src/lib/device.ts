@@ -121,7 +121,7 @@ export function brightnessMode(view: DeviceView): Mode | null {
   return view.description.modes.find((m) => m.id === id) ?? null
 }
 
-/** Whether a takeover (Connect all, brightness) can drive the device, as the engine reports it. */
+/** Whether a takeover (Take over all, brightness) can drive the device, as the engine reports it. */
 export const canTakeOver = (view: DeviceView): boolean => view.takeover !== null
 
 /** Whether any mode can be saved to the device's flash on request. */

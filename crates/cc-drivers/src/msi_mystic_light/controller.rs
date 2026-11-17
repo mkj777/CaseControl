@@ -274,6 +274,7 @@ fn layout_zones(board: &Board, lens: &[usize]) -> (Vec<Zone>, Vec<Led>) {
             start: leds.len() - len,
             len,
             resizable,
+            brightness_only: false,
         });
     }
     (zones, leds)

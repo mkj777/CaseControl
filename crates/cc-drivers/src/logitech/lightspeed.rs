@@ -447,6 +447,7 @@ pub fn describe(probe: &LightspeedProbe, wpid: u16, id: DeviceId, location: Stri
             start: i,
             len: 1,
             resizable: None,
+            brightness_only: false,
         });
         leds.push(Led { name: led_name });
     }

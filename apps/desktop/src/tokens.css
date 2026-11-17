@@ -148,6 +148,9 @@
   --tile-min: 260px; /* two tile columns at the 860 px minimum window */
   --dialog-width: 480px;
   --menu-min-width: 180px;
+  --popover-width: 320px; /* the ColorPicker popover of a colour button: two rows of swatches */
+  --tooltip-max-width: 280px;
+  --brand-icon-size: 24px; /* app icon next to the name in the sidebar */
 
   color-scheme: dark;
 }

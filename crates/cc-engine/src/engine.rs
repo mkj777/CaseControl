@@ -202,6 +202,7 @@ impl Slot {
         self.want = Some(match setting {
             DeviceSetting::Direct { mut colors } => {
                 mask_hidden_zones(&self.description, &fallback.dark, &mut colors);
+                self.description.reduce_fixed_colors(&mut colors);
                 self.colors = colors;
                 Want::Direct
             }
@@ -440,6 +441,7 @@ impl Shared {
             if let Some(dark) = st.dark_zones.get(id) {
                 mask_hidden_zones(&slot.description, dark, &mut colors);
             }
+            slot.description.reduce_fixed_colors(&mut colors);
             slot.colors = colors;
             slot.want = Some(Want::Direct);
             if let Some(output) = slot.output(levels) {

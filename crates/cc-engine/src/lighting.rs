@@ -9,6 +9,10 @@
 //!   brightness inside its range, from the range minimum (factor 0) up to the stored brightness (factor 1; the range
 //!   maximum when the state has none). A mode that declares the capability without a range is taken as `0..=100`.
 //! - **Hardware modes without one** are sent unchanged; device and master brightness do not affect them.
+//! - **Brightness-only LEDs** ([`Zone::brightness_only`](cc_core::Zone::brightness_only), e.g. the RTX 5080 FE):
+//!   a colour counts only as an intensity, its highest channel, so the direct colours (sent and recorded) of those
+//!   LEDs become white scaled by that intensity before the brightness factor applies. A takeover with the default
+//!   colour drives them at full intensity whatever the colour, so only brightness matters there.
 //! - **Off** (a factor of 0, i.e. device or master brightness 0; ADR 0001 #35) in a hardware mode: the device's mode
 //!   named "Off" if it has one that takes no colours, else black in its direct mode; a device with neither keeps its
 //!   mode at the lowest brightness.
@@ -132,13 +136,16 @@ pub(crate) fn off_output(desc: &DeviceDescription) -> Option<Out> {
 pub(crate) fn output(desc: &DeviceDescription, want: &Want, colors: &[Rgb], levels: Levels) -> Output {
     let factor = levels.factor();
     match want {
-        Want::Direct => Output {
-            stored: DeviceSetting::Direct {
-                colors: colors.to_vec(),
-            },
-            out: Out::Direct(scale_colors(colors, factor)),
-        },
+        Want::Direct => {
+            let mut colors = colors.to_vec();
+            desc.reduce_fixed_colors(&mut colors);
+            Output {
+                out: Out::Direct(scale_colors(&colors, factor)),
+                stored: DeviceSetting::Direct { colors },
+            }
+        }
         Want::Mode(state) => {
+            let state = &reduce_mode_colors(desc, state);
             let stored = DeviceSetting::Mode { state: state.clone() };
             let range = desc.mode(state.mode).and_then(brightness_range);
             if factor <= 0.0
@@ -161,6 +168,19 @@ pub(crate) fn output(desc: &DeviceDescription, want: &Want, colors: &[Rgb], leve
     }
 }
 
+/// `state` with its per-LED colours reduced for brightness-only LEDs ([`DeviceDescription::reduce_fixed_colors`]);
+/// unchanged for a mode that does not take per-LED colours.
+fn reduce_mode_colors(desc: &DeviceDescription, state: &ModeState) -> ModeState {
+    let mut state = state.clone();
+    if desc
+        .mode(state.mode)
+        .is_some_and(|m| m.color_mode == ColorMode::PerLed)
+    {
+        desc.reduce_fixed_colors(&mut state.colors);
+    }
+    state
+}
+
 /// Sets the LEDs of every zone of `desc` named in `zones` to black: the app's hidden zones (ADR 0001 #26), which the
 /// engine keeps black in every direct output (its dark zones, see
 /// [`EngineHandle::set_dark_zones`](crate::EngineHandle::set_dark_zones)). Slices beyond the end of `colors` are
@@ -180,14 +200,19 @@ pub fn mask_hidden_zones(desc: &DeviceDescription, zones: &BTreeSet<String>, col
 /// What a takeover drives a device with when it has neither a setting nor a hardware readback (ADR 0001 #36):
 /// `color` on every LED in its direct mode, else its first mode that takes a colour (per LED, or mode-wide with room
 /// for at least one) set to `color`, with speed in the middle and brightness at the top of their ranges. LEDs of the
-/// zones named in `dark` stay black where colours are per LED. `None` when the device has neither a direct mode nor
-/// such a mode.
+/// zones named in `dark` stay black where colours are per LED. Brightness-only LEDs get white (full intensity) instead of
+/// `color`, so only brightness matters for them. `None` when the device has neither a direct mode nor such a mode.
 pub(crate) fn default_setting(
     desc: &DeviceDescription,
     color: Rgb,
     dark: &BTreeSet<String>,
 ) -> Option<DeviceSetting> {
-    let mut leds = vec![color; desc.led_count()];
+    let count = desc.led_count();
+    let mut leds = vec![color; count];
+    for zone in desc.zones.iter().filter(|z| z.brightness_only) {
+        let range = zone.range();
+        leds[range.start.min(count)..range.end.min(count)].fill(Rgb::WHITE);
+    }
     mask_hidden_zones(desc, dark, &mut leds);
     if desc.direct_mode.is_some() {
         return Some(DeviceSetting::Direct { colors: leds });
@@ -278,6 +303,7 @@ mod tests {
                 start: 0,
                 len: 2,
                 resizable: None,
+                brightness_only: false,
             }],
             leds: vec![Led { name: "a".into() }, Led { name: "b".into() }],
             modes,
@@ -433,6 +459,7 @@ mod tests {
             start,
             len,
             resizable: None,
+            brightness_only: false,
         };
         let mut d = desc(modes, direct.then_some(0));
         d.zones = vec![zone("Board", 0, 1), zone("A", 1, 3), zone("B", 4, 2)];
@@ -513,6 +540,84 @@ mod tests {
             default_setting(&d, R, &names(&["Board"])),
             Some(DeviceSetting::Mode {
                 state: state(5, None, vec![B, R, R, R, R, R])
+            })
+        );
+    }
+
+    /// `zoned` with zone "A" (LEDs 1..4) brightness-only, or every zone with `all`.
+    fn fixed(all: bool, modes: Vec<Mode>) -> DeviceDescription {
+        let mut d = zoned(true, modes);
+        for z in &mut d.zones {
+            z.brightness_only = all || z.name == "A";
+        }
+        d
+    }
+
+    #[test]
+    fn brightness_only_leds_get_their_intensity_as_white_then_scale() {
+        let direct = mode(0, "Direct", ModeCaps::PER_LED_COLOR, ColorMode::PerLed, None);
+        let d = fixed(false, vec![direct]);
+        let orange = Rgb::new(200, 100, 0);
+        let colors = vec![orange, orange, Rgb::new(0, 0, 255), B, R, R];
+        let full = output(&d, &Want::Direct, &colors, Levels::FULL);
+        let grey = Rgb::new(200, 200, 200);
+        let reduced = vec![orange, grey, Rgb::WHITE, B, R, R];
+        assert_eq!(full.out, Out::Direct(reduced.clone()));
+        assert_eq!(
+            full.stored,
+            DeviceSetting::Direct {
+                colors: reduced.clone()
+            }
+        );
+        // Device x master brightness scale the intensity like any colour: 200 * 0.5 * 0.5 = 50.
+        let quarter = output(&d, &Want::Direct, &colors, levels(50, 50));
+        assert_eq!(
+            quarter.out,
+            Out::Direct(vec![
+                Rgb::new(50, 25, 0),
+                Rgb::new(50, 50, 50),
+                Rgb::new(64, 64, 64),
+                B,
+                Rgb::new(64, 0, 0),
+                Rgb::new(64, 0, 0)
+            ])
+        );
+        // Per-LED colours of a hardware mode are reduced too.
+        let per_led = mode(5, "Static", ModeCaps::PER_LED_COLOR, ColorMode::PerLed, None);
+        let d = fixed(true, vec![per_led]);
+        let want = Want::Mode(state(5, None, vec![R; 6]));
+        assert_eq!(
+            output(&d, &want, &[], Levels::FULL).out,
+            Out::Mode(state(5, None, vec![Rgb::WHITE; 6]))
+        );
+    }
+
+    #[test]
+    fn takeover_default_drives_brightness_only_leds_at_full_intensity() {
+        let direct = mode(0, "Direct", ModeCaps::PER_LED_COLOR, ColorMode::PerLed, None);
+        let dim_blue = Rgb::new(0, 0, 40);
+        let d = fixed(true, vec![direct.clone()]);
+        let setting = default_setting(&d, dim_blue, &BTreeSet::new());
+        assert_eq!(
+            setting,
+            Some(DeviceSetting::Direct {
+                colors: vec![Rgb::WHITE; 6]
+            })
+        );
+        // Only brightness matters: half device brightness is half white.
+        let Some(DeviceSetting::Direct { colors }) = setting else {
+            unreachable!("checked above")
+        };
+        assert_eq!(
+            output(&d, &Want::Direct, &colors, levels(50, 100)).out,
+            Out::Direct(vec![Rgb::new(128, 128, 128); 6])
+        );
+        // Mixed device: colour LEDs keep the default colour, dark zones stay black.
+        let d = fixed(false, vec![direct]);
+        assert_eq!(
+            default_setting(&d, dim_blue, &names(&["B"])),
+            Some(DeviceSetting::Direct {
+                colors: vec![dim_blue, Rgb::WHITE, Rgb::WHITE, Rgb::WHITE, B, B]
             })
         );
     }

@@ -122,6 +122,13 @@ pub struct Zone {
     pub len: usize,
     /// Allowed lengths if the zone can be resized (e.g. ARGB headers).
     pub resizable: Option<RangeInclusive<usize>>,
+    /// The zone's LEDs have a fixed colour and only take a brightness (e.g. NVIDIA `SINGLE_COLOR` / `COLOR_FIXED`
+    /// zones). A colour sent to them counts only as an intensity, its highest channel ([`Rgb::intensity`]).
+    /// Missing in JSON means `false`.
+    ///
+    /// [`Rgb::intensity`]: crate::Rgb::intensity
+    #[serde(default)]
+    pub brightness_only: bool,
 }
 
 impl Zone {
@@ -172,6 +179,28 @@ impl DeviceDescription {
     /// If `zone` is not a valid zone index.
     pub fn zone_range(&self, zone: usize) -> Range<usize> {
         self.zones[zone].range()
+    }
+
+    /// Whether the device has LEDs and every one of them is brightness-only ([`Zone::brightness_only`]), so colour
+    /// controls do not apply to it at all.
+    pub fn is_brightness_only(&self) -> bool {
+        let lit: Vec<&Zone> = self.zones.iter().filter(|z| z.len > 0).collect();
+        !lit.is_empty() && lit.iter().all(|z| z.brightness_only)
+    }
+
+    /// Reduces `colors` (one per LED) in place to what the device can show: the LEDs of brightness-only zones get
+    /// white scaled by the colour's intensity ([`Rgb::intensity`](crate::Rgb::intensity)), so white stays full and
+    /// black stays off. Other LEDs are unchanged; slices beyond the end of `colors` are ignored.
+    pub fn reduce_fixed_colors(&self, colors: &mut [crate::Rgb]) {
+        let len = colors.len();
+        for zone in self.zones.iter().filter(|z| z.brightness_only) {
+            let range = zone.range();
+            let (start, end) = (range.start.min(len), range.end.min(len));
+            for c in &mut colors[start..end] {
+                let v = c.intensity();
+                *c = crate::Rgb::new(v, v, v);
+            }
+        }
     }
 
     /// Looks a mode up by id.
@@ -357,6 +386,7 @@ pub(crate) fn sample_description() -> DeviceDescription {
                 start: 0,
                 len: 1,
                 resizable: None,
+                brightness_only: false,
             },
             Zone {
                 name: "ARGB 1".into(),
@@ -364,6 +394,7 @@ pub(crate) fn sample_description() -> DeviceDescription {
                 start: 1,
                 len: 3,
                 resizable: Some(0..=120),
+                brightness_only: false,
             },
             Zone {
                 name: "Keys".into(),
@@ -375,6 +406,7 @@ pub(crate) fn sample_description() -> DeviceDescription {
                 start: 4,
                 len: 3,
                 resizable: None,
+                brightness_only: false,
             },
         ],
         leds: (0..7).map(led).collect(),
@@ -629,8 +661,55 @@ mod tests {
             start: usize::MAX - 1,
             len: 5,
             resizable: None,
+            brightness_only: false,
         };
         assert_eq!(z.range(), usize::MAX - 1..usize::MAX);
+    }
+
+    #[test]
+    fn brightness_only_device_and_reduction() {
+        let mut d = sample_description();
+        assert!(!d.is_brightness_only());
+        d.zones[1].brightness_only = true;
+        // Mixed: only zone 1 (LEDs 1..4) is reduced.
+        assert!(!d.is_brightness_only());
+        let red = Rgb::new(255, 0, 0);
+        let mut colors = vec![red; 7];
+        colors[2] = Rgb::new(10, 60, 20);
+        colors[3] = Rgb::BLACK;
+        d.reduce_fixed_colors(&mut colors);
+        assert_eq!(colors[0], red);
+        assert_eq!(colors[1], Rgb::WHITE);
+        assert_eq!(colors[2], Rgb::new(60, 60, 60));
+        assert_eq!(colors[3], Rgb::BLACK);
+        assert_eq!(colors[4], red);
+        // A short buffer cannot panic.
+        d.reduce_fixed_colors(&mut [red; 2]);
+        // Every zone with LEDs brightness-only: the device is; an empty zone does not count.
+        for z in &mut d.zones {
+            z.brightness_only = true;
+        }
+        assert!(d.is_brightness_only());
+        d.zones[0].brightness_only = false;
+        d.zones[0].len = 0;
+        d.zones[1].start = 0;
+        d.zones[2].start = 3;
+        d.leds.truncate(6);
+        assert_eq!(d.validate(), Ok(()));
+        assert!(d.is_brightness_only());
+    }
+
+    #[test]
+    fn json_brightness_only_defaults_to_false() {
+        let d = sample_description();
+        let mut json = serde_json::to_value(&d).expect("serialize");
+        assert_eq!(json["zones"][0]["brightness_only"], serde_json::json!(false));
+        json["zones"][0]
+            .as_object_mut()
+            .expect("object")
+            .remove("brightness_only");
+        let back: DeviceDescription = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, d);
     }
 
     fn json_str<T: Serialize>(v: &T) -> String {

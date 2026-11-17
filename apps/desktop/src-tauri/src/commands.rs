@@ -830,6 +830,7 @@ mod tests {
                     start: 0,
                     len: 1,
                     resizable: None,
+                    brightness_only: false,
                 },
                 Zone {
                     name: "JRAINBOW1".into(),
@@ -837,6 +838,7 @@ mod tests {
                     start: 1,
                     len: 1,
                     resizable: Some(0..=120),
+                    brightness_only: false,
                 },
             ],
             leds: vec![Led { name: "a".into() }, Led { name: "b".into() }],

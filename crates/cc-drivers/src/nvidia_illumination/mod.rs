@@ -9,6 +9,8 @@
 //! - One single-LED zone per NvAPI zone, modes "Off" and "Direct" (per-zone colour plus brightness 0..=100), and the
 //!   reference's colour mapping per zone type ([`mapping`]): RGB as RGB, RGBW as RGBW with the reference's
 //!   near-grey-to-white rule, SINGLE_COLOR / COLOR_FIXED as brightness scaled by the colour's value (a deviation, see [`mapping::direct_color`]).
+//!   SINGLE_COLOR / COLOR_FIXED zones are described as [`brightness_only`](cc_core::Zone::brightness_only): they
+//!   show their own fixed colour (white on the RTX 5080 FE) and the UI offers no colour for them.
 //! - Each write sends the whole control struct once and is skipped when identical to the last one sent.
 //!   `release()` writes the kept params back; the next write after a release reads `GetControl` again first.
 //!
@@ -34,7 +36,9 @@ mod controller;
 pub mod mapping;
 pub mod table;
 
-pub use controller::{IllumApi, IllumController, MODE_DIRECT, MODE_OFF, NvApiGpu, describe};
+pub use controller::{
+    IllumApi, IllumController, MODE_DIRECT, MODE_OFF, NvApiGpu, describe, is_brightness_only,
+};
 pub use table::{SUPPORTED, SupportedGpu, lookup};
 
 /// The backend for this family.

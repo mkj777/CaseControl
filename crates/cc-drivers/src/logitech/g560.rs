@@ -476,6 +476,7 @@ pub fn describe(
             start: i,
             len: 1,
             resizable: None,
+            brightness_only: false,
         });
         leds.push(Led { name });
     }
