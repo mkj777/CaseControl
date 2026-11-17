@@ -48,6 +48,16 @@ pub fn hidden_devices(settings: &Settings) -> HashSet<DeviceId> {
         .collect()
 }
 
+/// The hidden zones of every device that has some (the engine's dark zones: the default colour leaves them black).
+pub fn hidden_zone_map(settings: &Settings) -> BTreeMap<DeviceId, BTreeSet<String>> {
+    settings
+        .devices
+        .iter()
+        .filter(|(_, ov)| !ov.hidden_zones.is_empty())
+        .map(|(id, ov)| (id.clone(), ov.hidden_zones.clone()))
+        .collect()
+}
+
 /// Whether device `id` is hidden.
 pub fn is_device_hidden(settings: &Settings, id: &DeviceId) -> bool {
     settings.devices.get(id).is_some_and(|ov| ov.hidden)
@@ -317,9 +327,17 @@ mod tests {
         assert!(set_zone_hidden(&mut s, &board_id(), "JRAINBOW2", true));
         assert!(!set_zone_hidden(&mut s, &board_id(), "JRGB1", true));
         assert_eq!(hidden_zones(&s, &board_id()), names(&["JRGB1", "JRAINBOW2"]));
+        assert_eq!(
+            hidden_zone_map(&s),
+            BTreeMap::from([(board_id(), names(&["JRGB1", "JRAINBOW2"]))])
+        );
         assert!(set_zone_hidden(&mut s, &board_id(), "JRGB1", false));
         assert!(set_zone_hidden(&mut s, &board_id(), "JRAINBOW2", false));
         assert!(hidden_zones(&s, &board_id()).is_empty());
+        assert!(
+            hidden_zone_map(&s).is_empty(),
+            "devices without hidden zones are left out"
+        );
         assert_eq!(
             s.devices[&board_id()].zone_sizes["JRAINBOW1"],
             30,

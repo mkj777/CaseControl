@@ -163,9 +163,9 @@ fn on_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
         }),
         TrayAction::ReleaseDevices => in_background(app, |app, state| {
             match crate::commands::release_all_now(state) {
-                Ok(results) => {
-                    for r in results.iter().filter(|r| r.error.is_some()) {
-                        tracing::warn!(id = %r.id, error = ?r.error, "tray: release failed");
+                Ok(report) => {
+                    for f in &report.failed {
+                        tracing::warn!(id = %f.id, error = %f.error, "tray: release failed");
                     }
                 }
                 Err(err) => tracing::error!(%err, "tray: cannot release devices"),

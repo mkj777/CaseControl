@@ -13,6 +13,7 @@
 //!   named "Off" if it has one that takes no colours, else black in its direct mode; a device with neither keeps its
 //!   mode at the lowest brightness.
 
+use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
 
 use cc_config::DeviceSetting;
@@ -158,6 +159,66 @@ pub(crate) fn output(desc: &DeviceDescription, want: &Want, colors: &[Rgb], leve
             }
         }
     }
+}
+
+/// What a takeover drives a device with when it has neither a setting nor a hardware readback (ADR 0001 #36):
+/// `color` on every LED in its direct mode (returned as the new colour buffer), else its first mode that takes a
+/// colour (per LED or mode-wide) set to `color`, with speed in the middle and brightness at the top of their ranges.
+/// LEDs of the zones named in `dark` stay black where colours are per LED. `None` when the device has neither a
+/// direct mode nor such a mode.
+pub(crate) fn default_want(
+    desc: &DeviceDescription,
+    color: Rgb,
+    dark: Option<&BTreeSet<String>>,
+) -> Option<(Want, Option<Vec<Rgb>>)> {
+    let mut leds = vec![color; desc.led_count()];
+    for zone in desc
+        .zones
+        .iter()
+        .filter(|z| dark.is_some_and(|d| d.contains(&z.name)))
+    {
+        if let Some(slice) = leds.get_mut(zone.range()) {
+            slice.fill(Rgb::BLACK);
+        }
+    }
+    if desc.direct_mode.is_some() {
+        return Some((Want::Direct, Some(leds)));
+    }
+    desc.modes
+        .iter()
+        .filter(|m| Some(m.id) != desc.direct_mode)
+        .find_map(|m| {
+            let colors = match m.color_mode {
+                ColorMode::PerLed => leds.clone(),
+                ColorMode::ModeSpecific => {
+                    let range = m.colors.as_ref()?;
+                    let n = (*range.start()).max(1).min(*range.end());
+                    vec![color; n]
+                }
+                ColorMode::None | ColorMode::Random => return None,
+            };
+            let mid = |r: &RangeInclusive<u32>| {
+                let (lo, hi) = (*r.start().min(r.end()), *r.start().max(r.end()));
+                lo + (hi - lo) / 2
+            };
+            let state = ModeState {
+                mode: m.id,
+                speed: m
+                    .caps
+                    .contains(ModeCaps::SPEED)
+                    .then(|| m.speed.as_ref().map(mid))
+                    .flatten(),
+                brightness: m
+                    .caps
+                    .contains(ModeCaps::BRIGHTNESS)
+                    .then(|| m.brightness.as_ref().map(|r| *r.start().max(r.end())))
+                    .flatten(),
+                direction: None,
+                colors,
+            };
+            desc.validate_state(&state).is_ok().then_some(state)
+        })
+        .map(|state| (Want::Mode(state), None))
 }
 
 #[cfg(test)]

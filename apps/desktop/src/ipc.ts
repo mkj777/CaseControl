@@ -171,6 +171,14 @@ export interface ApplyReport {
   failed: ApplyFailure[]
 }
 
+/** Result of Release all. */
+export interface ReleaseReport {
+  /** How many devices were driven and are released now. */
+  released: number
+  /** Devices whose release failed. */
+  failed: ApplyFailure[]
+}
+
 // ---- cc-conflicts ----------------------------------------------------------------------------------------------
 
 export type Severity = 'info' | 'low' | 'medium' | 'high'
@@ -341,11 +349,6 @@ export interface DeviceList {
   lighting: LightingView
 }
 
-export interface ReleaseResult {
-  id: DeviceId
-  error: string | null
-}
-
 export interface ProfileList {
   names: string[]
   active: string | null
@@ -359,6 +362,8 @@ export interface SettingsView {
   detectors: Record<string, boolean>
   check_openrgb_port: boolean
   last_profile: string | null
+  /** The colour a takeover shows on a device with neither a stored setting nor a known own mode (ADR 0001 #36). */
+  default_color: Rgb
   /** Why settings are not saved this session (unreadable settings file); changes are refused while set. */
   save_error: string | null
 }
@@ -369,6 +374,7 @@ export interface SettingsPatch {
   frame_rate?: number
   detectors?: Record<string, boolean>
   check_openrgb_port?: boolean
+  default_color?: Rgb
 }
 
 // ---- commands --------------------------------------------------------------------------------------------------
@@ -386,14 +392,14 @@ export const resizeZone = (id: DeviceId, zone: number, len: number) =>
   invoke<DeviceView>('resize_zone', { id, zone, len })
 export const saveToHardware = (id: DeviceId) => invoke<void>('save_to_hardware', { id })
 export const releaseDevice = (id: DeviceId) => invoke<void>('release_device', { id })
-export const releaseAll = () => invoke<ReleaseResult[]>('release_all')
+export const releaseAll = () => invoke<ReleaseReport>('release_all')
 /** `persist = false` while a slider is dragged, `true` for the final value (saved in the settings). */
 export const setDeviceBrightness = (id: DeviceId, percent: number, persist: boolean) =>
   invoke<void>('set_device_brightness', { id, percent, persist })
 export const setMasterBrightness = (percent: number, persist: boolean) =>
   invoke<LightingView>('set_master_brightness', { percent, persist })
 /** Connect all, the counterpart of Release all: takes control of every released device that is neither hidden nor
- * faulted (its last setting, else its own mode; a device with neither stays released). */
+ * faulted (its last setting, else its own mode, else the default colour from the settings). */
 export const connectAll = () => invoke<LightingView>('connect_all')
 export const rescan = () => invoke<DeviceList>('rescan')
 export const setDeviceHidden = (id: DeviceId, hidden: boolean) =>

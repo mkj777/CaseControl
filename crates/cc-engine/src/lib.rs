@@ -19,8 +19,9 @@
 //!   `Released` while it shows its own lighting, which includes "never taken since it was detected";
 //!   `DeviceStateChanged` is emitted on every change. Every lighting control takes over an undriven device that is
 //!   not excluded: colours and modes directly; brightness and Connect all with the device's last setting, else the
-//!   mode its driver read back from the hardware (`DeviceView::hardware`); a device with neither keeps its own
-//!   lighting.
+//!   mode its driver read back from the hardware (`DeviceView::hardware`), else the default colour (ADR 0001 #36,
+//!   [`EngineHandle::set_default_color`]) on every LED in direct mode, or in the first mode that takes a colour for a
+//!   device without a direct mode. Only a device with none of these keeps its own lighting.
 //! - Resume (sleep, hibernation): on Windows the engine subscribes to suspend/resume broadcasts and then calls
 //!   [`EngineHandle::reassert`]: debounced, it resets and re-sends every driven device's current output, retries
 //!   failed writes with back-off for a few seconds and re-opens devices that faulted or vanished during sleep.
@@ -45,4 +46,6 @@ mod tests;
 pub use cc_config::DeviceSetting;
 pub use engine::{EngineConfig, EngineHandle, start};
 pub use error::EngineError;
-pub use view::{ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView};
+pub use view::{
+    ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView, ReleaseReport,
+};

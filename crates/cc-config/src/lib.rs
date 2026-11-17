@@ -25,6 +25,7 @@ pub use error::{ConfigError, Result};
 pub use paths::Paths;
 pub use profile::{DeviceSetting, Profile};
 pub use settings::{
-    ConflictSettings, DEFAULT_FRAME_RATE, DeviceOverrides, FRAME_RATE_RANGE, FULL_BRIGHTNESS, Settings,
+    ConflictSettings, DEFAULT_COLOR, DEFAULT_FRAME_RATE, DeviceOverrides, FRAME_RATE_RANGE, FULL_BRIGHTNESS,
+    Settings,
 };
 pub use store::{MAX_NAME_LEN, ProfileStore, file_stem_for, validate_name};

@@ -5,6 +5,8 @@
 // the h1 stays for screen readers); the page starts with one toolbar row: All brightness, Connect all and Release
 // all (ADR 0001 #33, #35) on the left, Show hidden and Rescan on the right. Each tile shows the real status and what
 // the device shows: its colours, the name of its own mode while released, empty LEDs when that is unknown.
+// While Rescan runs the page is inactive (controls disabled, tiles dimmed and inert, `aria-busy`). Hiding a driven
+// device and Release all confirm with a toast, since the change is not visible where the user clicked (ADR 0001 #36).
 import { computed, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import BrightnessSlider from '../components/BrightnessSlider.vue'
@@ -25,6 +27,7 @@ import {
 import { connectAll, errorText, releaseAll, setMasterBrightness, type DeviceView } from '../ipc'
 import {
   STATUS_LABEL,
+  canTakeOver,
   deviceErrorText,
   familyLabel,
   lightingLabel,
@@ -41,6 +44,7 @@ import {
   refreshDevices,
   rescanDevices,
 } from '../stores/devices'
+import { releasedText, showToast } from '../stores/toast'
 
 const deviceLink = (id: string) => ({ name: 'device', params: { id } })
 
@@ -69,8 +73,11 @@ function openMenu(e: MouseEvent, id: string, hidden: boolean) {
 
 async function toggleHidden(id: string, hidden: boolean) {
   error.value = null
+  // Hiding releases a driven device; only that is worth a toast.
+  const releases = hidden && findDevice(id)?.status.state === 'active'
   try {
     await hideDevice(id, hidden)
+    if (releases) showToast('Device released')
   } catch (e) {
     error.value = errorText(e)
   }
@@ -80,18 +87,16 @@ async function toggleHidden(id: string, hidden: boolean) {
 
 const connecting = ref(false)
 const releasing = ref(false)
-/** The lighting controls need a running engine. */
+/** The lighting controls need a running engine and are off while a rescan runs. */
 const engineDown = computed(() => !deviceState.loaded || deviceState.engineError !== null)
+const scanning = computed(() => deviceState.scanning)
 /** Nothing to release: no device is driven. */
 const noneActive = computed(() => !deviceState.devices.some((d) => statusOf(d) === 'active'))
-/** Connect all has something to do: a released, visible device has a setting or a known own mode to be taken over
- * with (one without either would stay released, so it does not count). */
+/** Connect all has something to do: a released, visible device it can take over (with its setting, its own mode or
+ * the default colour; ADR 0001 #36). */
 const canConnect = computed(() =>
   deviceState.devices.some(
-    (d) =>
-      statusOf(d) === 'released' &&
-      !isDeviceHidden(d.description.info.id) &&
-      (d.setting !== null || d.hardware !== null),
+    (d) => statusOf(d) === 'released' && !isDeviceHidden(d.description.info.id) && canTakeOver(d),
   ),
 )
 
@@ -120,9 +125,10 @@ async function onReleaseAll() {
   error.value = null
   releasing.value = true
   try {
-    const failed = (await releaseAll()).filter((r) => r.error !== null)
-    if (failed.length > 0) {
-      const names = failed.map((r) => `${findDevice(r.id)?.description.info.name ?? r.id}: ${r.error}`)
+    const report = await releaseAll()
+    if (report.released > 0) showToast(releasedText(report.released))
+    if (report.failed.length > 0) {
+      const names = report.failed.map((r) => `${findDevice(r.id)?.description.info.name ?? r.id}: ${r.error}`)
       error.value = `Some devices could not be released. ${names.join('; ')}`
     }
   } catch (e) {
@@ -135,12 +141,12 @@ async function onReleaseAll() {
 </script>
 
 <template>
-  <section class="page wide">
+  <section class="page wide" :aria-busy="scanning">
     <PageHeader title="Devices" title-hidden>
       <template #actions>
-        <Switch v-model="deviceState.showHiddenDevices" label="Show hidden" compact />
-        <Button :disabled="deviceState.scanning" @click="rescanDevices">
-          {{ deviceState.scanning ? 'Scanning…' : 'Rescan' }}
+        <Switch v-model="deviceState.showHiddenDevices" label="Show hidden" compact :disabled="scanning" />
+        <Button :disabled="scanning" @click="rescanDevices">
+          {{ scanning ? 'Scanning…' : 'Rescan' }}
         </Button>
       </template>
       <template #controls>
@@ -148,13 +154,13 @@ async function onReleaseAll() {
           label="All brightness"
           :value="deviceState.lighting.master_brightness"
           :send="sendMaster"
-          :disabled="engineDown"
+          :disabled="engineDown || scanning"
           @error="lightingFailed"
         />
-        <Button :disabled="engineDown || connecting || releasing || !canConnect" @click="onConnectAll">
+        <Button :disabled="engineDown || scanning || connecting || releasing || !canConnect" @click="onConnectAll">
           Connect all
         </Button>
-        <Button :disabled="engineDown || connecting || releasing || noneActive" @click="onReleaseAll">
+        <Button :disabled="engineDown || scanning || connecting || releasing || noneActive" @click="onReleaseAll">
           {{ releasing ? 'Releasing…' : 'Release all' }}
         </Button>
       </template>
@@ -167,7 +173,7 @@ async function onReleaseAll() {
     <Notice v-if="deviceState.error" variant="error">Could not load the device list: {{ deviceState.error }}</Notice>
     <Notice v-if="error" variant="error">{{ error }}</Notice>
 
-    <div v-if="tiles.length > 0" class="grid">
+    <div v-if="tiles.length > 0" class="grid" :class="{ busy: scanning }" :inert="scanning">
       <Tile
         v-for="t in tiles"
         :key="t.id"
@@ -197,8 +203,8 @@ async function onReleaseAll() {
       Other RGB software can hold a device so CaseControl cannot reach it. Close it and rescan, or see
       <RouterLink to="/conflicts">Conflicts</RouterLink> for what is running.
       <template #action>
-        <Button variant="primary" :disabled="deviceState.scanning" @click="rescanDevices">
-          {{ deviceState.scanning ? 'Scanning…' : 'Rescan' }}
+        <Button variant="primary" :disabled="scanning" @click="rescanDevices">
+          {{ scanning ? 'Scanning…' : 'Rescan' }}
         </Button>
       </template>
     </EmptyState>
@@ -221,5 +227,11 @@ async function onReleaseAll() {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(var(--tile-min), 1fr));
   gap: var(--space-6);
+}
+
+/* Rescan running: the tiles are inert (no clicks, no focus, no context menu) and dimmed like other disabled
+   controls (the 50 % of Switch and ColorPicker). */
+.grid.busy {
+  opacity: 0.5;
 }
 </style>

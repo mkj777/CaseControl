@@ -101,7 +101,7 @@ strings, `--font-icon` (Segoe Fluent Icons, ships with Windows 11) for functiona
 | Token | Size | Weight | Line height | Use |
 |---|---|---|---|---|
 | `--text-xl` | 28 px | 600 | 1.25 | Page title (h1), one per page |
-| `--text-lg` | 18 px | 600 | 1.25 | Section title (h2), tile, finding and dialog titles; profile names (400) |
+| `--text-lg` | 18 px | 600 | 1.25 | Section title (h2), tile and dialog titles; list row names (400: profiles, conflict findings) |
 | `--text-md` | 15 px | 400 | 1.5 | Body, controls |
 | `--text-sm` | 13 px | 400 | 1.5 | Hints, metadata, badges, zone names |
 
@@ -114,15 +114,15 @@ Running text stops at `--measure` (60ch). Numbers that change (values next to sl
 
 **Elevation.** No shadows in the page. Depth is surface step plus border: page `--bg`, cards `--surface` with
 `--border`, interactive cards hover to `--surface-raised` with `--border-strong`. Only overlays (context menu,
-dialog) add `--shadow-overlay`, to separate them from what they cover.
+dialog, toast) add `--shadow-overlay`, to separate them from what they cover.
 
 **Motion.** `--duration` 120 ms, `--ease` ease-out, for `color`, `background-color` and `border-color` only.
 Nothing moves, slides, fades in or scales, except the switch thumb (position, same duration). LED colours in the
 preview do **not** transition: they mirror the hardware, which is already throttled by the engine (ADR #21), and a
 fade makes the preview lag behind the device. `prefers-reduced-motion` sets `--duration` to 0.
 
-**Stacking:** `--z-titlebar` 10, `--z-menu` 20, `--z-dialog` 30, `--z-dialog-menu` 40. Nothing else sets a
-z-index.
+**Stacking:** `--z-titlebar` 10, `--z-menu` 20 (also the toast), `--z-dialog` 30, `--z-dialog-menu` 40. Nothing
+else sets a z-index.
 
 ## Layout
 
@@ -171,9 +171,10 @@ unless noted.
 ### App shell, sidebar and title bar
 
 - **Anatomy:** grid of sidebar (`--sidebar-width`) and content. Sidebar: "CaseControl" at the top
-  (`--text-lg`, 600, in the drag region) with `--space-8` above it, so it does not sit under the window edge (it
+  (`--text-lg`, 600, in the drag region) with `--space-4` above it, so it does not sit under the window edge (it
   does not line up with the content's title strip), then the nav `--space-6` below. Content: a 32 px top strip that is a drag region, with
-  minimise, maximise/restore and close at the top right, each `--window-button-width` x `--titlebar-height`.
+  minimise, maximise/restore and close at the top right, each `--window-button-width` x `--titlebar-height`. The
+  shell also renders the window's one Toast.
 - **Nav item:** `--control-height`, padding `--space-3`, `--radius-md`, `--text-muted`. Hover and current:
   `--text` on `--surface-raised`. Current item also gets `aria-current="page"`. Text only, no icons.
 - **Window buttons:** glyphs from `--font-icon` (`E921` minimise, `E922` maximise, `E923` restore, `E8BB` close),
@@ -211,7 +212,8 @@ unless noted.
 ### Card and tile
 
 - **Card** (static container): `--surface`, 1 px `--border`, `--radius-lg`, padding `--space-6`, content gap
-  `--space-4`. Used for conflict findings, the preview stage (padding `--space-10`), the dialog body.
+  `--space-4`. Used for the preview stage (padding `--space-10`) and the dialog body. Conflict findings are list
+  rows since ADR #36.
 - **Tile** (a card that is a link): same look, `min-height` 220 px, whole tile is the link target. Head (name
   `--text-lg` 600, status badge right, optionally one `--text-sm` muted line about what the device shows: the name
   of its own mode while released, the hardware mode it is driven with), compact preview pinned to the
@@ -289,12 +291,12 @@ unless noted.
   it shows its own value, so a device refresh in between cannot pull the thumb back.
 - **Layout:** the inline Field layout (label at its own width, slider `--toolbar-control-width` down to
   `--toolbar-control-min-width`, readout), since it always sits in a page toolbar.
-- **States:** disabled (engine down, device locked, a hardware mode without a brightness parameter: "This mode has
-  no brightness setting.", or a released device that has no setting and whose own lighting cannot be read, so
-  there is nothing to dim: "Set a colour or mode first."). A failed send is emitted as `error`; the page shows it
-  as an inline Notice.
-- **Takes over:** on a released device it takes control (with its last setting, else its own mode as read back),
-  like every lighting control.
+- **States:** disabled (engine down, device locked, a rescan running on the Devices page, a hardware mode without a
+  brightness parameter: "This mode has no brightness setting."). A failed send is emitted as `error`; the page
+  shows it as an inline Notice.
+- **Takes over:** on a released device it takes control like every lighting control: with its last setting, else
+  its own mode as read back, else the default colour from Settings (ADR #36). So it is never disabled for lack of
+  something to dim.
 - **Rules:** every brightness control is this component (master brightness, labelled "All brightness", on the
   Devices page; device brightness on a device page), usually in the PageHeader `controls` row. The `send` callback decides what `persist` saves;
   the slider never saves on its own.
@@ -407,7 +409,23 @@ Severity group headings on the Conflicts page stay headings, not badges.
   `aria-describedby`; the field gets `aria-invalid`.
 - **Rules:** messages say what happened and what to do next. Success messages ("Saved to the device.") use `info`
   and disappear on the next action. Stacked notices are `--space-3` apart. Error notices and inline errors are
-  selectable (see [Text selection](#text-selection)).
+  selectable (see [Text selection](#text-selection)). A short confirmation that should go away on its own is a
+  Toast, not a Notice.
+
+### Toast
+
+- **Anatomy:** one line of `--text` on `--surface-raised`, 1 px `--border-strong`, `--radius-md`,
+  `--shadow-overlay`, padding `--space-2` (`--space-4` on the left), max width `--dialog-width`, and an IconButton
+  "Dismiss" (glyph `E8BB`, as the window's close button) at the right. Fixed at the bottom right of the window,
+  `--space-6` from both edges, over the content (`--z-menu`; dialogs cover it).
+- **Behaviour:** dismisses itself after 5 s or with its button. One at a time: a new toast replaces the current one
+  and starts the 5 s again. No animation (see Motion). The live region (`role="status"`, `aria-live="polite"`) is
+  always in the DOM, so screen readers announce each toast.
+- **In code:** `components/ui/Toast.vue` (props `toast: { id, text } | null`, `duration` = 5000; emits `dismiss`),
+  rendered once by the shell; pages call `showToast(text)` from `stores/toast.ts`.
+- **Rules (ADR #36):** only for releases whose result is not visible where the user acted: hiding a driven device
+  ("Device released", only if it was driven) and Release all ("1 device released" / "N devices released", the
+  number of devices actually released; none, no toast). Errors stay Notices; a toast never carries an action.
 
 ### List row
 
@@ -416,8 +434,24 @@ Severity group headings on the Conflicts page stay headings, not badges.
   rest ghost). Exception: a danger action (Delete) uses the `sm` danger button, not ghost. The first row draws the
   top line, so the list itself needs no border.
 - **States:** default, current (badge "Active"), editing (the row turns into an inline form with the same height),
-  disabled while busy.
-- **Rules:** rows are not cards. Used for profiles; also for "Found but not started" on Devices (no actions).
+  disabled while busy, expanded (slot `details`, below the row inside its divider, `--space-4` above).
+- **Actions:** stay on the right; when there are more than fit they wrap, right aligned, instead of widening the row.
+- **Expandable row** (Conflicts, ADR #36): the last action is an IconButton chevron (glyph `E70D` down / `E70E` up,
+  label "Show details" / "Hide details", `aria-expanded`, `aria-controls` on the details). The page decides what
+  is open; open rows stay open across a rescan.
+- **Rules:** rows are not cards. Used for profiles, for conflict findings (grouped under the severity h2s) and for
+  "Found but not started" on Devices (no actions).
+
+### Conflicts list
+
+One `ul` of ListRows per severity group (High, Medium, Low, Info), under the group's h2, groups `--space-14` apart.
+One compact row per finding: name, status badge (Running / Installed, not running / Not running), the affected
+devices in `--text-sm` muted ("None of your detected devices" when none), then the actions as `sm` buttons: End
+process / Stop service (danger, behind the confirm dialog), Turn off autostart (secondary), Re-enable autostart
+(ghost), and the chevron. The details below the row: the catalogue note (muted, up to `--measure`), a key-value list
+(Vendor, Device families, Found, Starts with Windows with each entry's command in `--font-mono`; evidence and
+commands selectable), the permission-prompt note when an autostart change needs one, and "Don't ask again at start"
+for RGB suites.
 
 ### Key-value list
 
@@ -452,10 +486,17 @@ The preview is the focus of the app (ADR #15), so it gets the most room and the 
   own colours or unknown LEDs. Every control stays usable and takes the device over.
 - **Off** (ADR #35): brightness 0 (a device's Brightness or All brightness) turns lights off;
   the device stays Active.
-- **Connect all / Release all** (Devices toolbar, secondary buttons): Release all hands every device back and is
-  disabled while no device is Active. Connect all takes every released, visible, non-faulted device over with the
-  same rules as brightness (last setting, else its own mode as read back; a device with neither stays released);
-  it is disabled when every such device is already Active.
+- **Connect all / Release all** (Devices toolbar, secondary buttons): Release all hands every device back, is
+  disabled while no device is Active, and confirms with a toast ("N devices released"). Connect all takes every
+  released, visible, non-faulted device over with the same rules as brightness (ADR #36): last setting, else its own
+  mode as read back, else the default colour from Settings (white unless changed) on every LED, or, without a direct
+  mode, in its first mode that takes a colour; it is disabled when every such device is already Active.
+- **Default colour** (Settings, "Lighting"): one ColorPicker in a stacked group Field "Default colour". It only
+  feeds later takeovers; changing it does not repaint devices that are already driven.
+- **Rescan busy** (Devices): while a rescan runs the Rescan button reads "Scanning…" and is disabled, the toolbar
+  controls (All brightness, Connect all, Release all, Show hidden) are disabled, and the tile grid is dimmed to
+  50 % opacity (the disabled look of Switch and ColorPicker) and `inert` (no clicks, focus or context menu). The
+  page section carries `aria-busy` while it runs.
 
 ## Copy and filler
 
@@ -466,7 +507,8 @@ The preview is the focus of the app (ADR #15), so it gets the most room and the 
   header.", "Open in the tray without showing this window."). Keep a hint only when it adds a fact the control does
   not show (a range, a side effect, a permission prompt, a non-obvious gesture).
 - **No confirmation notices for visible state.** When the result of an action is visible (a badge changes to
-  Released), no notice repeats it.
+  Released), no notice repeats it. The two release toasts (ADR #36) are the owner's exception: the tile of a hidden
+  device disappears, and Release all changes many badges at once.
 - **No decorative bits.** No duplicate labels, ornaments or filler lines; controls that belong together sit in one
   row (see the page toolbar), not scattered over several.
 
