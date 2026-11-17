@@ -150,6 +150,27 @@ const OFF_J_CORSAIR: usize = 53;
 const OFF_J_CORSAIR_OUTERLL120: usize = 64;
 const OFF_ON_BOARD: [usize; 10] = [74, 84, 94, 104, 114, 124, 134, 144, 154, 164];
 const OFF_J_RGB_2: usize = 174;
+/// Start of every zone record (each begins with its effect byte).
+const ZONE_OFFSETS: [usize; 18] = [
+    OFF_J_RGB_1,
+    OFF_J_PIPE_1,
+    OFF_J_PIPE_2,
+    OFF_J_RAINBOW_1,
+    OFF_J_RAINBOW_2,
+    OFF_J_CORSAIR,
+    OFF_J_CORSAIR_OUTERLL120,
+    OFF_ON_BOARD[0],
+    OFF_ON_BOARD[1],
+    OFF_ON_BOARD[2],
+    OFF_ON_BOARD[3],
+    OFF_ON_BOARD[4],
+    OFF_ON_BOARD[5],
+    OFF_ON_BOARD[6],
+    OFF_ON_BOARD[7],
+    OFF_ON_BOARD[8],
+    OFF_ON_BOARD[9],
+    OFF_J_RGB_2,
+];
 
 // Flag bits (`MSI_SPEED_BRIGHTNESS_FLAG_*`, `MSI_COLOR_FLAG_*`).
 const SPEED_MASK: u8 = 0x03;
@@ -352,6 +373,29 @@ impl ConfigPacket {
     /// (`GetMode` returning `MSI_MODE_DIRECT_DUMMY`).
     pub fn is_direct(&self) -> bool {
         self.0[OFF_ON_BOARD[0] + EFFECT] == mode::DIRECT_EFFECT
+    }
+
+    /// Whether any zone record of the packet carries the per-LED effect (0x25), i.e. the packet would put (part of)
+    /// the board into per-LED mode. The enable message sets it on the on-board zone and, in the unsynchronized
+    /// protocol, on the ARGB headers.
+    pub fn has_direct_effect(&self) -> bool {
+        ZONE_OFFSETS
+            .iter()
+            .any(|&o| self.0[o + EFFECT] == mode::DIRECT_EFFECT)
+    }
+
+    /// A remembered "last good own lighting" (ADR 0001 #38) as a packet that is safe to send, or `None`: exactly
+    /// [`CONFIG_LEN`] bytes (the 185-byte class), report id 0x52, save byte 0 and no zone in the per-LED effect.
+    pub fn from_own_lighting(bytes: &[u8]) -> Option<Self> {
+        let packet = Self::from_report(bytes)?;
+        (packet.0[SAVE_BYTE] == 0 && !packet.has_direct_effect()).then_some(packet)
+    }
+
+    /// The bytes to remember as the board's last good own lighting: the packet with the save byte forced to 0, or
+    /// `None` when [`from_own_lighting`](Self::from_own_lighting) would not accept it.
+    pub fn own_lighting(&self) -> Option<Vec<u8>> {
+        let bytes = self.with_save(false);
+        Self::from_own_lighting(&bytes).map(|_| bytes.to_vec())
     }
 
     /// `cycle_or_led_num` of a JRAINBOW zone.
@@ -644,6 +688,60 @@ pub(super) mod tests {
         assert_eq!(classify(0), PacketClass::Other);
         assert_eq!(classify(761), PacketClass::Other);
         assert_eq!(classify(200), PacketClass::Other);
+    }
+
+    #[test]
+    fn own_lighting_validation() {
+        // A Rainbow wave on JRAINBOW1 with every other zone Static: acceptable once the save byte is 0.
+        let mut b = [0u8; CONFIG_LEN];
+        b[0] = CONFIG_REPORT_ID;
+        for o in ZONE_OFFSETS {
+            b[o] = mode::STATIC;
+        }
+        b[OFF_J_RAINBOW_1] = mode::RAINBOW_WAVE;
+        b[SAVE_BYTE] = 1;
+        let read = ConfigPacket(b);
+        assert!(!read.has_direct_effect());
+        assert_eq!(ConfigPacket::from_own_lighting(&b), None, "save byte set");
+        let stored = read.own_lighting().expect("valid");
+        assert_eq!(stored.len(), CONFIG_LEN);
+        assert_eq!(stored[SAVE_BYTE], 0);
+        assert_eq!(stored[..SAVE_BYTE], b[..SAVE_BYTE]);
+        assert_eq!(
+            ConfigPacket::from_own_lighting(&stored).map(|p| p.0.to_vec()),
+            Some(stored.clone())
+        );
+
+        // Wrong length (162-byte class or truncated), wrong report id: rejected.
+        assert_eq!(ConfigPacket::from_own_lighting(&stored[..CONFIG_LEN_162]), None);
+        assert_eq!(
+            ConfigPacket::from_own_lighting(&[stored.as_slice(), &[0]].concat()),
+            None
+        );
+        assert_eq!(ConfigPacket::from_own_lighting(&[]), None);
+        let mut wrong_id = stored.clone();
+        wrong_id[0] = 0x53;
+        assert_eq!(ConfigPacket::from_own_lighting(&wrong_id), None);
+
+        // The per-LED effect in any zone record: rejected, and never offered for storing.
+        for o in ZONE_OFFSETS {
+            let mut direct = stored.clone();
+            direct[o] = mode::DIRECT_EFFECT;
+            assert_eq!(ConfigPacket::from_own_lighting(&direct), None, "offset {o}");
+            let packet = ConfigPacket::from_report(&direct).expect("report");
+            assert!(packet.has_direct_effect());
+            assert_eq!(packet.own_lighting(), None);
+        }
+        // The enable message itself (sync and unsynchronized) is per-LED.
+        let all = Headers {
+            jrainbow1: true,
+            jrainbow2: true,
+            jcorsair: true,
+        };
+        for sync in [true, false] {
+            let enable = enable_direct_packet(sync, all);
+            assert_eq!(ConfigPacket::from_own_lighting(&enable), None);
+        }
     }
 
     #[test]

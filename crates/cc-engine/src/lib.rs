@@ -25,13 +25,21 @@
 //!   says what a takeover would use, so the UI does not repeat that choice.
 //! - Dark zones (the app's hidden zones, ADR 0001 #26): every direct output has them black, whatever path drives the
 //!   device ([`EngineHandle::set_dark_zones`], [`mask_hidden_zones`]).
+//! - Last good own lighting (ADR 0001 #38): every detection hands the drivers what is remembered per device
+//!   (`DetectContext::own_lighting`, from [`EngineConfig::hardware_state`]); what a newly opened controller reports
+//!   through `Controller::own_lighting` is recorded there, which writes `hardware-state.toml` (through `cc-config`)
+//!   only when the value changed. Brightness 0 uses the driver's off mode (`Controller::off_mode`, Mystic Light:
+//!   Static at brightness 0) instead of black in the direct mode where the driver names one.
+//! - Release hardening (ADR 0001 #38): stopping releases faulted devices too (best effort), and detection releases a
+//!   faulted device's controller (stopping its thread) before it opens the device again.
 //! - Resume (sleep, hibernation): on Windows the engine subscribes to suspend/resume broadcasts and then calls
 //!   [`EngineHandle::reassert`]: debounced, it resets and re-sends every driven device's current output, retries
 //!   failed writes with back-off for a few seconds and re-opens devices that faulted or vanished during sleep.
 //! - [`EngineHandle::shutdown`] (or dropping the last handle) releases every active device and joins the threads.
 //!
 //! What this crate deliberately does not do: no device protocols (that is `cc-drivers`), no file I/O or profile
-//! storage (that is `cc-config`; the engine only takes and returns settings), no Tauri or UI code, no effects engine
+//! storage of its own (that is `cc-config`; the engine only takes and returns settings, and records the drivers'
+//! own lighting through `cc_config::HardwareState`, the one file it causes to be written), no Tauri or UI code, no effects engine
 //! (colour frames come from the caller), and it never writes device flash unless [`EngineHandle::save_to_hardware`] is
 //! called.
 

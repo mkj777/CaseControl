@@ -1,6 +1,6 @@
 //! The [`Backend`] trait (device discovery) and hot-plug notifications.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::mpsc::Sender;
 
@@ -21,6 +21,12 @@ pub struct DetectContext {
     /// a hot-plug event never disturbs a device that is in use.
     #[serde(default)]
     pub skip: HashSet<DeviceId>,
+    /// The last good own lighting remembered per device (ADR 0001 #38): driver-opaque bytes a controller reported
+    /// through [`Controller::own_lighting`] on an earlier open, possibly in an
+    /// earlier run. A driver may use them when it finds the device in a state it cannot hand back (e.g. left in
+    /// per-LED mode); it must validate them before sending anything derived from them.
+    #[serde(default)]
+    pub own_lighting: BTreeMap<DeviceId, Vec<u8>>,
 }
 
 impl DetectContext {
@@ -32,6 +38,11 @@ impl DetectContext {
     /// Whether the device `id` is already controlled and must be left alone.
     pub fn is_skipped(&self, id: &DeviceId) -> bool {
         self.skip.contains(id)
+    }
+
+    /// The remembered own lighting of device `id` (see [`own_lighting`](Self::own_lighting)), if any.
+    pub fn stored_own_lighting(&self, id: &DeviceId) -> Option<&[u8]> {
+        self.own_lighting.get(id).map(Vec::as_slice)
     }
 }
 
@@ -188,6 +199,18 @@ mod tests {
             ..Default::default()
         };
         assert!(!ctx.is_skipped(&DeviceId::hid(0x1462, 0x7D75, None)));
+        assert_eq!(
+            ctx.stored_own_lighting(&DeviceId::hid(0x1462, 0x7D75, None)),
+            None
+        );
+        let stored = DetectContext {
+            own_lighting: [(DeviceId::hid(0x1462, 0x7D75, None), vec![0x52, 1])].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            stored.stored_own_lighting(&DeviceId::hid(0x1462, 0x7D75, None)),
+            Some(&[0x52u8, 1][..])
+        );
         assert!(!ctx.is_enabled(family::WOOTING));
         assert!(ctx.is_enabled(family::LOGITECH));
         assert_eq!(b.detect(&ctx).len(), 1);

@@ -194,6 +194,8 @@ pub fn engine_config(settings: &Settings) -> EngineConfig {
         excluded: crate::hidden::hidden_devices(settings),
         default_color: settings.default_color,
         dark_zones: crate::hidden::hidden_zone_map(settings),
+        // Not part of the settings: the caller adds the machine state file (`AppState::init`).
+        hardware_state: cc_config::HardwareState::in_memory(),
     }
 }
 

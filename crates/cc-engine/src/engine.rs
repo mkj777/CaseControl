@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use cc_config::DeviceSetting;
+use cc_config::{DeviceSetting, HardwareState};
 use cc_core::{
     Backend, Bus, Controller, DetectContext, Detected, DeviceDescription, DeviceError, DeviceId, EngineEvent,
     HotplugEvent, ModeState, Rgb,
@@ -35,6 +35,8 @@ const MAX_REMOVED: usize = 64;
 /// A device removed this long before a resume counts as lost in the sleep (Windows may deliver the removals of a
 /// sleep shortly before the resume broadcast).
 const RESUME_LOOKBACK: Duration = Duration::from_secs(10);
+/// How long detection waits for the worker of a faulted device to release it before opening the device again.
+const FAULTED_RELEASE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Bounds of the frame rate.
 const FPS_RANGE: std::ops::RangeInclusive<u32> = 1..=60;
 
@@ -65,6 +67,10 @@ pub struct EngineConfig {
     /// Zones, by name per device, that every direct output leaves black (the app's hidden zones); see
     /// [`EngineHandle::set_dark_zones`].
     pub dark_zones: BTreeMap<DeviceId, BTreeSet<String>>,
+    /// The machine state remembered between runs (ADR 0001 #38): the last good own lighting of each device. Every
+    /// detection hands it to the drivers (`DetectContext::own_lighting`); what a newly opened controller reports
+    /// through `Controller::own_lighting` is recorded in it, which writes its file when the value changed.
+    pub hardware_state: HardwareState,
 }
 
 impl Default for EngineConfig {
@@ -80,6 +86,7 @@ impl Default for EngineConfig {
             excluded: HashSet::new(),
             default_color: cc_config::DEFAULT_COLOR,
             dark_zones: BTreeMap::new(),
+            hardware_state: HardwareState::in_memory(),
         }
     }
 }
@@ -94,6 +101,8 @@ struct Slot {
     colors: Vec<Rgb>,
     /// What the device shows on its own, as its driver read it (validated against the description).
     hardware: Option<ModeState>,
+    /// The driver's off mode (`Controller::off_mode`), used for brightness 0.
+    off_mode: Option<u32>,
     /// What the engine drives the device with (unscaled), or `None` while it does not drive it (never set, or
     /// released). Brightness changes re-send only devices that have one.
     want: Option<Want>,
@@ -159,7 +168,7 @@ impl Slot {
     fn output(&self, levels: Levels) -> Option<Output> {
         self.want
             .as_ref()
-            .map(|want| lighting::output(&self.description, want, &self.colors, levels))
+            .map(|want| lighting::output_with(&self.description, self.off_mode, want, &self.colors, levels))
     }
 
     fn is_faulted(&self) -> bool {
@@ -330,6 +339,8 @@ pub(crate) struct Shared {
     resume: Mutex<Option<ResumeRuntime>>,
     /// When the last reassert started (for the debounce).
     last_reassert: Mutex<Option<Instant>>,
+    /// The remembered machine state (own lighting per device); see [`EngineConfig::hardware_state`].
+    hardware_state: Mutex<HardwareState>,
     next_generation: AtomicU64,
     pub(crate) timing: Timing,
 }
@@ -524,17 +535,21 @@ impl Shared {
         if this.is_closed() {
             return;
         }
+        // Faulted devices are retried: a fresh controller replaces the faulted one. The faulted controller hands its
+        // device back first (best effort), so the new one does not read our own output as the device's lighting.
+        this.release_faulted();
+        let own_lighting = this.hardware_state.lock().own_lighting().clone();
         let ctx = {
             let st = this.state.lock();
             DetectContext {
                 disabled_families: st.disabled_families.clone(),
-                // Faulted devices are retried: a fresh controller replaces the faulted one.
                 skip: st
                     .devices
                     .iter()
                     .filter(|(_, s)| !matches!(s.status, DeviceStatus::Faulted { .. }))
                     .map(|(id, _)| id.clone())
                     .collect(),
+                own_lighting,
             }
         };
         let mut found = Vec::new();
@@ -578,6 +593,56 @@ impl Shared {
         }
     }
 
+    /// Stops the worker of every faulted device that still has one, releasing its device first (best effort, within
+    /// [`FAULTED_RELEASE_TIMEOUT`] each). The slot stays (faulted, without a worker) until detection replaces it.
+    fn release_faulted(&self) {
+        let stopping: Vec<(DeviceId, Sender<Command>, JoinHandle<()>)> = {
+            let mut st = self.state.lock();
+            st.devices
+                .iter_mut()
+                .filter(|(_, s)| s.is_faulted())
+                .filter_map(|(id, s)| s.thread.take().map(|t| (id.clone(), s.tx.clone(), t)))
+                .collect()
+        };
+        for (id, tx, thread) in stopping {
+            let r = self.acked_within(
+                &id,
+                tx,
+                |reply| Command::Stop {
+                    release: true,
+                    reply: Some(reply),
+                },
+                FAULTED_RELEASE_TIMEOUT,
+            );
+            match &r {
+                Ok(()) => debug!(%id, "faulted device released before re-opening it"),
+                Err(e) => {
+                    debug!(%id, error = %e, "release of the faulted device before re-opening it failed")
+                }
+            }
+            // The worker ends right after it answered (or already has); one stuck in a driver call is left behind.
+            if matches!(
+                r,
+                Ok(()) | Err(EngineError::Device(_) | EngineError::UnknownDevice(_))
+            ) && thread.join().is_err()
+            {
+                warn!(%id, "device thread panicked");
+            }
+        }
+    }
+
+    /// Remembers what a newly opened controller reports as the device's own lighting (ADR 0001 #38).
+    fn record_own_lighting(&self, id: &DeviceId, ctrl: &dyn Controller) {
+        let Some(bytes) = ctrl.own_lighting() else {
+            return;
+        };
+        match self.hardware_state.lock().record_own_lighting(id, &bytes) {
+            Ok(true) => info!(%id, "own lighting remembered"),
+            Ok(false) => {}
+            Err(e) => warn!(%id, error = %e, "cannot save the device's own lighting"),
+        }
+    }
+
     fn add_device(this: &Arc<Self>, family: String, mut ctrl: Box<dyn Controller>) {
         let id = ctrl.description().info.id.clone();
         if let Err(e) = ctrl.description().validate() {
@@ -598,6 +663,7 @@ impl Shared {
             warn!(%id, "device detected twice; second instance ignored");
             return;
         }
+        this.record_own_lighting(&id, ctrl.as_ref());
         for (name, len) in zone_sizes {
             let desc = ctrl.description();
             let Some(zone) = desc.zones.iter().position(|z| z.name == name) else {
@@ -616,6 +682,7 @@ impl Shared {
         let hardware = ctrl
             .hardware_mode()
             .filter(|h| description.validate_state(h).is_ok());
+        let off_mode = ctrl.off_mode();
         // The colour buffer starts with what the device shows, where that is known per LED, so a first zone edit
         // keeps the other zones as they are.
         let colors = match &hardware {
@@ -653,6 +720,7 @@ impl Shared {
             status: DeviceStatus::Released,
             setting: None,
             hardware,
+            off_mode,
             want: None,
             resuming: false,
             frame,
@@ -681,7 +749,8 @@ impl Shared {
         };
         if let Some(old) = replaced {
             info!(%id, "faulted device detected again; replacing it");
-            // The faulted worker no longer talks to the device; let it end on its own.
+            // The faulted worker no longer talks to the device (detection already stopped it after a release if it
+            // could); let it end on its own.
             let _ = old.tx.try_send(Command::Stop {
                 release: false,
                 reply: None,
@@ -1137,6 +1206,10 @@ impl Shared {
         release: bool,
         timeout: Duration,
     ) -> Result<(), EngineError> {
+        if slot.thread.is_none() {
+            // A faulted device whose worker already stopped (after releasing it) before a re-detection.
+            return Ok(());
+        }
         let r = self.acked_within(
             id,
             slot.tx.clone(),
@@ -1478,6 +1551,7 @@ pub(crate) fn start_with(
         hotplug: Mutex::new(None),
         resume: Mutex::new(None),
         last_reassert: Mutex::new(None),
+        hardware_state: Mutex::new(cfg.hardware_state),
         next_generation: AtomicU64::new(0),
         timing,
     });
@@ -1698,6 +1772,11 @@ impl EngineHandle {
     /// Runs detection again on every backend; devices already under control are skipped and left alone.
     pub fn rescan(&self) {
         Shared::detect_new(self.shared(), None);
+    }
+
+    /// The remembered machine state (own lighting per device), as recorded so far.
+    pub fn hardware_state(&self) -> HardwareState {
+        self.shared().hardware_state.lock().clone()
     }
 
     /// A new receiver of every [`EngineEvent`] from now on. Receivers that are dropped are forgotten.

@@ -82,6 +82,12 @@ pub trait Controller: Send {
     fn keepalive(&mut self) -> Result<(), DeviceError> { Ok(()) }
     /// Hand the device back to its firmware/hardware mode. Called on shutdown and on explicit "release".
     fn release(&mut self) -> Result<(), DeviceError>;
+    /// The lighting the device shows on its own as read at open (no I/O), as a state of one of its modes.
+    fn hardware_mode(&self) -> Option<ModeState> { None }
+    /// Driver-opaque bytes of the device's own lighting read at open, to remember (ADR 0001 #38). No I/O.
+    fn own_lighting(&self) -> Option<Vec<u8>> { None }
+    /// A hardware mode that is dark at the bottom of its brightness range, used for brightness 0 (ADR 0001 #38).
+    fn off_mode(&self) -> Option<u32> { None }
 }
 
 /// A way to find devices. HID detectors match on vid/pid/interface/usage page/usage; NvAPI on PCI ids.
@@ -131,7 +137,7 @@ unit-tested against the FakeTransport. Ported from `reference/openrgb/`:
 
 | Module | Reference | Notes |
 |---|---|---|
-| `msi_mystic_light` | `MSIMotherboardController/*` | Detect on `1462:7D75` usage page 0x0001 usage 0x00; class by `get_feature_report(0x52)` length (185/162/112, else 761 path). Direct mode per ARGB header via feature reports. Only PIDs in the upstream tested list; no `ENABLE_UNTESTED` set. Port the `GetFirmwareVersionInvalid` gate verbatim (it separates the tested path from the brick-era one). The save-to-flash byte inside the mode packet is always zero except in `save_to_hardware()`. LibreHardwareMonitor's MSI HID controller only targets CoreLiquid AIOs (PIDs 0x6A04..0x6A16), so FanControl does not touch this device. |
+| `msi_mystic_light` | `MSIMotherboardController/*` | Detect on `1462:7D75` usage page 0x0001 usage 0x00; class by `get_feature_report(0x52)` length (185/162/112, else 761 path). Direct mode per ARGB header via feature reports. Only PIDs in the upstream tested list; no `ENABLE_UNTESTED` set. Port the `GetFirmwareVersionInvalid` gate verbatim (it separates the tested path from the brick-era one). The save-to-flash byte inside the mode packet is always zero except in `save_to_hardware()`. Last good own lighting (ADR 0001 #38): a 185-byte config read at open that is not per-LED is reported as `own_lighting` (save byte 0); a per-LED readback is replaced by the stored one if it passes `ConfigPacket::from_own_lighting` (185 bytes, report id 0x52, save byte 0, no zone in effect 0x25), and `release()` then restores it even when nothing was sent. `off_mode` is Static (brightness 0 = Static at brightness 0, no per-LED). | LibreHardwareMonitor's MSI HID controller only targets CoreLiquid AIOs (PIDs 0x6A04..0x6A16), so FanControl does not touch this device. |
 | `wooting` | `WootingKeyboardController/*V3*` | `31E3:1310`, usage page 0xFF55 (V3). Direct per-key RGB, restore keyboard profile on release. |
 | `logitech` | `LogitechController/LogitechHIDPP20Controller`, `LogitechLightspeedController`, `LogitechProtocolCommon` | G560 `046D:0A78` usage page 0xFF43 (zone-only HID++ 2.0, feature 0x8070). PRO Wireless through receiver `046D:C539` (Lightspeed, virtual PID 0x4079); the receiver accepts one connection, pair-index handling per upstream. |
 | `nvidia_illumination` | `NVIDIAIlluminationController/*`, `dependencies/NVFC/nvapi.*` | Load `nvapi64.dll`, `NvAPI_GPU_ClientIllumZonesGetControl/SetControl`. Match `10DE:2C02` subsys `10DE:2095`. RGBW zones treated as RGBW. NvAPI Illumination is undocumented: function IDs and `#[repr(C)]` struct layouts/versions are copied byte-exact from `nvapi.h`. Always `GetControl` before any `SetControl`, keep the initial params, and `release()` writes them back. First hardware test is a round-trip (read, write the same values, read again) before any color change. |
@@ -150,7 +156,10 @@ re-plug of the device while the app runs (hot-plug, profile re-association by `D
 - Brightness (ADR 0001 #33, #35): a device brightness per device and a master brightness (0-100 %) scale what goes
   to the device (direct colours, or a hardware mode's brightness parameter inside its range); the stored settings
   stay unscaled. Brightness 0 is the off state: black in direct colours, in a hardware mode the device's "Off" mode,
-  else black in its direct mode. The device stays `Active` at 0.
+  else black in its direct mode. A driver that names an off mode (`Controller::off_mode`; Mystic Light: Static,
+  ADR 0001 #38) gets that mode at the bottom of its brightness range (black colours) instead of black in the direct
+  mode, for direct colours and hardware modes alike, so brightness 0 does not put the MSI board into per-LED mode;
+  raising the brightness sends the colours (or mode) again. The device stays `Active` at 0.
 - Brightness-only LEDs (`Zone::brightness_only`, set by `nvidia_illumination` for SINGLE_COLOR / COLOR_FIXED zones;
   the RTX 5080 FE is white only, ADR 0001 #37): a colour counts only as its intensity, the highest channel
   (`Rgb::intensity`). The engine reduces direct colours (and per-LED colours of a mode) for those LEDs to white at
@@ -177,9 +186,29 @@ re-plug of the device while the app runs (hot-plug, profile re-association by `D
   `set_dark_zones` re-sends a device driven with direct colours at once when the new zones black out something it
   shows. There is one masking function, `cc_engine::mask_hidden_zones`, which the app also uses for the buffers it
   builds.
+- Last good own lighting (ADR 0001 #38). The seam: `DetectContext::own_lighting` (`BTreeMap<DeviceId, Vec<u8>>`)
+  carries what is remembered into every detection, and `Controller::own_lighting()` reports what a newly opened
+  controller read as the device's own lighting; both are driver-opaque bytes, so any driver can use them. The engine
+  holds a `cc_config::HardwareState` (`EngineConfig::hardware_state`; the app loads it from
+  `%APPDATA%\CaseControl\hardware-state.toml`, in memory only without storage), hands its map to every detection
+  and records each new controller's bytes in it, which rewrites the file atomically only when the value changed.
+  The driver validates stored bytes before it uses them (Mystic Light: see the driver table). Format:
+
+  ```toml
+  # CaseControl machine state (ADR 0001 #38). Written by CaseControl; not meant to be edited.
+  [own_lighting]
+  "hid:1462:7d75:7D7522120106" = "5201ff0000..."   # lower-case hex, no separators
+  ```
+
+  A file that is not TOML, an `own_lighting` that is not a table and entries that are not non-empty hex strings are
+  ignored with a warning; unknown keys are dropped on the next write.
 - Error policy: write errors back off exponentially (50 ms .. 5 s), after 10 consecutive failures the device is marked
-  `Faulted` and shown as such; never retried in a tight loop.
-- Shutdown: `Release` on every device, join threads with timeout, then exit. Ctrl-C/WM_CLOSE/tray Quit all funnel here.
+  `Faulted` and shown as such; never retried in a tight loop. A faulted device is released once, best effort, when
+  its worker stops: on shutdown, and when detection is about to open it again (detection stops the faulted worker
+  with a release, within 500 ms, before the backends run). A removed device is not released: its handle is gone; the
+  re-opened controller finds the board's state itself (and Mystic Light the stored own lighting if it is per-LED).
+- Shutdown: `Release` on every device (also faulted ones, best effort), join threads with timeout, then exit.
+  Ctrl-C/WM_CLOSE/tray Quit all funnel here.
 - Event bus (`tokio::sync::broadcast` or crossbeam) consumed by the Tauri layer and re-emitted as Tauri events.
 
 ### Sleep and resume
@@ -238,7 +267,8 @@ re-plugged device still starts undriven.
 
 ## Config (`cc-config`)
 
-`%APPDATA%\CaseControl\config.toml`, `profiles\<name>.toml`, logs in `%LOCALAPPDATA%\CaseControl\logs`.
+`%APPDATA%\CaseControl\config.toml`, `profiles\<name>.toml`, `hardware-state.toml` (machine state, not settings:
+the last good own lighting per device, ADR 0001 #38; see Engine), logs in `%LOCALAPPDATA%\CaseControl\logs`.
 Settings: `autostart`, `start_minimized`, `frame_rate`, `detectors.<family> = true|false`, `conflicts.check_openrgb_port`,
 `conflicts.dont_ask` (catalog ids the start dialog no longer asks about), `conflicts.previous_start_types` (service name
 -> start type before CaseControl set it to Manual), `last_profile`. Profile: per `DeviceId` a `ModeState` or a direct color buffer plus per-zone overrides. Unknown keys preserved.

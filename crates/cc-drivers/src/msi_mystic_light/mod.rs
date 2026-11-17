@@ -23,10 +23,20 @@
 //!
 //! `release()` re-reads the board's current configuration, sends it back, then sends the configuration read at open
 //! with the save byte forced to zero. Nothing is written to flash, so the board's saved (power-on) state is never
-//! touched. If the configuration read at open was itself a per-LED state left by another program (on-board effect
-//! 0x25), `release()` restores exactly that: the board stays in per-LED mode and keeps showing the last per-LED frame
-//! it received (ours) until the next power cycle or until another program takes over; the flash configuration
-//! still applies after a power cycle. A warning is logged at open in that case.
+//! touched.
+//!
+//! Last good own lighting (ADR 0001 #38): a configuration read at open that is not per-LED is reported through
+//! [`Controller::own_lighting`](cc_core::Controller::own_lighting) (save byte 0) so the engine can remember it per
+//! device id. If the configuration read at open is a per-LED state (on-board effect 0x25, left by an earlier run or
+//! another program) and the detect context holds a remembered state for the board that passes
+//! [`ConfigPacket::from_own_lighting`](protocol::ConfigPacket::from_own_lighting) (185 bytes, report id 0x52, save
+//! byte 0, no per-LED effect in any zone), that state replaces the readback: `release()` restores it (even when
+//! nothing was sent since open) and `hardware_mode()` reports it; this is logged at info. Without one, `release()`
+//! restores the per-LED state exactly (the board keeps its last per-LED frame until the next power cycle or until
+//! another program takes over) and a warning is logged. The flash configuration is never written.
+//!
+//! Off: [`Controller::off_mode`](cc_core::Controller::off_mode) is Static, so brightness 0 is Static at brightness 0
+//! (a hardware state) instead of black frames in per-LED mode.
 //!
 //! # Zones
 //!
@@ -151,9 +161,9 @@ where
         if ctx.is_skipped(&candidate.id) {
             continue;
         }
-        let result = open(&candidate.path)
-            .map_err(DeviceError::from)
-            .and_then(|dev| MysticLight185::open(dev, &candidate));
+        let result = open(&candidate.path).map_err(DeviceError::from).and_then(|dev| {
+            MysticLight185::open_with_stored(dev, &candidate, ctx.stored_own_lighting(&candidate.id))
+        });
         match result {
             Ok(controller) => {
                 tracing::info!(target: "cc_drivers::msi", id = %candidate.id, "Mystic Light controller ready");

@@ -53,6 +53,22 @@ pub trait Controller: Send {
     fn hardware_mode(&self) -> Option<ModeState> {
         None
     }
+
+    /// Driver-opaque bytes describing the lighting the device showed on its own when it was opened, worth
+    /// remembering as its "last good own lighting" (ADR 0001 #38); `None` (the default) when the driver has nothing
+    /// to remember, e.g. because the device was found in a state left by software control. Must not do I/O. The
+    /// engine stores the bytes per device id and hands them back in
+    /// [`DetectContext::own_lighting`](crate::DetectContext::own_lighting) on later opens.
+    fn own_lighting(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// A hardware mode that shows the device dark at the lowest value of its brightness range, which the engine uses
+    /// for brightness 0 (ADR 0001 #35, #38) instead of black in the direct mode, e.g. because entering the direct mode
+    /// changes the device's state in a way that outlives the app. `None` (the default) keeps black in the direct mode.
+    fn off_mode(&self) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -127,6 +143,8 @@ pub(crate) mod tests {
         assert_eq!(c.save_to_hardware(), Err(DeviceError::Unsupported));
         assert_eq!(c.keepalive(), Ok(()));
         assert_eq!(c.hardware_mode(), None);
+        assert_eq!(c.own_lighting(), None);
+        assert_eq!(c.off_mode(), None);
         assert_eq!(c.release(), Ok(()));
     }
 

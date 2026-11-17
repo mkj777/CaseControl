@@ -4,9 +4,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use cc_config::{Paths, Profile, ProfileStore, Settings};
+use cc_config::{HardwareState, Paths, Profile, ProfileStore, Settings};
 use cc_conflicts::ScanReport;
-use cc_engine::{ApplyReport, EngineHandle};
+use cc_engine::{ApplyReport, EngineConfig, EngineHandle};
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::prefs::{engine_config, start_brightness};
@@ -37,9 +37,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Resolves and creates the storage folders, loads the settings and starts the engine with every compiled-in
-    /// backend. Never fails: a storage problem leaves the defaults in place (nothing is saved), an engine start
-    /// failure is kept as a message for the Devices page.
+    /// Resolves and creates the storage folders, loads the settings and the machine state (`hardware-state.toml`)
+    /// and starts the engine with every compiled-in backend. Never fails: a storage problem leaves the defaults in
+    /// place (nothing is saved), an engine start failure is kept as a message for the Devices page.
     pub fn init() -> Self {
         let storage = match Paths::from_env() {
             Some(paths) => match paths.ensure() {
@@ -73,7 +73,17 @@ impl AppState {
                 )
             }
         };
-        let engine = cc_engine::start(engine_config(&settings), cc_drivers::all_backends()).map_err(|err| {
+        // The machine state (last good own lighting per device, ADR 0001 #38) lives next to the settings; without
+        // storage it is kept in memory for this session only.
+        let hardware_state = match &storage {
+            Ok(s) => HardwareState::load(&s.paths),
+            Err(_) => HardwareState::in_memory(),
+        };
+        let config = EngineConfig {
+            hardware_state,
+            ..engine_config(&settings)
+        };
+        let engine = cc_engine::start(config, cc_drivers::all_backends()).map_err(|err| {
             tracing::error!(%err, "engine failed to start");
             format!("The device engine could not start: {err}")
         });
