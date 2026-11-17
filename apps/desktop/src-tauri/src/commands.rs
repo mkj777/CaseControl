@@ -10,8 +10,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use cc_config::Profile;
 use cc_core::{DeviceId, ModeState, Rgb};
 use cc_engine::{
-    ApplyReport, DetectFailure, DeviceSetting, DeviceStatus, DeviceView, EngineHandle, LightingView,
-    ReleaseReport,
+    ApplyReport, DetectFailure, DeviceStatus, DeviceView, EngineHandle, LightingView, ReleaseReport,
+    mask_hidden_zones,
 };
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime};
@@ -25,7 +25,7 @@ use crate::conflicts::ConflictScan;
 use crate::events::{self, CONFLICTS_UPDATED, DEVICES_CHANGED, PROFILES_CHANGED};
 use crate::hidden::{
     HiddenEntry, hidden_device_error, hidden_devices, hidden_view, hidden_zone_map, hidden_zones,
-    is_device_hidden, mask_hidden_zones, zone_write,
+    is_device_hidden, zone_write,
 };
 use crate::prefs::{
     SettingsPatch, SettingsView, apply_patch, clear_brightness_overrides, record_brightness, record_zone_size,
@@ -414,6 +414,36 @@ pub async fn connect_all<R: Runtime>(app: AppHandle<R>) -> Result<LightingView, 
     .await
 }
 
+/// Sets the colour a takeover shows on a device with neither a setting nor a readback (ADR 0001 #36). While the
+/// picker is dragged the page sends `persist = false`: the engine uses the colour, nothing is saved. The final value
+/// comes with `persist = true` and is saved; if that fails the engine goes back to the saved colour. Devices already
+/// driven keep what they show. Returns the colour now in effect.
+#[tauri::command]
+pub async fn set_default_color<R: Runtime>(
+    app: AppHandle<R>,
+    color: Rgb,
+    persist: bool,
+) -> Result<Rgb, String> {
+    blocking(app, move |_, state| {
+        if persist
+            && let Err(err) = state.update_settings(|s| {
+                s.default_color = color;
+                Ok(())
+            })
+        {
+            if let Ok(engine) = state.engine() {
+                engine.set_default_color(state.settings().default_color);
+            }
+            return Err(err);
+        }
+        if let Ok(engine) = state.engine() {
+            engine.set_default_color(color);
+        }
+        Ok(color)
+    })
+    .await
+}
+
 /// Hides or unhides a device (ADR 0001 #26) and saves that. Hiding releases the device to its own hardware mode;
 /// unhiding changes nothing on the hardware. Either way the engine learns which devices brightness changes must
 /// not take over. Returns the new device list.
@@ -446,9 +476,10 @@ pub async fn set_device_hidden<R: Runtime>(
     .await
 }
 
-/// Hides or unhides zone `zone_name` of a device (ADR 0001 #26) and saves that. If the device shows direct colours,
-/// hiding a zone switches it off right away; unhiding leaves it off until the next colour change. The engine learns
-/// the hidden zones, so a takeover with the default colour leaves them black. Returns the new device list.
+/// Hides or unhides zone `zone_name` of a device (ADR 0001 #26) and saves that. The engine learns the hidden zones
+/// first (as its dark zones) and keeps them black in every direct output from then on: if the device shows direct
+/// colours, hiding a zone switches it off right away; unhiding leaves it off until the next colour change. Returns the
+/// new device list.
 #[tauri::command]
 pub async fn set_zone_hidden<R: Runtime>(
     app: AppHandle<R>,
@@ -462,27 +493,19 @@ pub async fn set_zone_hidden<R: Runtime>(
         if !view.description.zones.iter().any(|z| z.name == zone_name) {
             return Err(format!("{} has no zone {zone_name}", view.description.info.name));
         }
-        state.update_settings(|s| {
+        // The engine gets the new zones under the settings lock, before the save, so a concurrent change of another
+        // zone cannot hand it an older set; it re-masks a device it drives with direct colours itself.
+        let saved = state.update_settings(|s| {
             crate::hidden::set_zone_hidden(s, &id, &zone_name, hidden);
+            engine.set_dark_zones(hidden_zone_map(s));
             Ok(())
-        })?;
-        tracing::info!(%id, zone = %zone_name, hidden, "zone visibility changed");
-        let (device_hidden, zones) = {
-            let settings = state.settings();
-            engine.set_dark_zones(hidden_zone_map(&settings));
-            (is_device_hidden(&settings, &id), hidden_zones(&settings, &id))
-        };
-        if hidden
-            && !device_hidden
-            && view.status == DeviceStatus::Active
-            && matches!(view.setting, Some(DeviceSetting::Direct { .. }))
-        {
-            let mut colors = view.colors;
-            mask_hidden_zones(&view.description, &zones, &mut colors);
-            engine
-                .set_direct(&id, colors)
-                .map_err(|err| format!("The zone is hidden, but it could not be switched off: {err}"))?;
+        });
+        if let Err(err) = saved {
+            // Not saved: the engine goes back to the zones that are still in the settings.
+            engine.set_dark_zones(hidden_zone_map(&state.settings()));
+            return Err(err);
         }
+        tracing::info!(%id, zone = %zone_name, hidden, "zone visibility changed");
         Ok(device_list_now(state))
     })
     .await
@@ -783,6 +806,7 @@ mod tests {
             Bus, ColorMode, DeviceDescription, DeviceError, DeviceInfo, DeviceKind, Led, Mode, ModeCaps,
             Zone, ZoneKind,
         };
+        use cc_engine::{DeviceSetting, Takeover};
         let red = Rgb::new(0xFF, 0, 0);
         let description = DeviceDescription {
             info: DeviceInfo {
@@ -845,6 +869,7 @@ mod tests {
                 }),
                 family: "msi_mystic_light".into(),
                 brightness: 55,
+                takeover: Some(Takeover { mode_id: Some(1) }),
             }],
             failures: vec![DetectFailure {
                 family: "wooting".into(),
@@ -901,6 +926,7 @@ mod tests {
         );
         assert_eq!(d["family"], serde_json::json!("msi_mystic_light"));
         assert_eq!(d["brightness"], serde_json::json!(55));
+        assert_eq!(d["takeover"], serde_json::json!({ "mode_id": 1 }));
         assert_eq!(json["lighting"], serde_json::json!({ "master_brightness": 80 }));
         assert_eq!(
             json["failures"][0]["error"],

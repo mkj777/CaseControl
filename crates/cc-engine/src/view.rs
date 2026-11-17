@@ -40,6 +40,18 @@ pub struct DeviceView {
     pub family: String,
     /// Device brightness in percent (ADR 0001 #33); `colors` and `setting` are unscaled.
     pub brightness: u8,
+    /// What a takeover (brightness, Connect all) drives the device with: what the engine drives it with now, else its
+    /// last setting, the mode it shows on its own, or the default colour, in that order. `None` when it cannot be
+    /// taken over (faulted, or neither a direct mode nor a mode that takes a colour and nothing else to use). It does
+    /// not consider whether the app hides the device.
+    pub takeover: Option<Takeover>,
+}
+
+/// What a takeover drives a device with (see [`DeviceView::takeover`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Takeover {
+    /// The hardware mode it uses, or `None` for direct colours.
+    pub mode_id: Option<u32>,
 }
 
 /// Master brightness (ADR 0001 #33).

@@ -22,7 +22,6 @@
     "allow-release-all",
     "allow-set-device-brightness",
     "allow-set-master-brightness",
-    "allow-set-all-off",
     "allow-connect-all",
     "allow-rescan",
     "allow-set-device-hidden",
@@ -39,6 +38,7 @@
     "allow-set-dont-ask",
     "allow-close-program",
     "allow-get-settings",
-    "allow-set-settings"
+    "allow-set-settings",
+    "allow-set-default-color"
   ]
 }

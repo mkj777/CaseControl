@@ -21,7 +21,10 @@
 //!   not excluded: colours and modes directly; brightness and Connect all with the device's last setting, else the
 //!   mode its driver read back from the hardware (`DeviceView::hardware`), else the default colour (ADR 0001 #36,
 //!   [`EngineHandle::set_default_color`]) on every LED in direct mode, or in the first mode that takes a colour for a
-//!   device without a direct mode. Only a device with none of these keeps its own lighting.
+//!   device without a direct mode. Only a device with none of these keeps its own lighting. `DeviceView::takeover`
+//!   says what a takeover would use, so the UI does not repeat that choice.
+//! - Dark zones (the app's hidden zones, ADR 0001 #26): every direct output has them black, whatever path drives the
+//!   device ([`EngineHandle::set_dark_zones`], [`mask_hidden_zones`]).
 //! - Resume (sleep, hibernation): on Windows the engine subscribes to suspend/resume broadcasts and then calls
 //!   [`EngineHandle::reassert`]: debounced, it resets and re-sends every driven device's current output, retries
 //!   failed writes with back-off for a few seconds and re-opens devices that faulted or vanished during sleep.
@@ -46,6 +49,7 @@ mod tests;
 pub use cc_config::DeviceSetting;
 pub use engine::{EngineConfig, EngineHandle, start};
 pub use error::EngineError;
+pub use lighting::mask_hidden_zones;
 pub use view::{
-    ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView, ReleaseReport,
+    ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView, ReleaseReport, Takeover,
 };

@@ -291,12 +291,13 @@ unless noted.
   it shows its own value, so a device refresh in between cannot pull the thumb back.
 - **Layout:** the inline Field layout (label at its own width, slider `--toolbar-control-width` down to
   `--toolbar-control-min-width`, readout), since it always sits in a page toolbar.
-- **States:** disabled (engine down, device locked, a rescan running on the Devices page, a hardware mode without a
-  brightness parameter: "This mode has no brightness setting."). A failed send is emitted as `error`; the page
-  shows it as an inline Notice.
+- **States:** disabled (engine down, device locked, a rescan or Release all running on the Devices page, a device
+  the engine cannot take over: "Set a colour or mode first.", a hardware mode without a brightness parameter: "This
+  mode has no brightness setting."). A failed send is emitted as `error`; the page shows it as an inline Notice.
 - **Takes over:** on a released device it takes control like every lighting control: with its last setting, else
-  its own mode as read back, else the default colour from Settings (ADR #36). So it is never disabled for lack of
-  something to dim.
+  its own mode as read back, else the default colour from Settings (ADR #36), as the engine reports it
+  (`DeviceView.takeover`). Only a device the engine cannot take over at all (no direct mode and no mode that takes a
+  colour, nothing stored or read back) gets a disabled slider with the hint "Set a colour or mode first."
 - **Rules:** every brightness control is this component (master brightness, labelled "All brightness", on the
   Devices page; device brightness on a device page), usually in the PageHeader `controls` row. The `send` callback decides what `persist` saves;
   the slider never saves on its own.
@@ -435,10 +436,12 @@ Severity group headings on the Conflicts page stay headings, not badges.
   top line, so the list itself needs no border.
 - **States:** default, current (badge "Active"), editing (the row turns into an inline form with the same height),
   disabled while busy, expanded (slot `details`, below the row inside its divider, `--space-4` above).
-- **Actions:** stay on the right; when there are more than fit they wrap, right aligned, instead of widening the row.
+- **Actions:** stay on the right at their width. Opt-in (`wrapActions`, used by Conflicts only): when there are more
+  than fit they wrap, right aligned, instead of widening the row.
 - **Expandable row** (Conflicts, ADR #36): the last action is an IconButton chevron (glyph `E70D` down / `E70E` up,
-  label "Show details" / "Hide details", `aria-expanded`, `aria-controls` on the details). The page decides what
-  is open; open rows stay open across a rescan.
+  label "Show details" / "Hide details", `aria-expanded`, `aria-controls` on the details: the page passes the id
+  as `detailsId`, which ListRow puts on its details wrapper). The page decides what is open; open rows stay open
+  across a rescan.
 - **Rules:** rows are not cards. Used for profiles, for conflict findings (grouped under the severity h2s) and for
   "Found but not started" on Devices (no actions).
 
@@ -487,12 +490,15 @@ The preview is the focus of the app (ADR #15), so it gets the most room and the 
 - **Off** (ADR #35): brightness 0 (a device's Brightness or All brightness) turns lights off;
   the device stays Active.
 - **Connect all / Release all** (Devices toolbar, secondary buttons): Release all hands every device back, is
-  disabled while no device is Active, and confirms with a toast ("N devices released"). Connect all takes every
+  disabled while no device is Active, and confirms with a toast ("N devices released"). While it runs it reads
+  "Releasing…" and All brightness and Connect all are disabled. Connect all takes every
   released, visible, non-faulted device over with the same rules as brightness (ADR #36): last setting, else its own
   mode as read back, else the default colour from Settings (white unless changed) on every LED, or, without a direct
   mode, in its first mode that takes a colour; it is disabled when every such device is already Active.
 - **Default colour** (Settings, "Lighting"): one ColorPicker in a stacked group Field "Default colour". It only
-  feeds later takeovers; changing it does not repaint devices that are already driven.
+  feeds later takeovers; changing it does not repaint devices that are already driven. Like a brightness slider it
+  goes live while dragging and is saved once with the final value (ColorPicker's `change` event: end of a drag, a
+  click, a key step or a hex entry). Its errors are its own Notice, so a colour change clears only those.
 - **Rescan busy** (Devices): while a rescan runs the Rescan button reads "Scanning…" and is disabled, the toolbar
   controls (All brightness, Connect all, Release all, Show hidden) are disabled, and the tile grid is dimmed to
   50 % opacity (the disabled look of Switch and ColorPicker) and `inert` (no clicks, focus or context menu). The

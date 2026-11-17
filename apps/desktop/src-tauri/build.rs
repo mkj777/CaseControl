@@ -15,7 +15,6 @@ const COMMANDS: &[&str] = &[
     "release_all",
     "set_device_brightness",
     "set_master_brightness",
-    "set_all_off",
     "connect_all",
     "rescan",
     "set_device_hidden",
@@ -33,6 +32,7 @@ const COMMANDS: &[&str] = &[
     "close_program",
     "get_settings",
     "set_settings",
+    "set_default_color",
 ];
 
 fn main() {

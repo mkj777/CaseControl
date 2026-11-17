@@ -18,10 +18,10 @@ use tracing::{debug, info, warn};
 
 use crate::error::EngineError;
 use crate::hotplug::{HotplugRuntime, HotplugSource};
-use crate::lighting::{self, FULL, Levels, Output, Want};
+use crate::lighting::{self, FULL, Levels, Output, Want, mask_hidden_zones};
 use crate::resume::ResumeRuntime;
 use crate::view::{
-    ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView, ReleaseReport,
+    ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView, ReleaseReport, Takeover,
 };
 use crate::worker::{Command, FrameSlot, Reply, Timing, Worker};
 
@@ -62,7 +62,7 @@ pub struct EngineConfig {
     /// The colour a takeover shows on a device that has neither a setting nor a hardware readback (ADR 0001 #36);
     /// see [`EngineHandle::set_default_color`].
     pub default_color: Rgb,
-    /// Zones, by name per device, that the default colour leaves black (the app's hidden zones); see
+    /// Zones, by name per device, that every direct output leaves black (the app's hidden zones); see
     /// [`EngineHandle::set_dark_zones`].
     pub dark_zones: BTreeMap<DeviceId, BTreeSet<String>>,
 }
@@ -78,7 +78,7 @@ impl Default for EngineConfig {
             master_brightness: FULL,
             brightness: BTreeMap::new(),
             excluded: HashSet::new(),
-            default_color: Rgb::WHITE,
+            default_color: cc_config::DEFAULT_COLOR,
             dark_zones: BTreeMap::new(),
         }
     }
@@ -105,7 +105,7 @@ struct Slot {
 }
 
 impl Slot {
-    fn view(&self, brightness: u8) -> DeviceView {
+    fn view(&self, brightness: u8, fallback: &Fallback) -> DeviceView {
         DeviceView {
             description: self.description.clone(),
             status: self.status.clone(),
@@ -114,7 +114,25 @@ impl Slot {
             hardware: self.hardware.clone(),
             family: self.family.clone(),
             brightness,
+            takeover: self.takeover(fallback),
         }
+    }
+
+    /// What a takeover drives the device with, as the view reports it: what the engine drives it with now, else what
+    /// [`take_over`](Self::take_over) would pick. `None` when it cannot be taken over.
+    fn takeover(&self, fallback: &Fallback) -> Option<Takeover> {
+        if self.is_faulted() {
+            return None;
+        }
+        let mode_id = match &self.want {
+            Some(Want::Direct) => None,
+            Some(Want::Mode(state)) => Some(state.mode),
+            None => match self.takeover_setting(fallback)? {
+                DeviceSetting::Direct { .. } => None,
+                DeviceSetting::Mode { state } => Some(state.mode),
+            },
+        };
+        Some(Takeover { mode_id })
     }
 
     fn check_usable(&self) -> Result<(), EngineError> {
@@ -148,43 +166,48 @@ impl Slot {
         matches!(self.status, DeviceStatus::Faulted { .. })
     }
 
-    /// Makes the engine drive an undriven device (ADR 0001 #33, #36): with its last setting if it has one, else with
-    /// the mode it shows on its own (so nothing visibly changes until the levels do), else with `fallback`'s colour
-    /// (see [`lighting::default_want`]). Returns whether the device is driven afterwards; only a device without a
-    /// direct mode and without a mode that takes a colour stays undriven. A faulted device is never taken.
-    fn take_over(&mut self, fallback: Fallback<'_>) -> bool {
+    /// What an undriven device is taken over with (ADR 0001 #33, #36): its last setting if it fits the device, else
+    /// the mode it shows on its own (so nothing visibly changes until the levels do), else `fallback`'s colour (see
+    /// [`lighting::default_setting`]). `None` for a faulted device and for a device without a direct mode and without
+    /// a mode that takes a colour.
+    fn takeover_setting(&self, fallback: &Fallback) -> Option<DeviceSetting> {
+        if self.is_faulted() {
+            return None;
+        }
+        match self
+            .setting
+            .clone()
+            .map(|s| s.fit_to(self.description.led_count()))
+        {
+            Some(s @ DeviceSetting::Direct { .. }) if self.description.direct_mode.is_some() => Some(s),
+            Some(DeviceSetting::Mode { state }) if self.description.validate_state(&state).is_ok() => {
+                Some(DeviceSetting::Mode { state })
+            }
+            _ => match self.hardware.clone() {
+                Some(state) => Some(DeviceSetting::Mode { state }),
+                None => lighting::default_setting(&self.description, fallback.color, &fallback.dark),
+            },
+        }
+    }
+
+    /// Makes the engine drive an undriven device with [`takeover_setting`](Self::takeover_setting); direct colours
+    /// get the device's dark zones black. Returns whether the device is driven afterwards.
+    fn take_over(&mut self, fallback: &Fallback) -> bool {
         if self.want.is_some() {
             return true;
         }
-        if self.is_faulted() {
+        let Some(setting) = self.takeover_setting(fallback) else {
             return false;
-        }
-        let led_count = self.description.led_count();
-        let want = match self.setting.clone().map(|s| s.fit_to(led_count)) {
-            Some(DeviceSetting::Direct { colors }) if self.description.direct_mode.is_some() => {
-                self.colors = colors;
-                Some(Want::Direct)
-            }
-            Some(DeviceSetting::Mode { state }) if self.description.validate_state(&state).is_ok() => {
-                Some(Want::Mode(state))
-            }
-            _ => match self.hardware.clone() {
-                Some(state) => Some(Want::Mode(state)),
-                None => {
-                    let dark = fallback.dark_zones.get(&self.description.info.id);
-                    match lighting::default_want(&self.description, fallback.color, dark) {
-                        Some((want, Some(colors))) => {
-                            self.colors = colors;
-                            Some(want)
-                        }
-                        Some((want, None)) => Some(want),
-                        None => None,
-                    }
-                }
-            },
         };
-        self.want = want;
-        self.want.is_some()
+        self.want = Some(match setting {
+            DeviceSetting::Direct { mut colors } => {
+                mask_hidden_zones(&self.description, &fallback.dark, &mut colors);
+                self.colors = colors;
+                Want::Direct
+            }
+            DeviceSetting::Mode { state } => Want::Mode(state),
+        });
+        true
     }
 
     /// Hands `output` to the worker as the latest frame (sequence `seq`). The setting is recorded by the worker once
@@ -196,11 +219,11 @@ impl Slot {
     }
 }
 
-/// What a takeover falls back to for a device with neither a setting nor a hardware readback.
-#[derive(Clone, Copy)]
-struct Fallback<'a> {
+/// What a takeover of one device needs besides the device itself: the default colour (for a device with neither a
+/// setting nor a hardware readback) and the device's dark zones.
+struct Fallback {
     color: Rgb,
-    dark_zones: &'a BTreeMap<DeviceId, BTreeSet<String>>,
+    dark: BTreeSet<String>,
 }
 
 struct State {
@@ -219,7 +242,7 @@ struct State {
     brightness: BTreeMap<DeviceId, u8>,
     /// The takeover's default colour.
     default_color: Rgb,
-    /// Zones the default colour leaves black, by device.
+    /// Zones every direct output leaves black, by device.
     dark_zones: BTreeMap<DeviceId, BTreeSet<String>>,
 }
 
@@ -236,33 +259,44 @@ impl State {
     }
 
     fn view(&self, id: &DeviceId, slot: &Slot) -> DeviceView {
-        slot.view(self.device_brightness(id))
+        slot.view(self.device_brightness(id), &self.fallback(id))
+    }
+
+    /// The default colour and the dark zones of device `id`, for a takeover.
+    fn fallback(&self, id: &DeviceId) -> Fallback {
+        Fallback {
+            color: self.default_color,
+            dark: self.dark_zones.get(id).cloned().unwrap_or_default(),
+        }
     }
 
     /// Takes over device `id` unless it is excluded (see [`Slot::take_over`]).
     fn take_over(&mut self, id: &DeviceId) {
-        let fallback = Fallback {
-            color: self.default_color,
-            dark_zones: &self.dark_zones,
-        };
-        if !self.excluded.contains(id)
-            && let Some(slot) = self.devices.get_mut(id)
-        {
-            slot.take_over(fallback);
+        if self.excluded.contains(id) {
+            return;
+        }
+        let fallback = self.fallback(id);
+        if let Some(slot) = self.devices.get_mut(id) {
+            slot.take_over(&fallback);
         }
     }
 
     /// Takes over every undriven device that is not excluded (see [`Slot::take_over`]); returns the devices it took.
     fn take_over_all(&mut self) -> Vec<DeviceId> {
-        let fallback = Fallback {
-            color: self.default_color,
-            dark_zones: &self.dark_zones,
-        };
+        let ids: Vec<DeviceId> = self
+            .devices
+            .iter()
+            .filter(|(id, s)| s.want.is_none() && !self.excluded.contains(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
         let mut taken = Vec::new();
-        for (id, slot) in &mut self.devices {
-            if slot.want.is_none() && !self.excluded.contains(id) && slot.take_over(fallback) {
+        for id in ids {
+            let fallback = self.fallback(&id);
+            if let Some(slot) = self.devices.get_mut(&id)
+                && slot.take_over(&fallback)
+            {
                 debug!(%id, "device taken over");
-                taken.push(id.clone());
+                taken.push(id);
             }
         }
         taken
@@ -397,11 +431,15 @@ impl Shared {
         }
     }
 
-    /// Sets device `id` to direct colours `colors` (already checked) and sends them at the current levels.
-    fn drive_direct(&self, st: &mut State, id: &DeviceId, colors: Vec<Rgb>) {
+    /// Sets device `id` to direct colours `colors` (already checked) with its dark zones black and sends them at the
+    /// current levels.
+    fn drive_direct(&self, st: &mut State, id: &DeviceId, mut colors: Vec<Rgb>) {
         let levels = st.levels(id);
         let seq = self.next_seq();
         if let Some(slot) = st.devices.get_mut(id) {
+            if let Some(dark) = st.dark_zones.get(id) {
+                mask_hidden_zones(&slot.description, dark, &mut colors);
+            }
             slot.colors = colors;
             slot.want = Some(Want::Direct);
             if let Some(output) = slot.output(levels) {
@@ -1016,6 +1054,38 @@ impl Shared {
         self.state.lock().excluded = excluded;
     }
 
+    /// Replaces the dark zones and re-sends every device driven with direct colours whose buffer they change, with
+    /// those zones black. All under the state lock, so no colour edit slips in between with the old zones.
+    fn set_dark_zones(&self, zones: BTreeMap<DeviceId, BTreeSet<String>>) {
+        let mut st = self.state.lock();
+        st.dark_zones = zones;
+        let mut changed = Vec::new();
+        let State {
+            devices, dark_zones, ..
+        } = &mut *st;
+        for (id, slot) in devices.iter_mut() {
+            if slot.is_faulted() || slot.want != Some(Want::Direct) {
+                continue;
+            }
+            let Some(dark) = dark_zones.get(id) else {
+                continue;
+            };
+            let mut colors = slot.colors.clone();
+            mask_hidden_zones(&slot.description, dark, &mut colors);
+            if colors != slot.colors {
+                slot.colors = colors;
+                changed.push(id.clone());
+            }
+        }
+        if self.is_closed() {
+            return;
+        }
+        for id in changed {
+            debug!(%id, "dark zones changed; re-sending the device");
+            self.refresh_locked(&mut st, Some(&id));
+        }
+    }
+
     /// Releases every device that is not faulted; counts the ones that were driven before.
     fn release_all(&self) -> ReleaseReport {
         let ids: Vec<(DeviceId, bool)> = self
@@ -1585,10 +1655,14 @@ impl EngineHandle {
         self.shared().state.lock().default_color = color;
     }
 
-    /// Replaces the zones (by name, per device) that the default colour leaves black: the app's hidden zones, which
-    /// it keeps black in direct colour (ADR 0001 #26). Only takeovers with the default colour use it.
+    /// Replaces the zones (by name, per device) that the engine keeps black: the app's hidden zones (ADR 0001 #26).
+    /// Every direct output has them black, whatever drives the device (colour edits, profiles, pending settings,
+    /// takeovers); so do the per-LED colours of a default-colour takeover in a hardware mode. A device driven with
+    /// direct colours is re-sent at once if the new zones black out something it shows; a zone that is no longer
+    /// dark stays black until the next colour change. Other hardware modes act on the whole device and are left
+    /// alone.
     pub fn set_dark_zones(&self, zones: BTreeMap<DeviceId, BTreeSet<String>>) {
-        self.shared().state.lock().dark_zones = zones;
+        self.shared().set_dark_zones(zones);
     }
 
     /// Changes the frame rate; clamped to `1..=60`. Takes effect with the next frame.

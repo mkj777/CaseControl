@@ -146,6 +146,16 @@ export interface DeviceView {
   family: string
   /** Device brightness in percent (ADR 0001 #33); `colors` and `setting` are unscaled. */
   brightness: number
+  /** What a takeover (brightness, Connect all) drives the device with, as the engine picks it: what it drives it with
+   * now, else its last setting, its own lighting, or the default colour. `null` when it cannot be taken over. Does
+   * not consider whether the device is hidden. */
+  takeover: Takeover | null
+}
+
+/** What a takeover drives a device with. */
+export interface Takeover {
+  /** The hardware mode it uses, or `null` for direct colours. */
+  mode_id: number | null
 }
 
 /** Master brightness (ADR 0001 #33). */
@@ -428,6 +438,10 @@ export const setDontAsk = (entry: string, dontAsk: boolean) => invoke<ConflictSc
 
 export const getSettings = () => invoke<SettingsView>('get_settings')
 export const setSettings = (patch: SettingsPatch) => invoke<SettingsView>('set_settings', { patch })
+/** The takeover default colour (ADR 0001 #36): `persist = false` while the picker is dragged (used, not saved), `true`
+ * for the final value (saved). Resolves with the colour now in effect. */
+export const setDefaultColor = (color: Rgb, persist: boolean) =>
+  invoke<Rgb>('set_default_color', { color, persist })
 
 // ---- events ----------------------------------------------------------------------------------------------------
 

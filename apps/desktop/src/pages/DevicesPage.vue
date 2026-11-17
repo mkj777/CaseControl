@@ -92,8 +92,8 @@ const engineDown = computed(() => !deviceState.loaded || deviceState.engineError
 const scanning = computed(() => deviceState.scanning)
 /** Nothing to release: no device is driven. */
 const noneActive = computed(() => !deviceState.devices.some((d) => statusOf(d) === 'active'))
-/** Connect all has something to do: a released, visible device it can take over (with its setting, its own mode or
- * the default colour; ADR 0001 #36). */
+/** Connect all has something to do: a released, visible device the engine says it can take over (with its setting,
+ * its own mode or the default colour; ADR 0001 #36). */
 const canConnect = computed(() =>
   deviceState.devices.some(
     (d) => statusOf(d) === 'released' && !isDeviceHidden(d.description.info.id) && canTakeOver(d),
@@ -154,7 +154,7 @@ async function onReleaseAll() {
           label="All brightness"
           :value="deviceState.lighting.master_brightness"
           :send="sendMaster"
-          :disabled="engineDown || scanning"
+          :disabled="engineDown || scanning || releasing"
           @error="lightingFailed"
         />
         <Button :disabled="engineDown || scanning || connecting || releasing || !canConnect" @click="onConnectAll">

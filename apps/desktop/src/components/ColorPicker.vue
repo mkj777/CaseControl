@@ -1,12 +1,13 @@
 <script setup lang="ts">
 // Swatches for quick clicks plus a free picker that folds out below: saturation/value area, hue bar and hex input
-// (ADR 0001 #20). Emits every change while dragging; the caller throttles what it sends.
+// (ADR 0001 #20). Emits every change while dragging (`update:modelValue`); the caller throttles what it sends.
+// `change` comes with the final value of a gesture: when a drag ends, and with every click, key step or hex entry.
 import { computed, ref, watch } from 'vue'
 import { SWATCHES, hexToHsv, hsvToHex, normalizeHex, sameColor, type Hsv } from '../lib/color'
 import { Button, TextField } from './ui'
 
 const props = withDefaults(defineProps<{ modelValue: string; disabled?: boolean }>(), { disabled: false })
-const emit = defineEmits<{ 'update:modelValue': [hex: string] }>()
+const emit = defineEmits<{ 'update:modelValue': [hex: string]; change: [hex: string] }>()
 
 const open = ref(false)
 // Kept separately from the hex value so hue survives greys and black.
@@ -33,6 +34,7 @@ function set(next: Hsv) {
 function pick(hex: string) {
   if (props.disabled) return
   emit('update:modelValue', hex)
+  emit('change', hex)
 }
 
 const hueColor = computed(() => hsvToHex({ h: hsv.value.h, s: 1, v: 1 }))
@@ -51,6 +53,7 @@ function track(e: PointerEvent, apply: (x: number, y: number) => void) {
     el.removeEventListener('pointermove', update)
     el.removeEventListener('pointerup', stop)
     el.removeEventListener('pointercancel', stop)
+    emit('change', hsvToHex(hsv.value))
   }
   el.addEventListener('pointermove', update)
   el.addEventListener('pointerup', stop)
@@ -79,6 +82,7 @@ function nudge(e: KeyboardEvent, target: 'area' | 'hue') {
   if (!f || props.disabled) return
   e.preventDefault()
   set(f())
+  emit('change', hsvToHex(hsv.value))
 }
 
 function onHex() {

@@ -161,64 +161,70 @@ pub(crate) fn output(desc: &DeviceDescription, want: &Want, colors: &[Rgb], leve
     }
 }
 
+/// Sets the LEDs of every zone of `desc` named in `zones` to black: the app's hidden zones (ADR 0001 #26), which the
+/// engine keeps black in every direct output (its dark zones, see
+/// [`EngineHandle::set_dark_zones`](crate::EngineHandle::set_dark_zones)). Slices beyond the end of `colors` are
+/// ignored, so a buffer that does not match the layout cannot panic here.
+pub fn mask_hidden_zones(desc: &DeviceDescription, zones: &BTreeSet<String>, colors: &mut [Rgb]) {
+    if zones.is_empty() {
+        return;
+    }
+    let len = colors.len();
+    for zone in desc.zones.iter().filter(|z| zones.contains(&z.name)) {
+        let range = zone.range();
+        let (start, end) = (range.start.min(len), range.end.min(len));
+        colors[start..end].fill(Rgb::BLACK);
+    }
+}
+
 /// What a takeover drives a device with when it has neither a setting nor a hardware readback (ADR 0001 #36):
-/// `color` on every LED in its direct mode (returned as the new colour buffer), else its first mode that takes a
-/// colour (per LED or mode-wide) set to `color`, with speed in the middle and brightness at the top of their ranges.
-/// LEDs of the zones named in `dark` stay black where colours are per LED. `None` when the device has neither a
-/// direct mode nor such a mode.
-pub(crate) fn default_want(
+/// `color` on every LED in its direct mode, else its first mode that takes a colour (per LED, or mode-wide with room
+/// for at least one) set to `color`, with speed in the middle and brightness at the top of their ranges. LEDs of the
+/// zones named in `dark` stay black where colours are per LED. `None` when the device has neither a direct mode nor
+/// such a mode.
+pub(crate) fn default_setting(
     desc: &DeviceDescription,
     color: Rgb,
-    dark: Option<&BTreeSet<String>>,
-) -> Option<(Want, Option<Vec<Rgb>>)> {
+    dark: &BTreeSet<String>,
+) -> Option<DeviceSetting> {
     let mut leds = vec![color; desc.led_count()];
-    for zone in desc
-        .zones
-        .iter()
-        .filter(|z| dark.is_some_and(|d| d.contains(&z.name)))
-    {
-        if let Some(slice) = leds.get_mut(zone.range()) {
-            slice.fill(Rgb::BLACK);
-        }
-    }
+    mask_hidden_zones(desc, dark, &mut leds);
     if desc.direct_mode.is_some() {
-        return Some((Want::Direct, Some(leds)));
+        return Some(DeviceSetting::Direct { colors: leds });
     }
-    desc.modes
-        .iter()
-        .filter(|m| Some(m.id) != desc.direct_mode)
-        .find_map(|m| {
-            let colors = match m.color_mode {
-                ColorMode::PerLed => leds.clone(),
-                ColorMode::ModeSpecific => {
-                    let range = m.colors.as_ref()?;
-                    let n = (*range.start()).max(1).min(*range.end());
-                    vec![color; n]
-                }
-                ColorMode::None | ColorMode::Random => return None,
-            };
-            let mid = |r: &RangeInclusive<u32>| {
-                let (lo, hi) = (*r.start().min(r.end()), *r.start().max(r.end()));
-                lo + (hi - lo) / 2
-            };
-            let state = ModeState {
-                mode: m.id,
-                speed: m
-                    .caps
-                    .contains(ModeCaps::SPEED)
-                    .then(|| m.speed.as_ref().map(mid))
-                    .flatten(),
-                brightness: m
-                    .caps
-                    .contains(ModeCaps::BRIGHTNESS)
-                    .then(|| m.brightness.as_ref().map(|r| *r.start().max(r.end())))
-                    .flatten(),
-                direction: None,
-                colors,
-            };
-            desc.validate_state(&state).is_ok().then_some(state)
-        })
-        .map(|state| (Want::Mode(state), None))
+    desc.modes.iter().find_map(|m| {
+        let colors = match m.color_mode {
+            ColorMode::PerLed => leds.clone(),
+            ColorMode::ModeSpecific => {
+                let range = m.colors.as_ref().filter(|r| *r.end() >= 1)?;
+                vec![color; (*range.start()).max(1)]
+            }
+            ColorMode::None | ColorMode::Random => return None,
+        };
+        // An inverted range holds no value, so the state below fails validation and the mode is skipped.
+        let state = ModeState {
+            mode: m.id,
+            speed: m
+                .caps
+                .contains(ModeCaps::SPEED)
+                .then(|| {
+                    m.speed
+                        .as_ref()
+                        .map(|r| r.start() + r.end().saturating_sub(*r.start()) / 2)
+                })
+                .flatten(),
+            brightness: m
+                .caps
+                .contains(ModeCaps::BRIGHTNESS)
+                .then(|| m.brightness.as_ref().map(|r| *r.end()))
+                .flatten(),
+            direction: None,
+            colors,
+        };
+        desc.validate_state(&state)
+            .is_ok()
+            .then_some(DeviceSetting::Mode { state })
+    })
 }
 
 #[cfg(test)]
@@ -415,6 +421,99 @@ mod tests {
         assert_eq!(
             output(&d, &want, &[], levels(0, 100)).out,
             Out::Mode(state(2, Some(1), vec![red]))
+        );
+    }
+
+    /// Board (1 LED), "A" (3 LEDs), "B" (2 LEDs).
+    fn zoned(direct: bool, modes: Vec<Mode>) -> DeviceDescription {
+        use cc_core::{Led, Zone, ZoneKind};
+        let zone = |name: &str, start, len| Zone {
+            name: name.into(),
+            kind: ZoneKind::Linear,
+            start,
+            len,
+            resizable: None,
+        };
+        let mut d = desc(modes, direct.then_some(0));
+        d.zones = vec![zone("Board", 0, 1), zone("A", 1, 3), zone("B", 4, 2)];
+        d.leds = (0..6).map(|i| Led { name: format!("{i}") }).collect();
+        d
+    }
+
+    fn names(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    const R: Rgb = Rgb::new(255, 0, 0);
+    const B: Rgb = Rgb::BLACK;
+
+    #[test]
+    fn mask_blacks_out_named_zones_only_and_tolerates_short_buffers() {
+        let d = zoned(true, Vec::new());
+        let mut colors = vec![R; 6];
+        mask_hidden_zones(&d, &names(&["Board", "B"]), &mut colors);
+        assert_eq!(colors, vec![B, R, R, R, B, B]);
+
+        let mut colors = vec![R; 6];
+        mask_hidden_zones(&d, &BTreeSet::new(), &mut colors);
+        mask_hidden_zones(&d, &names(&["NOPE"]), &mut colors);
+        assert_eq!(colors, vec![R; 6], "no or unknown zones change nothing");
+
+        let mut short = vec![R; 5];
+        mask_hidden_zones(&d, &names(&["B"]), &mut short);
+        assert_eq!(short, vec![R, R, R, R, B]);
+        let mut empty: Vec<Rgb> = Vec::new();
+        mask_hidden_zones(&d, &names(&["B"]), &mut empty);
+        assert!(empty.is_empty());
+    }
+
+    fn colored(id: u32, colors: RangeInclusive<usize>) -> Mode {
+        Mode {
+            colors: Some(colors),
+            ..mode(
+                id,
+                "M",
+                ModeCaps::MODE_SPECIFIC_COLOR | ModeCaps::BRIGHTNESS,
+                ColorMode::ModeSpecific,
+                Some(1..=10),
+            )
+        }
+    }
+
+    #[test]
+    fn default_setting_is_direct_colour_with_dark_zones_black() {
+        let direct = mode(0, "Direct", ModeCaps::PER_LED_COLOR, ColorMode::PerLed, None);
+        let d = zoned(true, vec![direct]);
+        assert_eq!(
+            default_setting(&d, R, &names(&["A"])),
+            Some(DeviceSetting::Direct {
+                colors: vec![R, B, B, B, R, R]
+            })
+        );
+    }
+
+    #[test]
+    fn default_setting_skips_modes_without_room_for_a_colour() {
+        // 0..=0 colours (no colour at all) and an inverted range are skipped; 1..=3 gets one colour.
+        #[allow(clippy::reversed_empty_ranges)]
+        let inverted = colored(2, 3..=1);
+        let d = zoned(false, vec![colored(1, 0..=0), inverted, colored(3, 1..=3)]);
+        assert_eq!(
+            default_setting(&d, R, &BTreeSet::new()),
+            Some(DeviceSetting::Mode {
+                state: state(3, Some(10), vec![R])
+            })
+        );
+        let d = zoned(false, vec![colored(1, 0..=0)]);
+        assert_eq!(default_setting(&d, R, &BTreeSet::new()), None);
+        // Per-LED colours of a hardware mode keep the dark zones black.
+        let per_led = mode(5, "Static", ModeCaps::PER_LED_COLOR, ColorMode::PerLed, None);
+        let d = zoned(false, vec![per_led]);
+        assert_eq!(
+            default_setting(&d, R, &names(&["Board"])),
+            Some(DeviceSetting::Mode {
+                state: state(5, None, vec![B, R, R, R, R, R])
+            })
         );
     }
 }
