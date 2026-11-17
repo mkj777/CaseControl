@@ -14,8 +14,12 @@
 //!   LEDs become white scaled by that intensity before the brightness factor applies. A takeover with the default
 //!   colour drives them at full intensity whatever the colour, so only brightness matters there.
 //! - **Off** (a factor of 0, i.e. device or master brightness 0; ADR 0001 #35) in a hardware mode: the device's mode
-//!   named "Off" if it has one that takes no colours, else black in its direct mode; a device with neither keeps its
-//!   mode at the lowest brightness.
+//!   named "Off" if it has one that takes no colours, else its driver's off mode
+//!   ([`Controller::off_mode`](cc_core::Controller::off_mode)) at the lowest brightness, else black in its direct
+//!   mode; a device with none of these keeps its mode at the lowest brightness.
+//! - **Off with direct colours**: black in the direct mode, except on a device whose driver names an off mode
+//!   (Mystic Light: Static; ADR 0001 #38), which gets that mode at the lowest brightness instead, so brightness 0
+//!   does not put it into per-LED mode. Raising the brightness again sends the colours in the direct mode.
 
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
@@ -111,8 +115,9 @@ pub(crate) fn scaled_brightness(range: &RangeInclusive<u32>, stored: Option<u32>
     min + step
 }
 
-/// What a device shows when it is off: its "Off" mode (one that takes no colours), else black in direct mode.
-pub(crate) fn off_output(desc: &DeviceDescription) -> Option<Out> {
+/// What a device shows when it is off: its "Off" mode (one that takes no colours), else its driver's off mode
+/// `off_mode` at the lowest brightness, else black in direct mode.
+pub(crate) fn off_output(desc: &DeviceDescription, off_mode: Option<u32>) -> Option<Out> {
     let off = desc.modes.iter().find(|m| {
         m.name.eq_ignore_ascii_case("off") && matches!(m.color_mode, ColorMode::None | ColorMode::Random)
     });
@@ -128,17 +133,66 @@ pub(crate) fn off_output(desc: &DeviceDescription) -> Option<Out> {
             return Some(Out::Mode(state));
         }
     }
+    if let Some(state) = off_mode.and_then(|id| off_mode_state(desc, id)) {
+        return Some(Out::Mode(state));
+    }
     desc.direct_mode
         .map(|_| Out::Direct(vec![Rgb::BLACK; desc.led_count()]))
 }
 
-/// What device `desc` is sent for `want` (direct colours from `colors`) at `levels`.
+/// The driver's off mode `id` as a state: the bottom of its brightness range (and of its speed range, if any),
+/// black colours where it takes them. `None` if the mode does not exist, has no brightness parameter or the state
+/// does not validate.
+fn off_mode_state(desc: &DeviceDescription, id: u32) -> Option<ModeState> {
+    let mode = desc.mode(id)?;
+    let brightness = brightness_range(mode)?;
+    let colors = match mode.color_mode {
+        ColorMode::PerLed => vec![Rgb::BLACK; desc.led_count()],
+        ColorMode::ModeSpecific => vec![Rgb::BLACK; mode.colors.as_ref().map_or(1, |r| (*r.start()).max(1))],
+        ColorMode::None | ColorMode::Random => Vec::new(),
+    };
+    let state = ModeState {
+        mode: id,
+        speed: mode
+            .caps
+            .contains(ModeCaps::SPEED)
+            .then(|| mode.speed.as_ref().map(|r| *r.start()))
+            .flatten(),
+        brightness: Some(*brightness.start()),
+        direction: None,
+        colors,
+    };
+    desc.validate_state(&state).is_ok().then_some(state)
+}
+
+/// [`output_with`] for a device whose driver names no off mode.
+#[cfg(test)]
 pub(crate) fn output(desc: &DeviceDescription, want: &Want, colors: &[Rgb], levels: Levels) -> Output {
+    output_with(desc, None, want, colors, levels)
+}
+
+/// What device `desc` is sent for `want` (direct colours from `colors`) at `levels`; `off_mode` is its driver's off
+/// mode ([`Controller::off_mode`](cc_core::Controller::off_mode)).
+pub(crate) fn output_with(
+    desc: &DeviceDescription,
+    off_mode: Option<u32>,
+    want: &Want,
+    colors: &[Rgb],
+    levels: Levels,
+) -> Output {
     let factor = levels.factor();
     match want {
         Want::Direct => {
             let mut colors = colors.to_vec();
             desc.reduce_fixed_colors(&mut colors);
+            if factor <= 0.0
+                && let Some(off) = off_mode.and_then(|id| off_mode_state(desc, id))
+            {
+                return Output {
+                    out: Out::Mode(off),
+                    stored: DeviceSetting::Direct { colors },
+                };
+            }
             Output {
                 out: Out::Direct(scale_colors(&colors, factor)),
                 stored: DeviceSetting::Direct { colors },
@@ -149,7 +203,7 @@ pub(crate) fn output(desc: &DeviceDescription, want: &Want, colors: &[Rgb], leve
             let stored = DeviceSetting::Mode { state: state.clone() };
             let range = desc.mode(state.mode).and_then(brightness_range);
             if factor <= 0.0
-                && let Some(off) = off_output(desc)
+                && let Some(off) = off_output(desc, off_mode)
             {
                 return Output { stored, out: off };
             }
@@ -354,6 +408,81 @@ mod tests {
             "stored value clamps to the range"
         );
         assert_eq!(scaled_brightness(&(0..=4), Some(4), 0.5), 2);
+    }
+
+    #[test]
+    fn driver_off_mode_replaces_direct_black_at_zero() {
+        // Like Mystic Light: Direct (0), Static (1, per LED, brightness 0..=10), Rainbow (2, random, 0..=10).
+        let d = desc(
+            vec![
+                mode(0, "Direct", ModeCaps::PER_LED_COLOR, ColorMode::PerLed, None),
+                mode(
+                    1,
+                    "Static",
+                    ModeCaps::BRIGHTNESS | ModeCaps::PER_LED_COLOR,
+                    ColorMode::PerLed,
+                    Some(0..=10),
+                ),
+                mode(
+                    2,
+                    "Rainbow",
+                    ModeCaps::BRIGHTNESS | ModeCaps::RANDOM_COLOR,
+                    ColorMode::Random,
+                    Some(0..=10),
+                ),
+            ],
+            Some(0),
+        );
+        let static_off = Out::Mode(state(1, Some(0), vec![Rgb::BLACK; 2]));
+        let colors = [Rgb::new(200, 100, 0), Rgb::new(10, 0, 4)];
+
+        // Direct colours at 0: Static 0, the stored colours unchanged; above 0 the colours in direct mode as before.
+        let off = output_with(&d, Some(1), &Want::Direct, &colors, levels(0, 100));
+        assert_eq!(off.out, static_off);
+        assert_eq!(
+            off.stored,
+            DeviceSetting::Direct {
+                colors: colors.to_vec()
+            }
+        );
+        assert_eq!(
+            output_with(&d, Some(1), &Want::Direct, &colors, levels(100, 0)).out,
+            static_off
+        );
+        assert_eq!(
+            output_with(&d, Some(1), &Want::Direct, &colors, Levels::FULL).out,
+            Out::Direct(colors.to_vec())
+        );
+        // Without an off mode: black in direct mode, as for every other device.
+        assert_eq!(
+            output(&d, &Want::Direct, &colors, levels(0, 100)).out,
+            Out::Direct(vec![Rgb::BLACK; 2])
+        );
+
+        // A hardware mode at 0: Static 0 instead of direct black; above 0 the mode scaled as before.
+        let rainbow = Want::Mode(state(2, Some(10), vec![]));
+        assert_eq!(
+            output_with(&d, Some(1), &rainbow, &[], levels(0, 100)).out,
+            static_off
+        );
+        assert_eq!(
+            output(&d, &rainbow, &[], levels(0, 100)).out,
+            Out::Direct(vec![Rgb::BLACK; 2])
+        );
+        assert_eq!(
+            output_with(&d, Some(1), &rainbow, &[], levels(50, 100)).out,
+            Out::Mode(state(2, Some(5), vec![]))
+        );
+
+        // An off mode that does not exist or has no brightness parameter is ignored.
+        assert_eq!(
+            output_with(&d, Some(9), &Want::Direct, &colors, levels(0, 100)).out,
+            Out::Direct(vec![Rgb::BLACK; 2])
+        );
+        assert_eq!(
+            output_with(&d, Some(0), &rainbow, &[], levels(0, 100)).out,
+            Out::Direct(vec![Rgb::BLACK; 2])
+        );
     }
 
     #[test]

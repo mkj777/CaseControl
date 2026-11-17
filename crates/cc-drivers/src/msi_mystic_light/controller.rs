@@ -283,8 +283,13 @@ fn layout_zones(board: &Board, lens: &[usize]) -> (Vec<Zone>, Vec<Led>) {
 /// The mode the board shows on its own, decoded from configuration `config` (`GetMode` of the first zone with LEDs,
 /// as `RGBController_MSIMotherboard185` reads the active mode): its effect as one of `desc`'s hardware modes, speed and
 /// brightness clamped to the mode's ranges, and for per-LED colour modes each zone's first colour on all its LEDs.
-/// `None` for the per-LED (direct) effect, "disabled" and effects without a mode, since their colours are unknown.
+/// `None` for the per-LED (direct) effect, "disabled" and effects without a mode, since their colours are unknown;
+/// also `None` for a configuration in per-LED mode (on-board effect 0x25), whose other zone records (Static, as the
+/// enable message sets them) do not describe what the board shows.
 fn hardware_state(config: &ConfigPacket, board: &Board, desc: &DeviceDescription) -> Option<ModeState> {
+    if config.is_direct() {
+        return None;
+    }
     let mixed = board.layout.mixed_mode;
     let (first, _) = board
         .config
@@ -334,8 +339,14 @@ pub struct MysticLight185 {
     board: Board,
     board_id: u16,
     firmware: Firmware,
-    /// The configuration read at open; `release()` sends it back with the save byte forced to zero.
+    /// The configuration read at open, or the remembered last good own lighting when the board was found in
+    /// per-LED mode (ADR 0001 #38); `release()` sends it back with the save byte forced to zero.
     original: ConfigPacket,
+    /// The configuration read at open when it is a good own lighting worth remembering (`Controller::own_lighting`).
+    own_lighting: Option<Vec<u8>>,
+    /// `original` came from the remembered state because the board was found in per-LED mode: `release()` restores
+    /// it even if nothing was sent since open.
+    restore_pending: bool,
     /// Working configuration (`data` in the reference): the original plus our header sizes and mode changes.
     data: ConfigPacket,
     per_led: PerLedBuffers,
@@ -434,7 +445,27 @@ impl MysticLight185 {
     /// 4. `get_feature_report(0x52)` again into a 185-byte buffer: the configuration that `release()` restores.
     ///
     /// Boards whose reference configuration uses the zone-based direct mode fail before step 2.
-    pub fn open(mut dev: Box<dyn HidTransport>, candidate: &Candidate) -> Result<Self, DeviceError> {
+    ///
+    /// Same as [`open_with_stored`](Self::open_with_stored) without a remembered own lighting.
+    pub fn open(dev: Box<dyn HidTransport>, candidate: &Candidate) -> Result<Self, DeviceError> {
+        Self::open_with_stored(dev, candidate, None)
+    }
+
+    /// [`open`](Self::open) with the board's remembered last good own lighting (ADR 0001 #38, the bytes an earlier
+    /// controller reported through [`Controller::own_lighting`](cc_core::Controller::own_lighting)).
+    ///
+    /// - The configuration read at open is not per-LED: it is what `release()` restores, and it is reported as the
+    ///   new own lighting to remember.
+    /// - It is per-LED (left by an earlier run or another program) and `stored` passes
+    ///   [`ConfigPacket::from_own_lighting`] (185 bytes, report id 0x52, save byte 0, no zone in the per-LED effect):
+    ///   `stored` takes its place for `release()` and [`hardware_mode`](cc_core::Controller::hardware_mode), and
+    ///   `release()` restores it even if nothing was sent since open.
+    /// - It is per-LED without a usable `stored`: as before, `release()` restores the per-LED state (warning).
+    pub fn open_with_stored(
+        mut dev: Box<dyn HidTransport>,
+        candidate: &Candidate,
+        stored: Option<&[u8]>,
+    ) -> Result<Self, DeviceError> {
         let len = read_config_len(dev.as_mut())?;
         match protocol::classify(len) {
             PacketClass::Bytes185 => {}
@@ -461,14 +492,37 @@ impl MysticLight185 {
             )));
         }
 
-        let original = read_config(dev.as_mut())?;
-        if original.is_direct() {
-            tracing::warn!(
-                target: "cc_drivers::msi",
-                id = %candidate.id,
-                "board was left in per-LED mode by another program; release() will restore that state"
-            );
-        }
+        let read = read_config(dev.as_mut())?;
+        let (original, own_lighting, restore_pending) = if read.is_direct() {
+            match stored.and_then(ConfigPacket::from_own_lighting) {
+                Some(good) => {
+                    tracing::info!(
+                        target: "cc_drivers::msi",
+                        id = %candidate.id,
+                        "board found in per-LED mode; release() will restore the last good own lighting stored for it"
+                    );
+                    (good, None, true)
+                }
+                None => {
+                    if stored.is_some() {
+                        tracing::warn!(
+                            target: "cc_drivers::msi",
+                            id = %candidate.id,
+                            "stored own lighting is not a valid 185-byte configuration; ignoring it"
+                        );
+                    }
+                    tracing::warn!(
+                        target: "cc_drivers::msi",
+                        id = %candidate.id,
+                        "board was left in per-LED mode by another program; release() will restore that state"
+                    );
+                    (read, None, false)
+                }
+            }
+        } else {
+            let own = read.own_lighting();
+            (read, own, false)
+        };
 
         let config = listed.copied().unwrap_or(boards::DEFAULT_BOARD);
         let board = Board::new(board_id, config);
@@ -487,7 +541,10 @@ impl MysticLight185 {
             serial: candidate.serial.clone(),
             firmware: Some(firmware.display()),
         };
-        Ok(Self::assemble(dev, info, board, board_id, firmware, original))
+        let mut c = Self::assemble(dev, info, board, board_id, firmware, original);
+        c.own_lighting = own_lighting;
+        c.restore_pending = restore_pending;
+        Ok(c)
     }
 
     fn assemble(
@@ -533,6 +590,8 @@ impl MysticLight185 {
             board_id,
             firmware,
             original,
+            own_lighting: None,
+            restore_pending: false,
             data,
             per_led: PerLedBuffers::new(),
             colors,
@@ -543,7 +602,8 @@ impl MysticLight185 {
         }
     }
 
-    /// The configuration read from the device at open.
+    /// The configuration `release()` restores: the one read from the device at open, or the remembered own lighting
+    /// that replaced a per-LED readback (see [`open_with_stored`](Self::open_with_stored)).
     pub fn original_config(&self) -> &ConfigPacket {
         &self.original
     }
@@ -831,7 +891,7 @@ impl Controller for MysticLight185 {
     }
 
     fn release(&mut self) -> Result<(), DeviceError> {
-        if !self.touched {
+        if !self.touched && !self.restore_pending {
             return Ok(());
         }
         self.direct = false;
@@ -852,11 +912,23 @@ impl Controller for MysticLight185 {
         let original = self.original.with_save(false);
         self.send(&original)?;
         self.touched = false;
+        self.restore_pending = false;
         Ok(())
     }
 
-    /// The mode in the configuration read at open, which is also what `release()` restores.
+    /// The mode in the configuration `release()` restores (read at open, or the remembered own lighting).
     fn hardware_mode(&self) -> Option<ModeState> {
         hardware_state(&self.original, &self.board, &self.desc)
+    }
+
+    /// The configuration read at open (save byte 0) when the board showed its own lighting then.
+    fn own_lighting(&self) -> Option<Vec<u8>> {
+        self.own_lighting.clone()
+    }
+
+    /// Static at brightness 0: a hardware state, so brightness 0 does not switch the board to per-LED mode (whose
+    /// enable message outlives the app if it ends without a release; ADR 0001 #38).
+    fn off_mode(&self) -> Option<u32> {
+        Some(u32::from(mode::STATIC))
     }
 }

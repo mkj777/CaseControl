@@ -8,6 +8,8 @@ use crate::error::{ConfigError, Result};
 const APP_DIR: &str = "CaseControl";
 /// File name of the settings file inside [`Paths::config_dir`].
 const CONFIG_FILE: &str = "config.toml";
+/// File name of the machine state file inside [`Paths::config_dir`] (ADR 0001 #38).
+const HARDWARE_STATE_FILE: &str = "hardware-state.toml";
 
 /// The directories this crate reads and writes. Nothing outside them is touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +52,11 @@ impl Paths {
         self.config_dir.join(CONFIG_FILE)
     }
 
+    /// Full path of the machine state file ([`HardwareState`](crate::HardwareState)).
+    pub fn hardware_state_file(&self) -> PathBuf {
+        self.config_dir.join(HARDWARE_STATE_FILE)
+    }
+
     /// Creates all three directories (and their parents) if they do not exist.
     pub fn ensure(&self) -> Result<()> {
         for dir in [&self.config_dir, &self.profiles_dir, &self.logs_dir] {
@@ -71,6 +78,7 @@ mod tests {
         assert_eq!(p.profiles_dir, root.join("profiles"));
         assert_eq!(p.logs_dir, root.join("logs"));
         assert_eq!(p.config_file(), root.join("config.toml"));
+        assert_eq!(p.hardware_state_file(), root.join("hardware-state.toml"));
     }
 
     #[test]

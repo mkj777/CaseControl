@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cc_config::DeviceSetting;
+use cc_config::{DeviceSetting, HardwareState};
 use cc_core::{
     Backend, Bus, ColorMode, Controller, DetectContext, Detected, DeviceDescription, DeviceError, DeviceId,
     DeviceInfo, DeviceKind, EngineEvent, HotplugAction, HotplugEvent, HotplugHandle, HotplugSender, Led,
@@ -44,6 +44,10 @@ struct Behavior {
     fail_release: bool,
     /// What `hardware_mode` reports.
     hardware: Option<ModeState>,
+    /// What `own_lighting` reports.
+    own_lighting: Option<Vec<u8>>,
+    /// What `off_mode` reports.
+    off_mode: Option<u32>,
 }
 
 struct FakeCtrl {
@@ -128,6 +132,14 @@ impl Controller for FakeCtrl {
     fn hardware_mode(&self) -> Option<ModeState> {
         self.behavior.lock().hardware.clone()
     }
+
+    fn own_lighting(&self) -> Option<Vec<u8>> {
+        self.behavior.lock().own_lighting.clone()
+    }
+
+    fn off_mode(&self) -> Option<u32> {
+        self.behavior.lock().off_mode
+    }
 }
 
 /// A device that may be "plugged in" to a [`FakeBackend`].
@@ -209,6 +221,8 @@ struct FakeBackend {
     contexts: Arc<Mutex<Vec<DetectContext>>>,
     /// How long `detect` blocks.
     delay: Arc<Mutex<Duration>>,
+    /// The length of the call log when each `detect` started (to order calls against detection passes).
+    detect_marks: Arc<Mutex<Vec<usize>>>,
 }
 
 impl FakeBackend {
@@ -221,6 +235,7 @@ impl FakeBackend {
             log: Arc::clone(log),
             contexts: Arc::default(),
             delay: Arc::default(),
+            detect_marks: Arc::default(),
         }
     }
 }
@@ -236,6 +251,8 @@ impl Backend for FakeBackend {
 
     fn detect(&self, ctx: &DetectContext) -> Vec<Detected> {
         self.contexts.lock().push(ctx.clone());
+        let mark = self.log.lock().len();
+        self.detect_marks.lock().push(mark);
         let delay = *self.delay.lock();
         std::thread::sleep(delay);
         if !ctx.is_enabled(self.family) {
@@ -695,9 +712,10 @@ fn fatal_error_faults_immediately() {
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(entries(&log, "direct").len(), 1);
 
-    // Shutdown does not talk to a faulted device.
+    // Shutdown releases a faulted device too, best effort (ADR 0001 #38): one attempt, nothing else is sent.
     e.shutdown(SECOND);
-    assert!(entries(&log, "release").is_empty());
+    assert_eq!(entries(&log, "release").len(), 1);
+    assert_eq!(entries(&log, "direct").len(), 1);
 }
 
 #[test]
@@ -2404,4 +2422,223 @@ fn brightness_only_device_takes_over_at_full_white_and_reduces_colours_to_intens
     };
     assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting == Some(grey.clone())));
     assert_eq!(e.device(&id(1)).unwrap().colors, vec![Rgb::new(200, 200, 200); 7]);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Last good own lighting, release hardening, off mode (ADR 0001 #38)
+
+/// A unique path for a machine state file in the system temp folder, removed on drop.
+struct TempFile(std::path::PathBuf);
+
+impl TempFile {
+    fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Self(std::env::temp_dir().join(format!("cc-engine-{tag}-{}-{nanos}.toml", std::process::id())))
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Faults device `n` (its next frame fails fatally), then lets it work again.
+fn fault(e: &EngineHandle, s: &Spec, n: u16) {
+    s.behavior.lock().fatal_direct = true;
+    e.set_direct(&id(n), vec![RED; 7]).unwrap();
+    assert!(wait_until(SECOND, || matches!(
+        e.device(&id(n)).unwrap().status,
+        DeviceStatus::Faulted { .. }
+    )));
+    s.behavior.lock().fatal_direct = false;
+}
+
+#[test]
+fn own_lighting_is_recorded_once_and_handed_to_later_detections() {
+    let file = TempFile::new("own-lighting");
+    // Something remembered from an earlier run, for a device that is not connected.
+    let mut state = HardwareState::load_from(file.0.clone());
+    state.record_own_lighting(&id(9), &[9]).unwrap();
+
+    let log = Log::default();
+    let board = spec(id(1), "Board", DeviceKind::Motherboard);
+    board.behavior.lock().own_lighting = Some(vec![1, 2, 3]);
+    let other = spec(id(2), "Other", DeviceKind::Light);
+    let b = FakeBackend::new("f", vec![board.clone(), other], &log);
+    let contexts = Arc::clone(&b.contexts);
+    let e = start_with(
+        EngineConfig {
+            hardware_state: state,
+            ..cfg(60)
+        },
+        vec![Box::new(b)],
+        None,
+        fast_timing(),
+    )
+    .unwrap();
+
+    // The first detection got what was stored; the board's readback is recorded and written.
+    assert_eq!(
+        contexts.lock()[0].own_lighting,
+        BTreeMap::from([(id(9), vec![9])])
+    );
+    assert_eq!(e.hardware_state().get(&id(1)), Some(&[1u8, 2, 3][..]));
+    assert_eq!(e.hardware_state().get(&id(2)), None, "nothing reported");
+    let saved = HardwareState::load_from(file.0.clone());
+    assert_eq!(saved.get(&id(1)), Some(&[1u8, 2, 3][..]));
+    assert_eq!(saved.get(&id(9)), Some(&[9u8][..]));
+
+    // Re-opened with the same readback: handed to the driver, not written again.
+    std::fs::write(&file.0, "marker").unwrap();
+    fault(&e, &board, 1);
+    e.rescan();
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
+        == DeviceStatus::Released));
+    assert_eq!(
+        contexts.lock().last().unwrap().own_lighting.get(&id(1)),
+        Some(&vec![1, 2, 3])
+    );
+    assert_eq!(std::fs::read_to_string(&file.0).unwrap(), "marker");
+
+    // A different readback replaces it.
+    board.behavior.lock().own_lighting = Some(vec![4]);
+    fault(&e, &board, 1);
+    e.rescan();
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
+        == DeviceStatus::Released));
+    let saved = HardwareState::load_from(file.0.clone());
+    assert_eq!(saved.get(&id(1)), Some(&[4u8][..]));
+    e.shutdown(SECOND);
+}
+
+#[test]
+fn faulted_device_is_released_before_it_is_opened_again() {
+    let log = Log::default();
+    let s = spec(id(1), "A", DeviceKind::Light);
+    let b = FakeBackend::new("f", vec![s.clone()], &log);
+    let marks = Arc::clone(&b.detect_marks);
+    let plugged = Arc::clone(&b.plugged);
+    let e = engine(60, vec![Box::new(b)]);
+    fault(&e, &s, 1);
+    assert!(entries(&log, "release").is_empty());
+
+    e.rescan();
+    let releases: Vec<usize> = log
+        .lock()
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, l))| l.ends_with(" release"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(releases.len(), 1, "the faulted controller released once");
+    assert!(
+        releases[0] < *marks.lock().last().unwrap(),
+        "released before detection opened the device again"
+    );
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
+
+    // Faulted again and gone: released once on the next detection, not again on later ones; shutdown does not
+    // wait for the stopped worker.
+    fault(&e, &s, 1);
+    plugged.lock().clear();
+    e.rescan();
+    e.rescan();
+    assert_eq!(entries(&log, "release").len(), 2);
+    assert!(matches!(
+        e.device(&id(1)).unwrap().status,
+        DeviceStatus::Faulted { .. }
+    ));
+    let start = Instant::now();
+    e.shutdown(SECOND);
+    assert!(start.elapsed() < Duration::from_millis(500));
+    assert_eq!(entries(&log, "release").len(), 2);
+}
+
+/// Device `n` like a Mystic Light board: mode 5 "Static" (per-LED colours, brightness 0..=10) is its driver's off
+/// mode.
+fn with_off_mode(n: u16) -> Spec {
+    let mut s = spec(id(n), "Board", DeviceKind::Motherboard);
+    s.desc.modes.push(Mode {
+        id: 5,
+        name: "Static".into(),
+        caps: ModeCaps::BRIGHTNESS | ModeCaps::PER_LED_COLOR,
+        color_mode: ColorMode::PerLed,
+        speed: None,
+        brightness: Some(0..=10),
+        colors: None,
+    });
+    s.behavior.lock().off_mode = Some(5);
+    s
+}
+
+#[test]
+fn brightness_zero_uses_the_driver_off_mode_instead_of_direct_black() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![with_off_mode(1), with_off_mode(2)], &log);
+    let e = engine(60, vec![Box::new(b)]);
+
+    // Driven with colours: 0 sends Static at brightness 0 (no black frame), back up sends the colours again.
+    drive(&e, &log, 1);
+    e.set_device_brightness(&id(1), 0).unwrap();
+    assert!(shows_mode(&log, 1, "5 b=0"));
+    assert_eq!(frames(&log, 1), [hex(&[RED; 7])]);
+    // Colour edits at 0 are recorded but stay dark (the off mode is not re-sent).
+    e.set_direct(&id(1), vec![GREEN; 7]).unwrap();
+    assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().setting
+        == Some(DeviceSetting::Direct {
+            colors: vec![GREEN; 7]
+        })));
+    assert_eq!(modes(&log, 1).len(), 1);
+    assert_eq!(frames(&log, 1).len(), 1);
+    e.set_device_brightness(&id(1), 100).unwrap();
+    assert!(shows(&log, 1, &[GREEN; 7]));
+
+    // A released device taken over at 0: straight to the off mode, never a direct frame.
+    e.set_device_brightness(&id(2), 0).unwrap();
+    assert!(shows_mode(&log, 2, "5 b=0"));
+    assert!(wait_until(SECOND, || e.device(&id(2)).unwrap().status
+        == DeviceStatus::Active));
+    assert!(frames(&log, 2).is_empty());
+    e.set_device_brightness(&id(2), 50).unwrap();
+    assert!(shows(&log, 2, &[Rgb::new(128, 128, 128); 7]));
+}
+
+/// Run 7 (ADR 0001 #38, item 4): Take over all three times within seconds, each taking every device again. A second
+/// Take over all leaves driven devices alone; only a release in between (Release all, which did not log at that
+/// build) makes the next one take them again.
+#[test]
+fn take_over_all_retakes_devices_only_after_a_release() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            spec(id(2), "B", DeviceKind::Light),
+        ],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    e.connect_all();
+    for n in [1, 2] {
+        assert!(shows(&log, n, &[Rgb::WHITE; 7]));
+    }
+    let n = log.lock().len();
+    e.connect_all();
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(log.lock().len(), n, "nothing is taken twice");
+
+    for round in 1..=3 {
+        assert_eq!(e.release_all().released, 2);
+        assert_eq!(entries(&log, "release").len(), 2 * round);
+        e.connect_all();
+        for n in [1, 2] {
+            assert!(wait_until(SECOND, || frames(&log, n).len() == round + 1));
+            assert!(wait_until(SECOND, || e.device(&id(n)).unwrap().status
+                == DeviceStatus::Active));
+        }
+    }
 }

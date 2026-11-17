@@ -753,3 +753,180 @@ fn hardware_mode_decodes_the_configuration_read_at_open() {
         fake.finish().expect("script consumed");
     }
 }
+
+/// `original()` with JRGB1 (offset 1) in Rainbow wave (26) at speed HIGH, brightness 7 (flags 0x1E) and save byte 0:
+/// a good own lighting as an earlier open stored it.
+fn stored_rainbow() -> [u8; CONFIG_LEN] {
+    let mut b = original();
+    b[1] = 26;
+    b[5] = 0x1E;
+    b[184] = 0;
+    b
+}
+
+/// What the board reads back after a run that left it in per-LED mode: the synchronized enable message.
+fn per_led_readback() -> [u8; CONFIG_LEN] {
+    let headers = protocol::Headers {
+        jrainbow1: true,
+        jrainbow2: true,
+        jcorsair: false,
+    };
+    protocol::enable_direct_packet(true, headers)
+}
+
+fn detect_stored(fake: &FakeTransport, stored: Option<&[u8]>) -> Box<dyn Controller> {
+    let mut ctx = DetectContext::default();
+    if let Some(s) = stored {
+        ctx.own_lighting
+            .insert(DeviceId::hid(0x1462, 0x7D75, None), s.to_vec());
+    }
+    let f = fake.clone();
+    let devices = [hid(0x1462, 0x7D75, 1, 0, None, PATH)];
+    let mut found = detect_with(&ctx, &devices, move |_| {
+        Ok(Box::new(f.clone()) as Box<dyn HidTransport>)
+    });
+    assert_eq!(found.len(), 1);
+    match found.remove(0) {
+        Detected::Device(c) => c,
+        other => panic!("expected a device, got {other:?}"),
+    }
+}
+
+#[test]
+fn own_lighting_is_reported_for_a_readback_that_is_not_per_led() {
+    let (c, fake) = open_7d75(|s| s);
+    // The configuration read at open, save byte forced to 0 (original() has 1 there).
+    assert_eq!(c.own_lighting(), Some(with_save(original(), 0)));
+    assert_eq!(c.off_mode(), Some(1), "Static");
+    fake.finish().expect("script consumed");
+
+    // A per-LED readback is never offered for storing, and without a stored state nothing changes: no readback
+    // mode, and an untouched release sends nothing.
+    let fake = open_steps_with(FakeTransport::builder(), per_led_readback()).build();
+    let mut c = detect_stored(&fake, None);
+    assert_eq!(c.own_lighting(), None);
+    assert_eq!(c.hardware_mode(), None);
+    c.release().expect("untouched release");
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn per_led_readback_uses_the_stored_own_lighting() {
+    let stored = stored_rainbow();
+    // Untouched: release still restores the stored state (current state back first, as every release does), once.
+    let fake = open_steps_with(FakeTransport::builder(), per_led_readback())
+        .feature_reply(0x52, per_led_readback()[1..].to_vec())
+        .feature(per_led_readback().to_vec())
+        .feature(stored.to_vec())
+        .build();
+    let mut c = detect_stored(&fake, Some(&stored));
+    assert_eq!(c.own_lighting(), None, "nothing new to remember");
+    assert_eq!(
+        c.hardware_mode(),
+        Some(ModeState {
+            mode: 26,
+            speed: Some(2),
+            brightness: Some(7),
+            direction: None,
+            colors: vec![],
+        }),
+        "the readback is the stored state"
+    );
+    // Header sizes come from the stored state (0 / 0), not from the enable message's 40 / 40.
+    let lens: Vec<_> = c.description().zones.iter().map(|z| z.len).collect();
+    assert_eq!(lens, vec![1, 1, 0, 0]);
+    c.release().expect("restores the stored state");
+    c.release().expect("second release is a no-op");
+    fake.finish().expect("script consumed");
+
+    // Driven, then released: the stored state too.
+    let fake = open_steps_with(FakeTransport::builder(), per_led_readback())
+        .feature(expected_enable_sync())
+        .feature(per_led(0x06, 0x00, &[(0, C1), (1, C2)]))
+        .feature_reply(0x52, per_led_readback()[1..].to_vec())
+        .feature(per_led_readback().to_vec())
+        .feature(stored.to_vec())
+        .build();
+    let mut c = detect_stored(&fake, Some(&stored));
+    c.set_direct(&[C1, C2]).expect("frame");
+    c.release().expect("release");
+    fake.finish().expect("script consumed");
+
+    // A board that is not per-LED ignores the stored state and reports its own readback instead.
+    let fake = open_steps(FakeTransport::builder()).build();
+    let c = detect_stored(&fake, Some(&stored));
+    assert_eq!(c.own_lighting(), Some(with_save(original(), 0)));
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn invalid_stored_own_lighting_is_never_sent() {
+    let good = stored_rainbow();
+    let mut per_led_onboard = good;
+    per_led_onboard[74] = 0x25;
+    let mut per_led_header = good;
+    per_led_header[31] = 0x25;
+    let mut saving = good;
+    saving[184] = 1;
+    let mut wrong_id = good;
+    wrong_id[0] = 0x53;
+    let invalid: Vec<Vec<u8>> = vec![
+        per_led_onboard.to_vec(),
+        per_led_header.to_vec(),
+        saving.to_vec(),
+        wrong_id.to_vec(),
+        good[..162].to_vec(),
+        [good.as_slice(), &[0]].concat(),
+        Vec::new(),
+    ];
+    for stored in invalid {
+        // Only the open runs: the untouched release has nothing to restore and sends nothing.
+        let fake = open_steps_with(FakeTransport::builder(), per_led_readback()).build();
+        let mut c = detect_stored(&fake, Some(&stored));
+        assert_eq!(c.hardware_mode(), None, "{stored:02x?}");
+        c.release().expect("untouched release");
+        fake.finish().expect("script consumed");
+    }
+}
+
+#[test]
+fn static_at_brightness_zero_stays_out_of_per_led_mode() {
+    // The engine's off output for this board: Static (off_mode) at brightness 0 with black colours. Only the
+    // configuration report 0x52 goes out (current state, then the new one); no enable message, no 0x53 frame.
+    let layout = protocol::Layout {
+        mixed_mode: true,
+        no_onboards: true,
+        onboard_leds: 0,
+    };
+    let mut e = protocol::ConfigPacket(original());
+    e.0[41] = 0;
+    e.0[52] = 0;
+    for z in [MsiZone::JRgb1, MsiZone::JRgb2] {
+        e.apply_mode(&layout, z, 1, 0, 0, false);
+        e.apply_zone_color(&layout, z, Rgb::BLACK, Rgb::BLACK);
+    }
+    let e = e.with_save(false);
+    assert_eq!(e[5] >> 2, 0, "JRGB1 brightness 0");
+    assert!(!protocol::ConfigPacket(e).has_direct_effect());
+
+    let (mut c, fake) = open_7d75(|s| {
+        s.feature(expected_enable_sync()) //                 colours first
+            .feature(per_led(0x06, 0x00, &[(0, C1), (1, C2)]))
+            .feature_reply(0x52, current()[1..].to_vec()) // then brightness 0: Static 0
+            .feature(with_save(current(), 0))
+            .feature(e.to_vec())
+            .feature(expected_enable_sync()) //               back up: per-LED again, then the frame
+            .feature(per_led(0x06, 0x00, &[(0, C1), (1, C2)]))
+    });
+    c.set_direct(&[C1, C2]).expect("frame");
+    let off = ModeState {
+        mode: c.off_mode().expect("off mode"),
+        speed: None,
+        brightness: Some(0),
+        direction: None,
+        colors: vec![Rgb::BLACK; 2],
+    };
+    c.set_mode(&off).expect("static 0");
+    c.set_direct(&[C1, C2]).expect("frame after off");
+    fake.finish().expect("script consumed");
+}

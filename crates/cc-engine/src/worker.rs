@@ -65,7 +65,7 @@ pub(crate) enum Command {
     /// Hand the device back to its hardware mode.
     Release { seq: u64, reply: Reply },
     /// Leave the thread, releasing first if `release` and the device was not handed back since it was opened or last
-    /// written to.
+    /// written to. A faulted device is released too (best effort; ADR 0001 #38).
     Stop { release: bool, reply: Option<Reply> },
     /// The system resumed: reset the device (`release()`) and send `output` (the current output, issued with
     /// `seq`) again, retrying both with back-off for up to [`Timing::resume_retry`].
@@ -491,10 +491,14 @@ impl Worker {
             }
             Command::Reassert { seq, output } => self.reassert(seq, output),
             Command::Stop { release, reply } => {
-                let r = if release && self.needs_release && self.local != Local::Faulted {
+                let r = if release && self.needs_release {
                     let r = self.ctrl.release();
-                    if let Err(e) = &r {
-                        warn!(id = %self.id, error = %e, "release on stop failed");
+                    match &r {
+                        Err(e) if self.local == Local::Faulted => {
+                            debug!(id = %self.id, error = %e, "release of the faulted device on stop failed");
+                        }
+                        Err(e) => warn!(id = %self.id, error = %e, "release on stop failed"),
+                        Ok(()) => {}
                     }
                     r
                 } else {
