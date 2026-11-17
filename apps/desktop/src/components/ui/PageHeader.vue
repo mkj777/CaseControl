@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // Page header (docs/design-system.md, "Page header"). Title with an optional status badge (slot `badge`), back link
 // on detail pages, at most one description line. Slot `actions` holds the page's view actions (Rescan, Scan, Show
-// hidden). Slot `controls` holds page-wide lighting controls (brightness, All off, Release all; ADR 0001 #33): with
+// hidden). Slot `controls` holds page-wide lighting controls (brightness, Connect all, Release all; ADR 0001 #33, #35): with
 // it the header gets one toolbar row under the title, lighting controls on the left and the actions on the right,
 // instead of putting the actions next to the title. `titleHidden` keeps the h1 for screen readers only, for a page
 // the sidebar already names (Devices): the toolbar row is then the first thing on the page.

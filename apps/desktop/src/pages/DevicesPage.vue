@@ -3,9 +3,8 @@
 // view. Tiles fill the window width (ADR 0001 #28). Right-click a tile to hide or unhide the device; hidden devices
 // are shown greyed only with "Show hidden" on (ADR 0001 #26, #27). No visible title (the sidebar says where you are;
 // the h1 stays for screen readers); the page starts with one toolbar row: All brightness, Connect all and Release
-// all (ADR 0001 #33) on the left, Show hidden and Rescan on the right. Connect all also ends All off (as a device
-// view's "Turn on" does). Each tile shows the real status and what the device shows: its colours, the name of its
-// own mode while released, empty LEDs when that is unknown, dark LEDs while All off holds it.
+// all (ADR 0001 #33, #35) on the left, Show hidden and Rescan on the right. Each tile shows the real status and what
+// the device shows: its colours, the name of its own mode while released, empty LEDs when that is unknown.
 import { computed, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import BrightnessSlider from '../components/BrightnessSlider.vue'
@@ -85,17 +84,15 @@ const releasing = ref(false)
 const engineDown = computed(() => !deviceState.loaded || deviceState.engineError !== null)
 /** Nothing to release: no device is driven. */
 const noneActive = computed(() => !deviceState.devices.some((d) => statusOf(d) === 'active'))
-/** Connect all has something to do: All off is on, or a released, visible device has a setting or a known own mode
- * to be taken over with (one without either would stay released, so it does not count). */
-const canConnect = computed(
-  () =>
-    deviceState.lighting.all_off ||
-    deviceState.devices.some(
-      (d) =>
-        statusOf(d) === 'released' &&
-        !isDeviceHidden(d.description.info.id) &&
-        (d.setting !== null || d.hardware !== null),
-    ),
+/** Connect all has something to do: a released, visible device has a setting or a known own mode to be taken over
+ * with (one without either would stay released, so it does not count). */
+const canConnect = computed(() =>
+  deviceState.devices.some(
+    (d) =>
+      statusOf(d) === 'released' &&
+      !isDeviceHidden(d.description.info.id) &&
+      (d.setting !== null || d.hardware !== null),
+  ),
 )
 
 async function sendMaster(percent: number, persist: boolean) {
@@ -177,7 +174,7 @@ async function onReleaseAll() {
         :to="deviceLink(t.id)"
         :hidden="t.hidden"
         :name="t.d.description.info.name"
-        :meta="t.hidden ? undefined : (lightingLabel(t.d, deviceState.lighting.all_off) ?? undefined)"
+        :meta="t.hidden ? undefined : (lightingLabel(t.d) ?? undefined)"
         @contextmenu="openMenu($event, t.id, t.hidden)"
       >
         <template #badge>
@@ -186,7 +183,7 @@ async function onReleaseAll() {
         </template>
         <DevicePreview
           :description="t.d.description"
-          :colors="shownColors(t.d, deviceState.lighting.all_off)"
+          :colors="shownColors(t.d)"
           :hidden-zones="hiddenZonesOf(t.d)"
         />
       </Tile>

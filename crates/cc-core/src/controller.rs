@@ -49,7 +49,7 @@ pub trait Controller: Send {
     /// was taken, expressed as a state of one of the description's modes; `None` when the driver cannot read it or
     /// cannot express it as a mode (the default). Must not do I/O: drivers return what they read when the device was
     /// opened (or re-read when control was taken again). The engine shows it for a released device and adopts it as
-    /// the device's setting when a brightness or All off change takes over a device that has none, so nothing jumps.
+    /// the device's setting when a brightness change takes over a device that has none, so nothing jumps.
     fn hardware_mode(&self) -> Option<ModeState> {
         None
     }

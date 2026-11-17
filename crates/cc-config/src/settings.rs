@@ -17,11 +17,16 @@ pub const DEFAULT_FRAME_RATE: u32 = 30;
 pub const FRAME_RATE_RANGE: std::ops::RangeInclusive<u32> = 1..=60;
 /// Full brightness in percent: the default of the master and every device brightness (ADR 0001 #33).
 pub const FULL_BRIGHTNESS: u8 = 100;
+/// Top-level keys of earlier versions that are no longer used: dropped on load instead of being kept in
+/// [`Settings::extra`], so they leave the file on the next save. `all_off` was the All off switch (ADR 0001 #33),
+/// removed by ADR 0001 #35.
+const RETIRED_KEYS: &[&str] = &["all_off"];
 
 /// Application settings.
 ///
 /// Every field has a default, so old or partial files load. Keys this version does not know are kept in
-/// [`Settings::extra`] (and in the `extra` of the nested tables) and written back on save.
+/// [`Settings::extra`] (and in the `extra` of the nested tables) and written back on save, except retired keys of
+/// earlier versions (`all_off`), which are dropped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -46,10 +51,6 @@ pub struct Settings {
         skip_serializing_if = "is_full_brightness"
     )]
     pub master_brightness: u8,
-    /// All off is on: devices are kept black and fade back in when it is switched off (ADR 0001 #33). Written only
-    /// when `true`.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub all_off: bool,
     /// Per-device overrides, keyed by device id.
     pub devices: BTreeMap<DeviceId, DeviceOverrides>,
     /// Unknown top-level keys, preserved across a load/save cycle.
@@ -67,7 +68,6 @@ impl Default for Settings {
             conflicts: ConflictSettings::default(),
             last_profile: None,
             master_brightness: FULL_BRIGHTNESS,
-            all_off: false,
             devices: BTreeMap::new(),
             extra: toml::Table::new(),
         }
@@ -171,9 +171,14 @@ impl Settings {
         self.detectors.get(family).copied().unwrap_or(true)
     }
 
-    /// Parses settings from TOML text. The frame rate is clamped; unknown keys land in `extra`.
+    /// Parses settings from TOML text. The frame rate is clamped; unknown keys land in `extra`, retired keys of
+    /// earlier versions are dropped.
     pub fn from_toml(text: &str) -> std::result::Result<Self, toml::de::Error> {
-        toml::from_str(text)
+        let mut settings: Self = toml::from_str(text)?;
+        for key in RETIRED_KEYS {
+            settings.extra.remove(*key);
+        }
+        Ok(settings)
     }
 
     /// Serializes the settings to TOML text (without the comment-preserving merge [`Settings::save`] does).
@@ -476,16 +481,14 @@ check_openrgb_port = true
     }
 
     #[test]
-    fn brightness_and_all_off_round_trip() {
+    fn brightness_round_trip() {
         let (_tmp, paths) = temp_paths();
         let id = DeviceId::hid(0x1462, 0x7D75, None);
         let mut s = full_settings();
         s.master_brightness = 35;
-        s.all_off = true;
         s.devices.entry(id.clone()).or_default().brightness = Some(0);
         let text = s.to_toml().expect("serialize");
         assert!(text.contains("master_brightness = 35"), "{text}");
-        assert!(text.contains("all_off = true"), "{text}");
         assert!(text.contains("brightness = 0"), "{text}");
         assert_eq!(Settings::from_toml(&text).expect("parse"), s);
         s.save(&paths).expect("save");
@@ -493,27 +496,58 @@ check_openrgb_port = true
 
         // Back to the defaults: the keys leave the file again.
         s.master_brightness = FULL_BRIGHTNESS;
-        s.all_off = false;
         s.devices.get_mut(&id).expect("device entry").brightness = None;
         s.save(&paths).expect("save");
         let text = std::fs::read_to_string(paths.config_file()).expect("read");
         assert!(!text.contains("brightness"), "{text}");
-        assert!(!text.contains("all_off"), "{text}");
         assert_eq!(Settings::load(&paths).expect("reload"), s);
+    }
+
+    #[test]
+    fn retired_all_off_key_loads_and_leaves_the_file_on_save() {
+        let (_tmp, paths) = temp_paths();
+        std::fs::write(
+            paths.config_file(),
+            "# mine
+autostart = true
+all_off = true
+master_brightness = 40
+mystery = 1
+",
+        )
+        .expect("write");
+        let s = Settings::load(&paths).expect("load");
+        assert!(s.autostart, "not treated as broken");
+        assert_eq!(s.master_brightness, 40);
+        assert!(!s.extra.contains_key("all_off"), "{:?}", s.extra);
+        assert!(s.extra.contains_key("mystery"), "other unknown keys are kept");
+        s.save(&paths).expect("save");
+        let text = std::fs::read_to_string(paths.config_file()).expect("read");
+        assert!(!text.contains("all_off"), "{text}");
+        assert!(text.contains("# mine"), "{text}");
+        assert!(text.contains("mystery = 1"), "{text}");
+        assert_eq!(Settings::load(&paths).expect("reload"), s);
+        assert!(
+            Settings::from_toml(
+                "all_off = false
+"
+            )
+            .expect("parse")
+            .extra
+            .is_empty()
+        );
     }
 
     #[test]
     fn defaults_write_no_brightness_keys_and_old_files_load() {
         let text = Settings::default().to_toml().expect("serialize");
         assert!(!text.contains("brightness"), "{text}");
-        assert!(!text.contains("all_off"), "{text}");
         let s = Settings::from_toml(
             "autostart = true
 ",
         )
         .expect("parse");
         assert_eq!(s.master_brightness, 100);
-        assert!(!s.all_off);
     }
 
     #[test]

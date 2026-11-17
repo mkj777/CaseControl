@@ -38,7 +38,7 @@ pub fn hidden_view(settings: &Settings) -> BTreeMap<DeviceId, HiddenEntry> {
         .collect()
 }
 
-/// The ids of every hidden device (the engine's excluded set: brightness and All off never take them over).
+/// The ids of every hidden device (the engine's excluded set: brightness changes never take them over).
 pub fn hidden_devices(settings: &Settings) -> HashSet<DeviceId> {
     settings
         .devices

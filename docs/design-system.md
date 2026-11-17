@@ -213,8 +213,8 @@ unless noted.
 - **Card** (static container): `--surface`, 1 px `--border`, `--radius-lg`, padding `--space-6`, content gap
   `--space-4`. Used for conflict findings, the preview stage (padding `--space-10`), the dialog body.
 - **Tile** (a card that is a link): same look, `min-height` 220 px, whole tile is the link target. Head (name
-  `--text-lg` 600, status badge right, optionally one `--text-sm` muted line about what the device shows: "All off",
-  the name of its own mode while released, the hardware mode it is driven with), compact preview pinned to the
+  `--text-lg` 600, status badge right, optionally one `--text-sm` muted line about what the device shows: the name
+  of its own mode while released, the hardware mode it is driven with), compact preview pinned to the
   bottom. No kind or vendor line: the name and the preview identify the device.
 - **States:** hover `--surface-raised` + `--border-strong`; focus ring; **hidden** (ADR #27, only when "Show
   hidden" is on): content at 45 % opacity, a "Hidden" badge, not a link, context menu still works.
@@ -373,7 +373,7 @@ the meaning; colour is reserved for the states that need attention.
 
 | Status | Look |
 |---|---|
-| Active (CaseControl drives the device, also while All off holds it dark) | `--text`, border `--border-strong` |
+| Active (CaseControl drives the device, also at brightness 0) | `--text`, border `--border-strong` |
 | Released (the device shows its own lighting, also before CaseControl ever drove it) | `--text-muted`, border `--border-strong` |
 | Hidden | `--text-faint`, dashed border `--border-strong` |
 | Faulted | `--status-faulted` text and border |
@@ -435,8 +435,7 @@ The preview is the focus of the app (ADR #15), so it gets the most room and the 
   key by grid, single 160 x 80 px. Compact preview on tiles: dot 8 px, key gap 2 px, single 32 x 16 px.
 - **Colour:** the fill is exactly what the device shows. `#000000` is drawn as `--led-off`. Every LED has a 1 px
   `--led-border`, so off LEDs stay visible. No transition on the fill (see Motion).
-- **What it shows:** while CaseControl drives the device, its colours; while All off holds it dark, every LED off;
-  while released, the device's own per-LED colours if its driver can read them, else **unknown**: no fill and a
+- **What it shows:** while CaseControl drives the device, its colours; while released, the device's own per-LED colours if its driver can read them, else **unknown**: no fill and a
   dashed `--led-border`, so the layout shows without made-up colours. Never draw white or black for a colour that
   is not known.
 - **Selection:** 2 px outline in `--selection` with 2 px offset. Hover on a selectable LED: border `--text-muted`.
@@ -451,13 +450,12 @@ The preview is the focus of the app (ADR #15), so it gets the most room and the 
 - **Released** (the device shows its own lighting): badge "Released"; the tile line and the device view's mode menu
   name its own mode when it can be read ("Own lighting (Rainbow wave)", else "Own lighting"); the preview shows its
   own colours or unknown LEDs. Every control stays usable and takes the device over.
-- **All off:** set by the engine's All off (kept across restarts); every driven device's preview is dark, its tile
-  line says "All off", and its device view shows an `info` Notice "All lights are off." with a "Turn on" button.
-  The Devices overview has no All off switch; its Connect all ends All off too.
+- **Off** (ADR #35): brightness 0 (a device's Brightness or All brightness) turns lights off;
+  the device stays Active.
 - **Connect all / Release all** (Devices toolbar, secondary buttons): Release all hands every device back and is
   disabled while no device is Active. Connect all takes every released, visible, non-faulted device over with the
-  same rules as brightness (last setting, else its own mode as read back; a device with neither stays released)
-  and ends All off; it is disabled when every such device is already Active and All off is not on.
+  same rules as brightness (last setting, else its own mode as read back; a device with neither stays released);
+  it is disabled when every such device is already Active.
 
 ## Copy and filler
 

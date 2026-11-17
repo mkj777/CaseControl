@@ -146,6 +146,11 @@ re-plug of the device while the app runs (hot-plug, profile re-association by `D
 - Frame scheduler: when a profile or live color edit is active, coalesces updates to at most `frame_rate` Hz
   (default 30) per device; keep-alive timer per device from `DeviceDescription.keepalive`.
 - Hot-plug: `HotplugEvent` -> targeted re-detect -> `EngineEvent::DeviceAdded/Removed`.
+- Brightness (ADR 0001 #33, #35): a device brightness per device and a master brightness (0-100 %) scale what goes
+  to the device (direct colours, or a hardware mode's brightness parameter inside its range); the stored settings
+  stay unscaled. Brightness 0 is the off state: black in direct colours, in a hardware mode the device's "Off" mode,
+  else black in its direct mode. A brightness change takes over a released, non-hidden device with its last
+  setting, else the mode its driver read back; the device stays `Active` at 0.
 - Error policy: write errors back off exponentially (50 ms .. 5 s), after 10 consecutive failures the device is marked
   `Faulted` and shown as such; never retried in a tight loop.
 - Shutdown: `Release` on every device, join threads with timeout, then exit. Ctrl-C/WM_CLOSE/tray Quit all funnel here.
@@ -159,7 +164,7 @@ bus or come back with dead handles. The engine subscribes to suspend/resume broa
 debounced (a wake reports itself twice, a second call within 5 s does nothing) and runs on its own thread: after
 1 s for USB to settle, every driven device that is not faulted gets a reset (`release()`, which also clears the
 driver's "already sent" caches and makes it re-send its init) followed by its current output (colours or mode with
-device brightness, master brightness and All off applied); released and undriven devices are left alone. A
+device and master brightness applied); released and undriven devices are left alone. A
 device whose writes keep failing is retried with the usual back-off and faulted after 5 s. For 20 s after the
 resume the engine re-runs detection whenever a device present before the sleep (or removed just before the resume
 broadcast) is missing or faulted; such a device comes back with what it was driven with. Outside a resume a
@@ -226,11 +231,13 @@ Settings: `autostart`, `start_minimized`, `frame_rate`, `detectors.<family> = tr
   single-instance lock and returns without running the app (exit code 0). `--elevated-actions` is handled separately
   by `main` (see Conflicts).
 - Commands: `list_devices`, `set_direct`, `set_zone`, `set_mode`, `resize_zone`, `save_to_hardware`, `release_device`,
-  `release_all`, `rescan`, `set_device_hidden`, `set_zone_hidden`, `list_profiles/save_profile/apply_profile/
+  `release_all`, `connect_all`, `set_device_brightness`, `set_master_brightness`, `rescan`, `set_device_hidden`, `set_zone_hidden`, `list_profiles/save_profile/apply_profile/
   rename_profile/delete_profile`, `scan_conflicts`, `startup_conflicts`, `resolve_conflicts`, `close_program`,
-  `set_autostart`, `set_dont_ask`, `get_settings/set_settings`. Events: `device-added`, `device-removed`,
-  `device-faulted`, `device-state-changed`, `devices-changed`, `profiles-changed`, `conflicts-updated`,
-  `startup-conflicts`.
+  `set_autostart`, `set_dont_ask`, `get_settings/set_settings`. Events: `device-added` (`DeviceInfo`),
+  `device-removed` (`{ id }`), `device-faulted` (`{ id, error }`), `device-state-changed`
+  (`{ id, active, state: ModeState | null }`: `active` is whether CaseControl drives the device now, `state` the
+  hardware mode it was switched to when that was the change), `devices-changed` (no payload), `profiles-changed`,
+  `conflicts-updated`, `startup-conflicts`.
 - Conflicts at start (ADR 0001 #31): after setup (also with `--hidden`) a background thread scans; device control is
   already running. RGB suites that affect a detected, non-hidden device, are not in `conflicts.dont_ask` and have
   something to close or an autostart item that is on form the start dialog model. If it is not empty the window is

@@ -7,9 +7,9 @@
 //! actually applied (setting, `DeviceStateChanged`, resized description), so the engine's record matches the device.
 //!
 //! Brightness (ADR 0001 #33): what the worker sends ([`Out`]) can differ from the unscaled setting it records
-//! ([`Output::stored`]). The latest-wins slot carries brightness and fade steps for hardware modes too, paced like
-//! colour frames; a mode output equal to the one the device already shows is not sent again, so a mode without a
-//! brightness parameter does not restart its effect on every fade step.
+//! ([`Output::stored`]). The latest-wins slot carries brightness steps for hardware modes too, paced like colour
+//! frames; a mode output equal to the one the device already shows is not sent again, so a mode without a brightness
+//! parameter does not restart its effect on every brightness step.
 //!
 //! Status: a device starts released (it shows its own lighting) and becomes active with the first output that goes
 //! out; an explicit release makes it released again. The worker reports both changes to the engine, which emits
@@ -32,7 +32,7 @@ use crate::engine::Shared;
 use crate::lighting::{Out, Output};
 use crate::view::DeviceStatus;
 
-/// An output (colour frame or brightness / fade step of a mode) and the sequence number it was issued with.
+/// An output (colour frame or brightness step of a mode) and the sequence number it was issued with.
 pub(crate) type Frame = (u64, Output);
 
 /// Where the latest coalesced output waits for the worker. Latest wins: a newer output replaces an unsent one.
@@ -45,8 +45,8 @@ pub(crate) type Reply = Sender<Result<(), DeviceError>>;
 pub(crate) enum Command {
     /// A new frame is in the [`FrameSlot`].
     Wake,
-    /// Switch to a hardware mode: send `out` (the mode at the current brightness, or the off output while All off
-    /// holds the device dark), record `state`.
+    /// Switch to a hardware mode: send `out` (the mode at the current brightness, or the off output at brightness 0),
+    /// record `state`.
     SetMode {
         seq: u64,
         state: ModeState,
@@ -85,8 +85,6 @@ pub(crate) struct Timing {
     pub max_failures: u32,
     /// How often the hot-plug thread checks for shutdown.
     pub hotplug_poll: Duration,
-    /// Length of a full All off / on fade.
-    pub fade: Duration,
     /// Resume notifications closer together than this start only one reassert (a wake usually sends two).
     pub resume_debounce: Duration,
     /// Wait after a resume before the first write, so USB devices can come back.
@@ -107,7 +105,6 @@ impl Default for Timing {
             backoff_max: Duration::from_secs(5),
             max_failures: 10,
             hotplug_poll: Duration::from_millis(100),
-            fade: Duration::from_millis(500),
             resume_debounce: Duration::from_secs(5),
             resume_settle: Duration::from_secs(1),
             resume_retry: Duration::from_secs(5),
@@ -331,9 +328,8 @@ impl Worker {
                 self.last_seq = seq;
                 self.took_control(now);
                 self.resumed();
-                if let Some(stored) = output.stored {
-                    self.shared.applied(&self.id, self.generation, stored, false);
-                }
+                self.shared
+                    .applied(&self.id, self.generation, output.stored, false);
             }
             Err(DeviceError::InvalidArgument(msg)) => {
                 warn!(id = %self.id, %msg, "driver rejected frame");
