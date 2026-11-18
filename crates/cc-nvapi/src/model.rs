@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! Safe, owned representations of the NvAPI data this crate exchanges with the driver, and their
 //! byte-faithful conversions to and from the [`raw`](crate::raw) structs.
 //!

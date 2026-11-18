@@ -1,6 +1,6 @@
 //! The [`Backend`] trait (device discovery) and hot-plug notifications.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::mpsc::Sender;
 
@@ -9,18 +9,51 @@ use serde::{Deserialize, Serialize};
 use crate::controller::Controller;
 use crate::device::Bus;
 use crate::error::DeviceError;
+use crate::id::DeviceId;
 
 /// Inputs to a detection pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DetectContext {
     /// Family ids (see [`crate::family`]) the user turned off. Their detectors must not run.
     pub disabled_families: HashSet<String>,
+    /// Devices the engine already controls. A backend computes each candidate's [`DeviceId`] from enumeration data
+    /// alone (no I/O) and must not open, probe or return a candidate whose id is in this set, so a re-detection after
+    /// a hot-plug event never disturbs a device that is in use.
+    #[serde(default)]
+    pub skip: HashSet<DeviceId>,
+    /// The last good own lighting remembered per device (ADR 0001 #38): driver-opaque bytes a controller reported
+    /// through [`Controller::own_lighting`] on an earlier open, possibly in an
+    /// earlier run. A driver may use them when it finds the device in a state it cannot hand back (e.g. left in
+    /// per-LED mode); it must validate them before sending anything derived from them.
+    #[serde(default)]
+    pub own_lighting: BTreeMap<DeviceId, Vec<u8>>,
+    /// Devices CaseControl wrote to and did not hand back (the persisted "unreleased" marker, ADR 0001 #38), e.g.
+    /// after a crash, sleep or re-enumeration. Such a device shows a state CaseControl left, not its own lighting: a
+    /// driver must not report its readback through [`Controller::own_lighting`], and may restore the remembered own
+    /// lighting at open instead (validated, as above), then report [`Controller::shows_own_lighting`].
+    #[serde(default)]
+    pub unreleased: HashSet<DeviceId>,
 }
 
 impl DetectContext {
     /// Whether detectors of `family` may run.
     pub fn is_enabled(&self, family: &str) -> bool {
         !self.disabled_families.contains(family)
+    }
+
+    /// Whether the device `id` is already controlled and must be left alone.
+    pub fn is_skipped(&self, id: &DeviceId) -> bool {
+        self.skip.contains(id)
+    }
+
+    /// The remembered own lighting of device `id` (see [`own_lighting`](Self::own_lighting)), if any.
+    pub fn stored_own_lighting(&self, id: &DeviceId) -> Option<&[u8]> {
+        self.own_lighting.get(id).map(Vec::as_slice)
+    }
+
+    /// Whether device `id` carries the "unreleased" marker (see [`unreleased`](Self::unreleased)).
+    pub fn is_unreleased(&self, id: &DeviceId) -> bool {
+        self.unreleased.contains(id)
     }
 }
 
@@ -174,7 +207,27 @@ mod tests {
 
         let ctx = DetectContext {
             disabled_families: [family::WOOTING.to_string()].into(),
+            ..Default::default()
         };
+        assert!(!ctx.is_skipped(&DeviceId::hid(0x1462, 0x7D75, None)));
+        assert_eq!(
+            ctx.stored_own_lighting(&DeviceId::hid(0x1462, 0x7D75, None)),
+            None
+        );
+        let stored = DetectContext {
+            own_lighting: [(DeviceId::hid(0x1462, 0x7D75, None), vec![0x52, 1])].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            stored.stored_own_lighting(&DeviceId::hid(0x1462, 0x7D75, None)),
+            Some(&[0x52u8, 1][..])
+        );
+        assert!(!stored.is_unreleased(&DeviceId::hid(0x1462, 0x7D75, None)));
+        let marked = DetectContext {
+            unreleased: [DeviceId::hid(0x1462, 0x7D75, None)].into(),
+            ..Default::default()
+        };
+        assert!(marked.is_unreleased(&DeviceId::hid(0x1462, 0x7D75, None)));
         assert!(!ctx.is_enabled(family::WOOTING));
         assert!(ctx.is_enabled(family::LOGITECH));
         assert_eq!(b.detect(&ctx).len(), 1);

@@ -30,6 +30,13 @@ impl Rgb {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
+
+    /// The colour's intensity on a brightness-only LED: its highest channel, so white and every saturated colour are
+    /// full intensity and black is off.
+    pub const fn intensity(self) -> u8 {
+        let rg = if self.r > self.g { self.r } else { self.g };
+        if rg > self.b { rg } else { self.b }
+    }
 }
 
 impl From<[u8; 3]> for Rgb {
@@ -109,6 +116,15 @@ impl<'de> Deserialize<'de> for Rgb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intensity_is_the_highest_channel() {
+        assert_eq!(Rgb::WHITE.intensity(), 255);
+        assert_eq!(Rgb::BLACK.intensity(), 0);
+        assert_eq!(Rgb::new(255, 0, 0).intensity(), 255);
+        assert_eq!(Rgb::new(1, 9, 3).intensity(), 9);
+        assert_eq!(Rgb::new(1, 2, 30).intensity(), 30);
+    }
 
     fn parse(s: &str) -> Rgb {
         s.parse().expect("valid color")

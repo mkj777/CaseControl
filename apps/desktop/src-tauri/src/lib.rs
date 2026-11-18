@@ -2,19 +2,50 @@
 //!
 //! One process (ADR 0001 #3): a window with the Devices, Profiles, Conflicts and Settings pages, a tray icon
 //! with Show / Apply profile / Release devices / Quit, close-to-tray, a single-instance guard, autostart
-//! registration (not enabled by default), file logging, and the first IPC commands (`app_info`,
-//! `show_window`, `hide_to_tray`, `quit`).
+//! registration, file logging, and the IPC commands and events the pages use. The window has no Windows title bar
+//! (ADR 0001 #29); the frontend draws its own window controls. Devices and zones the user hid are kept out of
+//! control by the commands (see [`hidden`], ADR 0001 #26).
 //!
-//! It deliberately does not talk to devices yet (Phase 2 adds the engine), has no network access and no
-//! telemetry (ADR 0001 #13), and does not enable autostart on its own (the Settings page does that in Phase 3).
+//! On start it loads settings and profiles (`cc-config`), starts the device engine (`cc-engine`) with every
+//! compiled-in driver (`cc-drivers`) and re-applies the last applied profile. Every exit path (tray Quit, the
+//! `quit` command, a second instance started with `--quit`, `RunEvent::ExitRequested`/`Exit` (no update install there), which also covers
+//! Windows session end) releases the devices through [`AppState::shutdown_engine`] exactly once. A `--quit`
+//! process itself never starts the engine (see [`run`]).
+//!
+//! After the start (also a hidden one) a background thread scans for conflicting software; if RGB suites affect a
+//! visible device, the window is shown and `startup-conflicts` carries the start dialog model (ADR 0001 #31, see
+//! [`startup`]). Closing them or turning their autostart off happens only on the user's click
+//! ([`conflict_actions`]); what needs administrator rights runs in the [`elevated`] helper mode of this same
+//! executable, which `main` enters before anything here starts.
+//!
+//! Release builds update themselves silently from GitHub releases ([`updater`], ADR 0001 #39): a check after the
+//! start and every 6 hours downloads a signed update in the background; it is installed on the next quit, after the
+//! devices were released, or on the next start, before any device is opened.
+//!
+//! The updater is its only network access (ADR 0001 #13, #39); it has no telemetry, changes other software's
+//! autostart only reversibly and only on a click (ADR 0001 #31), and enables its own autostart only when the user
+//! switches it on in Settings.
 
+pub mod autostart;
 pub mod commands;
+pub mod conflict_actions;
+pub mod conflicts;
+pub mod elevated;
+pub mod events;
+pub mod hidden;
 pub mod logging;
+pub mod prefs;
+pub mod profiles;
+pub mod startup;
+pub mod state;
 pub mod tray;
+pub mod updater;
 
 use std::ffi::OsStr;
 
-use tauri::{AppHandle, Manager, Runtime, WindowEvent};
+use tauri::{AppHandle, Manager, RunEvent, Runtime, WindowEvent};
+
+pub use state::AppState;
 
 /// Label of the main window as declared in `tauri.conf.json`.
 pub const MAIN_WINDOW: &str = "main";
@@ -22,17 +53,38 @@ pub const MAIN_WINDOW: &str = "main";
 /// Command-line flag that starts the app with the window hidden (used by autostart).
 pub const HIDDEN_FLAG: &str = "--hidden";
 
-/// Whether the given command line (including the program name) asks for a hidden start.
-///
-/// Takes OS strings so a non-Unicode argument is simply not the flag instead of a startup panic.
-pub fn starts_hidden<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    args.into_iter()
-        .skip(1)
-        .any(|arg| arg.as_ref() == OsStr::new(HIDDEN_FLAG))
+/// Command-line flag that asks a running instance to shut down (releasing every device) and starts nothing itself.
+pub const QUIT_FLAG: &str = "--quit";
+
+/// What a command line asks the desktop app to do. `--elevated-actions` is not parsed here: `main` handles it
+/// before anything else (see [`elevated::helper_main`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaunchArgs {
+    /// `--hidden`: start with the window hidden.
+    pub hidden: bool,
+    /// `--quit`: make the running instance shut down; never start one.
+    pub quit: bool,
+}
+
+impl LaunchArgs {
+    /// Parses a command line including the program name, which is skipped. Flags match exactly; unknown
+    /// arguments are ignored. Takes OS strings so a non-Unicode argument is simply not a flag instead of a panic.
+    pub fn parse<I, S>(args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut parsed = Self::default();
+        for arg in args.into_iter().skip(1) {
+            let arg = arg.as_ref();
+            if arg == OsStr::new(HIDDEN_FLAG) {
+                parsed.hidden = true;
+            } else if arg == OsStr::new(QUIT_FLAG) {
+                parsed.quit = true;
+            }
+        }
+        parsed
+    }
 }
 
 /// Shows, unminimizes and focuses the main window.
@@ -57,26 +109,88 @@ pub fn hide_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     }
 }
 
-/// Orderly shutdown and process exit. Later phases release the devices to firmware control here before
-/// exiting; every exit path (tray Quit, the `quit` command) goes through this function.
+/// Orderly shutdown and process exit: releases every device to its hardware mode (once), installs a pending update
+/// (see [`install_update_on_exit`]), then exits. Tray Quit, the `quit` command and `--quit` call this; the run-loop
+/// exit events call [`AppState::shutdown_engine`] and [`install_update_on_exit`] directly.
 pub fn shutdown<R: Runtime>(app: &AppHandle<R>) {
     tracing::info!("shutting down");
+    if let Some(state) = app.try_state::<AppState>() {
+        state.shutdown_engine();
+    }
+    install_update_on_exit(app);
     app.exit(0);
 }
 
-/// Builds and runs the Tauri application. Returns only on startup failure; a normal exit ends the process.
+/// Starts the installer of a pending update without restarting the app; call only after the devices were released.
+/// On success the process ends here (after Tauri's exit cleanup, so the tray icon is removed); otherwise it returns
+/// and the caller exits normally. A no-op in debug builds and when nothing is pending.
+pub fn install_update_on_exit<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(updater) = app.try_state::<updater::AppUpdater<R>>() {
+        updater.install_pending(false, || app.cleanup_before_exit());
+    }
+}
+
+/// Scans for conflicts on a background thread after the start (device control is already running). If the start
+/// dialog has programs to ask about, shows the window (also after a hidden start) and emits `startup-conflicts`.
+fn spawn_startup_check<R: Runtime>(app: AppHandle<R>) {
+    let spawned = std::thread::Builder::new()
+        .name("cc-startup-conflicts".into())
+        .spawn(move || {
+            elevated::sweep_stale_files();
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            let view = match conflict_actions::scan_and_publish(&app, &state) {
+                Ok(view) => view,
+                Err(err) => {
+                    tracing::warn!(%err, "start-up conflict check failed");
+                    return;
+                }
+            };
+            if view.startup.is_empty() {
+                tracing::info!("start-up conflict check: nothing to ask");
+                return;
+            }
+            tracing::info!(
+                programs = ?view.startup.iter().map(|p| p.entry_id.as_str()).collect::<Vec<_>>(),
+                "start-up conflict check: asking the user"
+            );
+            if let Err(err) = show_main_window(&app) {
+                tracing::error!(%err, "cannot show main window for the start-up conflicts");
+            }
+            events::emit(&app, events::STARTUP_CONFLICTS, view.startup);
+        });
+    if let Err(err) = spawned {
+        tracing::error!(%err, "cannot start the start-up conflict check");
+    }
+}
+
+/// Builds and runs the Tauri application. Returns only when started with `--quit` and no instance was running; a
+/// normal exit ends the process.
+///
+/// `--quit`: the single-instance plugin decides inside `Builder::build`, before the window, the tray, the engine or
+/// device detection exist (those start in the setup hook, which runs only in `App::run`). If an instance is running,
+/// this process forwards its arguments there and exits inside `build`; the running instance's callback calls
+/// [`shutdown`] before the forward returns. If none is running, `build` returns here and the process leaves without
+/// running the app.
 pub fn run() {
     logging::init();
-    let hidden = starts_hidden(std::env::args_os());
+    let launch = LaunchArgs::parse(std::env::args_os());
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        hidden,
+        hidden = launch.hidden,
+        quit = launch.quit,
         "CaseControl starting"
     );
 
-    let result = tauri::Builder::default()
+    let app = tauri::Builder::default()
         // Must be the first plugin so a second instance exits before anything else initializes.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if LaunchArgs::parse(&args).quit {
+                tracing::info!(?args, "second instance asked to quit");
+                shutdown(app);
+                return;
+            }
             tracing::info!(?args, "second instance started; focusing the main window");
             if let Err(err) = show_main_window(app) {
                 tracing::error!(%err, "cannot show main window");
@@ -86,11 +200,40 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![HIDDEN_FLAG]),
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
             commands::show_window,
             commands::hide_to_tray,
             commands::quit,
+            commands::list_devices,
+            commands::set_direct,
+            commands::set_zone,
+            commands::set_mode,
+            commands::resize_zone,
+            commands::save_to_hardware,
+            commands::release_device,
+            commands::release_all,
+            commands::set_device_brightness,
+            commands::set_master_brightness,
+            commands::connect_all,
+            commands::rescan,
+            commands::set_device_hidden,
+            commands::set_zone_hidden,
+            commands::list_profiles,
+            commands::save_profile,
+            commands::apply_profile,
+            commands::rename_profile,
+            commands::delete_profile,
+            commands::scan_conflicts,
+            commands::startup_conflicts,
+            commands::resolve_conflicts,
+            commands::set_autostart,
+            commands::set_dont_ask,
+            commands::close_program,
+            commands::get_settings,
+            commands::set_settings,
+            commands::set_default_color,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event
@@ -104,32 +247,110 @@ pub fn run() {
             }
         })
         .setup(move |app| {
-            tray::create(app.handle())?;
+            // A pending update is installed before the engine opens any device; the installer restarts the app with
+            // the same arguments and this process ends here. Otherwise (nothing pending, debug build) start normally.
+            let updater = updater::create(app.handle());
+            updater.install_pending(true, || {});
+            app.manage(updater.clone());
+            let state = AppState::init();
+            let start_minimized = state.settings().start_minimized;
+            autostart::sync_run_entry(app.handle(), state.settings().autostart);
+            if let Ok(engine) = state.engine() {
+                events::spawn_forwarder(app.handle().clone(), engine.subscribe());
+            }
+            state.apply_last_profile();
+            let profiles = state.profile_list().unwrap_or_else(|err| {
+                tracing::warn!(%err, "cannot list profiles for the tray");
+                profiles::ProfileList {
+                    names: Vec::new(),
+                    active: None,
+                }
+            });
+            app.manage(state);
+            tray::create(app.handle(), &profiles)?;
             // The window is declared with `visible: false` so a hidden start never flashes it.
-            if !hidden {
+            if !launch.hidden && !start_minimized {
                 show_main_window(app.handle())?;
             }
+            spawn_startup_check(app.handle().clone());
+            // After the engine is up: check now and every 6 hours on a background thread.
+            updater::spawn_checks(updater);
             Ok(())
         })
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!());
 
-    if let Err(err) = result {
-        tracing::error!(%err, "CaseControl failed to start");
-        panic!("error while running CaseControl: {err}");
+    let app = match app {
+        Ok(app) => app,
+        Err(err) => {
+            tracing::error!(%err, "CaseControl failed to start");
+            panic!("error while running CaseControl: {err}");
+        }
+    };
+    if launch.quit {
+        // A running instance would have made this process exit inside `build`, so none is running. The setup hook
+        // (engine, tray, window) never runs; release the single-instance lock and leave.
+        tracing::info!("--quit: no running instance; exiting");
+        app.handle().cleanup_before_exit();
+        return;
     }
+    app.run(|app, event| {
+        // `Exit` also arrives on Windows session end (WM_ENDSESSION), where the process ends right after.
+        // No update install here: `Exit` also arrives on session end, where Windows may kill a running installer.
+        // A pending update installs on an explicit quit (`shutdown`) or on the next start.
+        if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit)
+            && let Some(state) = app.try_state::<AppState>()
+        {
+            state.shutdown_engine();
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn parse(args: &[&str]) -> LaunchArgs {
+        LaunchArgs::parse(args)
+    }
+
     #[test]
     fn hidden_flag_is_detected_after_program_name() {
-        assert!(starts_hidden(["casecontrol.exe", "--hidden"]));
-        assert!(starts_hidden(["casecontrol.exe", "--other", "--hidden"]));
-        assert!(!starts_hidden(["casecontrol.exe"]));
-        assert!(!starts_hidden(["--hidden"]));
-        assert!(!starts_hidden(["casecontrol.exe", "--hidden=false"]));
+        assert!(parse(&["casecontrol.exe", "--hidden"]).hidden);
+        assert!(parse(&["casecontrol.exe", "--other", "--hidden"]).hidden);
+        assert!(!parse(&["casecontrol.exe"]).hidden);
+        assert!(!parse(&["--hidden"]).hidden);
+        assert!(!parse(&["casecontrol.exe", "--hidden=false"]).hidden);
+    }
+
+    #[test]
+    fn quit_flag_is_detected_after_program_name() {
+        assert_eq!(
+            parse(&["casecontrol.exe", "--quit"]),
+            LaunchArgs {
+                hidden: false,
+                quit: true
+            }
+        );
+        assert_eq!(
+            parse(&["casecontrol.exe", "--hidden", "--quit"]),
+            LaunchArgs {
+                hidden: true,
+                quit: true
+            }
+        );
+        assert!(!parse(&["--quit"]).quit);
+        assert!(!parse(&["casecontrol.exe"]).quit);
+        assert!(!parse(&["casecontrol.exe", "--quit=true"]).quit);
+        assert!(!parse(&["casecontrol.exe", "--QUIT"]).quit);
+        assert!(!parse(&["casecontrol.exe", "quit"]).quit);
+        assert_eq!(parse(&[]), LaunchArgs::default());
+    }
+
+    #[test]
+    fn forwarded_second_instance_args_parse() {
+        // The single-instance callback receives the second instance's argv as `Vec<String>`.
+        let args = vec![r"C:\Apps\casecontrol.exe".to_owned(), "--quit".to_owned()];
+        assert!(LaunchArgs::parse(&args).quit);
     }
 
     #[cfg(windows)]
@@ -139,14 +360,16 @@ mod tests {
         use std::os::windows::ffi::OsStringExt;
 
         let lone_surrogate = OsString::from_wide(&[0xD800]);
-        assert!(!starts_hidden([
-            OsString::from("casecontrol.exe"),
-            lone_surrogate.clone()
-        ]));
-        assert!(starts_hidden([
+        assert_eq!(
+            LaunchArgs::parse([OsString::from("casecontrol.exe"), lone_surrogate.clone()]),
+            LaunchArgs::default()
+        );
+        let parsed = LaunchArgs::parse([
             OsString::from("casecontrol.exe"),
             lone_surrogate,
             OsString::from("--hidden"),
-        ]));
+            OsString::from("--quit"),
+        ]);
+        assert!(parsed.hidden && parsed.quit);
     }
 }

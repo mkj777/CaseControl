@@ -1,13 +1,44 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window: core defaults plus the app commands the pages call.",
+  "description": "Main window: core defaults (incl. event listening), the window controls of the custom title bar (minimise, maximise, drag) and the app commands the pages call.",
   "windows": [
     "main"
   ],
   "permissions": [
     "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-start-dragging",
     "allow-app-info",
-    "allow-hide-to-tray"
+    "allow-hide-to-tray",
+    "allow-list-devices",
+    "allow-set-direct",
+    "allow-set-zone",
+    "allow-set-mode",
+    "allow-resize-zone",
+    "allow-save-to-hardware",
+    "allow-release-device",
+    "allow-release-all",
+    "allow-set-device-brightness",
+    "allow-set-master-brightness",
+    "allow-connect-all",
+    "allow-rescan",
+    "allow-set-device-hidden",
+    "allow-set-zone-hidden",
+    "allow-list-profiles",
+    "allow-save-profile",
+    "allow-apply-profile",
+    "allow-rename-profile",
+    "allow-delete-profile",
+    "allow-scan-conflicts",
+    "allow-startup-conflicts",
+    "allow-resolve-conflicts",
+    "allow-set-autostart",
+    "allow-set-dont-ask",
+    "allow-close-program",
+    "allow-get-settings",
+    "allow-set-settings",
+    "allow-set-default-color"
   ]
 }

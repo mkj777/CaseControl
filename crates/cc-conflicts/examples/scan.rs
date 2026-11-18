@@ -1,7 +1,7 @@
 //! Runs a real conflict scan on this machine and prints the findings as a table.
 //!
 //! `cargo run -p cc-conflicts --example scan` (add `-- --openrgb-port` to probe 127.0.0.1:6742).
-//! Not run in CI. Reads processes, services and the registry only; changes nothing.
+//! Not run in CI. Reads processes, services, the registry and the Startup folders only; changes nothing.
 
 #[cfg(windows)]
 fn main() {
@@ -52,6 +52,18 @@ fn main() {
             f.verified,
             evidence.join("; ")
         ));
+        for item in &f.autostart {
+            out.push_str(&format!(
+                "    autostart {:?} {:?} enabled={} toggleable={} admin={} {}
+",
+                item.location,
+                item.name,
+                item.enabled,
+                item.toggleable,
+                item.needs_admin,
+                item.command.as_deref().unwrap_or("")
+            ));
+        }
     }
     for e in &report.errors {
         out.push_str(&format!("error: {e}\n"));
