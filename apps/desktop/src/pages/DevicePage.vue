@@ -9,8 +9,10 @@
 // takes the device over.
 //
 // Brightness-only LEDs (zones with `brightness_only`, a fixed white such as the RTX 5080 FE) take no colour: a device
-// made only of them shows no colour picker and no LED selection, just brightness and its modes, and its preview is
-// white at the output intensity. On a mixed device the colour controls apply to the colour LEDs only.
+// made only of them shows no colour picker and no LED selection, and its preview is white at the output intensity. On
+// a mixed device the colour controls apply to the colour LEDs only. Instead, each visible brightness-only LED gets
+// its own level slider (0-100 %, ADR 0001 #41), stored as a grey in the direct colours (`whiteLevel`, mirroring
+// `Rgb::white_level`), so it autosaves into the active profile; the device brightness at the top scales them all.
 //
 // Every colour and mode change goes through one ordered sender, so the last user action always wins. While changes
 // are queued or in flight, the page shows its own latest intent instead of the store, so a refresh that raced an
@@ -32,6 +34,7 @@ import {
   NumberField,
   PageHeader,
   Select,
+  Slider,
   StatusBadge,
   Switch,
   menuPoint,
@@ -45,10 +48,11 @@ import {
   setDeviceBrightness,
   setDirect,
   setMode,
+  type DeviceView,
   type ModeState,
   type Zone,
 } from '../ipc'
-import { BLACK } from '../lib/color'
+import { BLACK, levelOf, whiteLevel } from '../lib/color'
 import {
   STATUS_LABEL,
   brightnessMode,
@@ -226,6 +230,54 @@ function onColor(hex: string) {
   write({ kind: 'direct', colors: blackOut(painted, hiddenLeds.value) })
 }
 
+/** All LEDs white for a device that was never set (an all-black buffer), so a first edit does not look like "off";
+ * `null` otherwise. Used by "Static" in the mode menu and by the level sliders. */
+function whiteIfNeverSet(d: DeviceView): string[] | null {
+  return d.setting === null && d.colors.every((c) => c === BLACK) ? d.colors.map(() => '#FFFFFF') : null
+}
+
+// ---- per-LED white levels (ADR 0001 #41) ----------------------------------------------------------------------
+
+/** One slider per LED of the visible brightness-only zones, named after the zone (and the LED in a longer zone). */
+const levelRows = computed(() => {
+  const d = desc.value
+  if (!d) return []
+  return d.zones.flatMap((zone, index) =>
+    !zone.brightness_only || hiddenZones.value.has(index)
+      ? []
+      : zoneIndices(zone).map((led) => ({
+          led,
+          label: zone.len === 1 ? zone.name : `${zone.name}: ${d.leds[led]?.name ?? `LED ${led - zone.start + 1}`}`,
+        })),
+  )
+})
+
+/**
+ * What the level sliders show and a level change starts from: the latest local edit; while released, the device's
+ * own colours as the preview shows them, with its brightness-only LEDs at the level the preview draws (their colour
+ * times the own mode's brightness, `previewIntensity`), since the engine buffer can still hold what CaseControl
+ * showed before the release; else white on a device that was never set; else the engine's buffer.
+ */
+const levelColors = computed<readonly string[]>(() => {
+  const d = device.value
+  if (!d) return []
+  if (intent.value?.kind === 'direct') return intent.value.colors
+  const own = d.status.state === 'released' ? shownColors(d) : null
+  if (own) {
+    const k = previewIntensity.value
+    return own.map((c, i) => (fixedLeds.value.has(i) ? whiteLevel(levelOf(c) * k) : c))
+  }
+  return whiteIfNeverSet(d) ?? d.colors
+})
+
+/** Sets one brightness-only LED's level; the other LEDs keep what the sliders and the preview show. */
+function onLevel(led: number, percent: number) {
+  if (!device.value) return
+  const next = [...levelColors.value]
+  next[led] = whiteLevel(percent)
+  write({ kind: 'direct', colors: blackOut(next, hiddenLeds.value) })
+}
+
 // ---- mode menu -------------------------------------------------------------------------------------------------
 
 const STATIC = 'static'
@@ -275,8 +327,7 @@ function onMenu(value: string) {
   if (!d || value === menuValue.value) return
   if (value === STATIC) {
     // A device that was never set has an all-black buffer; start from white so "Static" does not look like "off".
-    const fresh = d.setting === null && d.colors.every((c) => c === BLACK)
-    const start = fresh ? d.colors.map(() => '#FFFFFF') : [...colors.value]
+    const start = whiteIfNeverSet(d) ?? [...colors.value]
     write({ kind: 'direct', colors: blackOut(start, hiddenLeds.value) })
     syncPicker()
     return
@@ -504,6 +555,22 @@ const previewIntensity = computed(() => {
 
         <ColorPicker v-if="editingColors" :model-value="pickerColor" :disabled="locked" @update:model-value="onColor" />
 
+        <div v-if="editingStatic && levelRows.length > 0" class="levels">
+          <Field v-for="r in levelRows" :key="r.led" :label="r.label">
+            <template #default="{ id }">
+              <Slider
+                :id="id"
+                :model-value="levelOf(levelColors[r.led] ?? BLACK)"
+                :min="0"
+                :max="100"
+                :disabled="locked"
+                @update:model-value="onLevel(r.led, $event)"
+              />
+            </template>
+            <template #value>{{ levelOf(levelColors[r.led] ?? BLACK) }} %</template>
+          </Field>
+        </div>
+
         <ModeControls
           v-else-if="!editingStatic && activeMode && activeState"
           :mode="activeMode"
@@ -599,6 +666,12 @@ const previewIntensity = computed(() => {
   flex-direction: column;
   gap: var(--space-6);
   margin: var(--space-10) 0;
+}
+
+.levels {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
 }
 
 .facts {

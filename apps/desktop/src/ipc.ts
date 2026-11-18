@@ -389,6 +389,28 @@ export interface SettingsPatch {
   default_color?: Rgb
 }
 
+/** What the updater is doing or did last (`updater::UpdateStatus`, ADR 0001 #41). `ready` is shown while an update
+ * is pending and nothing runs. */
+export type UpdateStatus =
+  /** A build without updates; `reason` is the text to show. */
+  | { state: 'disabled'; reason: string }
+  | { state: 'idle' }
+  | { state: 'checking' }
+  | { state: 'up_to_date' }
+  | { state: 'downloading'; version: string }
+  | { state: 'ready'; version: string }
+  | { state: 'installing'; version: string }
+  | { state: 'failed'; error: string }
+
+/** `updater::UpdateView`: the status plus the version of a downloaded update waiting to be installed. */
+export interface UpdateView {
+  status: UpdateStatus
+  /** "Update now" is possible while this is set. */
+  pending: string | null
+  /** Grows with every status change: keep the view with the highest `seq` (events and command replies race). */
+  seq: number
+}
+
 // ---- commands --------------------------------------------------------------------------------------------------
 
 export const appInfo = () => invoke<AppInfo>('app_info')
@@ -452,6 +474,14 @@ export const setSettings = (patch: SettingsPatch) => invoke<SettingsView>('set_s
 export const setDefaultColor = (color: Rgb, persist: boolean) =>
   invoke<Rgb>('set_default_color', { color, persist })
 
+// Updates (ADR 0001 #39, #41); release builds only, the commands reject in debug builds.
+export const updateStatus = () => invoke<UpdateView>('update_status')
+/** Checks now and downloads a newer release; resolves when the check has finished (progress: `update-status`). A
+ * check already running is not started again (resolves at once with the current status). */
+export const checkForUpdates = () => invoke<UpdateView>('check_for_updates')
+/** Releases the devices, installs the pending update and restarts the app; resolves only if nothing was installed. */
+export const installUpdate = () => invoke<UpdateView>('install_update')
+
 // ---- events ----------------------------------------------------------------------------------------------------
 
 export interface EventPayloads {
@@ -466,6 +496,8 @@ export interface EventPayloads {
   'conflicts-updated': ConflictScan
   /** Sent once after start when the start dialog has programs to ask about. */
   'startup-conflicts': ConflictProgram[]
+  /** The updater's status changed. */
+  'update-status': UpdateView
 }
 
 export function on<K extends keyof EventPayloads>(

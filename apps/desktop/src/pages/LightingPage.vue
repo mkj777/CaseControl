@@ -2,9 +2,9 @@
 // Lighting, the devices overview (ADR 0001 #18, renamed from Devices in #37): one large tile per device with a small
 // live preview; a tile opens the device view. Tiles fill the window width (ADR 0001 #28). Right-click a tile to hide
 // or unhide the device; hidden devices are shown greyed only with "Show hidden" on (ADR 0001 #26, #27). No visible
-// title (the sidebar says where you are; the h1 stays for screen readers); the page starts with one toolbar row:
-// the profile dropdown (ADR 0001 #40), Take over all, the fallback colour with its help tooltip, All brightness and
-// Release all (ADR 0001 #33, #35, #37) on the left, Show hidden and Rescan on the right. Each tile shows the real status and what
+// title (the sidebar says where you are; the h1 stays for screen readers); the page starts with one toolbar row
+// (ADR 0001 #41): the profile dropdown (#40), one takeover button (Take over all / Release all, #33, #35, #37), Show
+// hidden and Rescan on the left, All brightness and the fallback colour with its help tooltip on the right. Each tile shows the real status and what
 // the device shows: its colours, the name of its own mode while released, empty LEDs when that is unknown.
 // While Rescan runs the page is inactive (controls disabled, tiles dimmed and inert, `aria-busy`). Hiding a driven
 // device and Release all confirm with a toast, since the change is not visible where the user clicked (ADR 0001 #36).
@@ -114,6 +114,32 @@ const canTakeOverAll = computed(() =>
   ),
 )
 
+// One takeover button (ADR 0001 #41): "Take over all" while a visible device can still be taken over (the rule
+// above), else "Release all". A running action keeps its own label until it ends. Every label is laid out in the
+// same grid cell and only the current one is visible, so the button keeps the width of the longest.
+const TAKEOVER_LABELS = ['Take over all', 'Release all', 'Releasing…'] as const
+const takeoverMode = computed<'take' | 'release'>(() => {
+  if (takingOver.value) return 'take'
+  if (releasing.value) return 'release'
+  return canTakeOverAll.value ? 'take' : 'release'
+})
+const takeoverLabel = computed(() =>
+  releasing.value ? 'Releasing…' : takeoverMode.value === 'take' ? 'Take over all' : 'Release all',
+)
+const takeoverDisabled = computed(
+  () =>
+    engineDown.value ||
+    scanning.value ||
+    takingOver.value ||
+    releasing.value ||
+    (takeoverMode.value === 'release' && noneActive.value),
+)
+
+function onTakeover() {
+  if (takeoverMode.value === 'take') void onTakeOverAll()
+  else void onReleaseAll()
+}
+
 async function sendMaster(percent: number, persist: boolean) {
   deviceState.lighting = await setMasterBrightness(percent, persist)
 }
@@ -213,28 +239,23 @@ async function onReleaseAll() {
 
 <template>
   <section class="page wide" :aria-busy="scanning">
-    <PageHeader title="Lighting" title-hidden wrap-controls>
-      <template #actions>
+    <PageHeader title="Lighting" title-hidden wrap-controls flex-actions>
+      <!-- ADR 0001 #41: the left group (slot `controls`) holds the profile dropdown, the takeover button, Show hidden
+           and Rescan; the right group (slot `actions`, the flexible one) All brightness and the fallback colour with
+           its "?", whose popover and tooltip open towards the left so they stay inside the page. -->
+      <template #controls>
+        <ProfileMenu :disabled="scanning" @error="(m) => (error = m)" />
+        <Button :disabled="takeoverDisabled" @click="onTakeover">
+          <span class="flip">
+            <span v-for="l in TAKEOVER_LABELS" :key="l" :class="{ off: l !== takeoverLabel }">{{ l }}</span>
+          </span>
+        </Button>
         <Switch v-model="deviceState.showHiddenDevices" label="Show hidden" compact :disabled="scanning" />
         <Button :disabled="scanning" @click="rescanDevices">
           {{ scanning ? 'Scanning…' : 'Rescan' }}
         </Button>
       </template>
-      <template #controls>
-        <ProfileMenu :disabled="scanning" @error="(m) => (error = m)" />
-        <Button :disabled="engineDown || scanning || takingOver || releasing || !canTakeOverAll" @click="onTakeOverAll">
-          Take over all
-        </Button>
-        <ColorButton
-          :model-value="fallbackColor"
-          label="Fallback colour"
-          :disabled="colorLocked"
-          @update:model-value="onFallbackColor"
-          @change="onFallbackColorCommit"
-        />
-        <Tooltip v-slot="{ describedBy }" :text="FALLBACK_HELP">
-          <IconButton label="Help" :glyph="HELP" no-title :aria-describedby="describedBy" />
-        </Tooltip>
+      <template #actions>
         <BrightnessSlider
           label="All brightness"
           :value="deviceState.lighting.master_brightness"
@@ -242,9 +263,17 @@ async function onReleaseAll() {
           :disabled="engineDown || scanning || releasing"
           @error="lightingFailed"
         />
-        <Button :disabled="engineDown || scanning || takingOver || releasing || noneActive" @click="onReleaseAll">
-          {{ releasing ? 'Releasing…' : 'Release all' }}
-        </Button>
+        <ColorButton
+          :model-value="fallbackColor"
+          label="Fallback colour"
+          align="end"
+          :disabled="colorLocked"
+          @update:model-value="onFallbackColor"
+          @change="onFallbackColorCommit"
+        />
+        <Tooltip v-slot="{ describedBy }" :text="FALLBACK_HELP" align="end">
+          <IconButton label="Help" :glyph="HELP" no-title :aria-describedby="describedBy" />
+        </Tooltip>
       </template>
     </PageHeader>
 
@@ -310,6 +339,20 @@ async function onReleaseAll() {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(var(--tile-min), 1fr));
   gap: var(--space-6);
+}
+
+/* The takeover button's labels share one grid cell; hidden ones keep their width but are not read or seen. */
+.flip {
+  display: inline-grid;
+}
+
+.flip > span {
+  grid-area: 1 / 1;
+  text-align: center;
+}
+
+.flip > .off {
+  visibility: hidden;
 }
 
 /* Rescan running: the tiles are inert (no clicks, no focus, no context menu) and dimmed like other disabled

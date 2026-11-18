@@ -12,6 +12,10 @@
 //!   near-grey-to-white rule, SINGLE_COLOR / COLOR_FIXED as brightness scaled by the colour's value (a deviation, see [`mapping::direct_color`]).
 //!   SINGLE_COLOR / COLOR_FIXED zones are described as [`brightness_only`](cc_core::Zone::brightness_only): they
 //!   show their own fixed colour (white on the RTX 5080 FE) and the UI offers no colour for them.
+//! - Direct colours (`set_direct`, `set_zone_direct`) are written at the full mode brightness, so each zone's
+//!   brightness comes from its colour alone (per-LED white levels, ADR 0001 #41; the engine applies device and master
+//!   brightness to the colours). Only a "Direct" mode state (`set_mode`) carries a brightness of its own, for that
+//!   write only. Deviation from the reference, whose direct writes keep the last mode brightness.
 //! - Each write sends the whole control struct once and is skipped when identical to the last one sent.
 //!   `release()` writes the kept params back; the next write after a release reads `GetControl` again first.
 //!

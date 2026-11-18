@@ -8,8 +8,12 @@
 //! - The pending update is installed on the next quit (tray Quit, the `quit` command, `--quit`, the run-loop exit that
 //!   also covers logoff/shutdown) after the devices were released, and on the next start before the engine opens any
 //!   device. On quit the app stays closed; on start the installer starts the new version with the same arguments.
-//! - Nothing is ever shown to the user: no dialog, no error. Every step is logged; a failure (offline, GitHub down,
-//!   bad signature) is retried at the next interval. The NSIS installer runs in quiet mode, per user.
+//! - Settings shows the status (ADR 0001 #41): [`Updater::view`] and the `update-status` event carry an
+//!   [`UpdateView`]. "Check for updates" runs [`Updater::check_once`] now (the same check, download and
+//!   [`PendingStore`] as the background check; a check that is already running is not started twice). "Update now"
+//!   ([`Updater::install_now`]) releases the devices through the normal shutdown path, installs the pending update
+//!   and restarts the app. No dialog: every step is logged; a failure (offline, GitHub down, bad signature) is shown
+//!   as the status and retried at the next interval. The NSIS installer runs in quiet mode, per user.
 //! - Debug builds never check, download or install ([`enabled_for_build`]).
 //!
 //! The decisions live in [`Updater`], which talks to the plugin only through [`UpdateBackend`] so the state machine is
@@ -19,8 +23,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Runtime};
@@ -65,9 +71,23 @@ pub trait UpdateBackend: Send + Sync {
     /// than the running version, `Ok(None)` when it is no longer an update (e.g. already installed).
     fn verify(&self, manifest: &Value, bytes: &[u8]) -> Result<Option<String>, String>;
     /// Starts the installer (quiet, per user). On Windows a successful start ends this process and never returns.
-    /// `restart`: the installer starts the new version afterwards with the current arguments.
-    fn install(&self, manifest: &Value, bytes: &[u8], restart: bool) -> Result<(), String>;
+    /// `restart`: whether and with which arguments the installer starts the new version afterwards.
+    fn install(&self, manifest: &Value, bytes: &[u8], restart: &Restart) -> Result<(), String>;
 }
+
+/// Whether and how the installer starts CaseControl after installing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Restart {
+    /// It does not (install on quit).
+    No,
+    /// With the arguments this process was started with (install on start, e.g. keeping `--hidden`).
+    SameArgs,
+    /// With these arguments (Update now: the current ones without `--hidden` and `--quit`).
+    WithArgs(Vec<String>),
+}
+
+/// Shown for a build without updates, as the `disabled` status's reason and the refusal of the update commands.
+pub const DISABLED_REASON: &str = "Updates are only available in installed builds";
 
 /// A downloaded, verified update waiting for the next quit or start.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,7 +100,10 @@ pub struct Pending {
 
 /// Stores the pending update as two files: `pending.bin` (installer) and `pending.json` ([`Announced`]). The JSON file
 /// is written last and removed first, so it marks a complete pending update; both are written to a temporary file
-/// and renamed, so a quit during a download never sees a half-written installer.
+/// and renamed, so a quit during a download never sees a half-written installer. A third file, `pending.attempted`,
+/// marks that its installer was started once: the update stays in place until the installer really launched (the
+/// process ends then), and a pending update whose installer already ran without installing it is discarded instead
+/// of started again, so a failing installer cannot cause a start/install loop.
 #[derive(Debug, Clone)]
 pub struct PendingStore {
     dir: PathBuf,
@@ -88,6 +111,7 @@ pub struct PendingStore {
 
 const PENDING_JSON: &str = "pending.json";
 const PENDING_BIN: &str = "pending.bin";
+const PENDING_ATTEMPTED: &str = "pending.attempted";
 
 impl PendingStore {
     /// A store in `dir` (created on the first save).
@@ -127,6 +151,7 @@ impl PendingStore {
             .map_err(|err| format!("cannot create {}: {err}", self.dir.display()))?;
         // Remove the marker first so a crash between the two writes leaves no marker pointing at the wrong installer.
         remove_if_exists(&self.dir.join(PENDING_JSON))?;
+        remove_if_exists(&self.dir.join(PENDING_ATTEMPTED))?;
         write_atomic(&self.dir.join(PENDING_BIN), bytes)?;
         let json = serde_json::to_vec_pretty(announced)
             .map_err(|err| format!("cannot serialize the pending update: {err}"))?;
@@ -136,7 +161,19 @@ impl PendingStore {
     /// Removes the pending update (marker first). Missing files are fine.
     pub fn clear(&self) -> Result<(), String> {
         remove_if_exists(&self.dir.join(PENDING_JSON))?;
-        remove_if_exists(&self.dir.join(PENDING_BIN))
+        remove_if_exists(&self.dir.join(PENDING_BIN))?;
+        remove_if_exists(&self.dir.join(PENDING_ATTEMPTED))
+    }
+
+    /// Whether the installer of the pending update was started before.
+    pub fn attempted(&self) -> bool {
+        self.dir.join(PENDING_ATTEMPTED).exists()
+    }
+
+    /// Records that the installer of the pending update is being started.
+    pub fn mark_attempted(&self) -> Result<(), String> {
+        let path = self.dir.join(PENDING_ATTEMPTED);
+        fs::write(&path, b"").map_err(|err| format!("cannot write {}: {err}", path.display()))
     }
 }
 
@@ -167,6 +204,8 @@ pub enum CheckOutcome {
     Downloaded(String),
     /// The check, the download or storing failed; retried at the next interval.
     Failed(String),
+    /// Another check (background or button) or an install is running; this one was not started.
+    AlreadyRunning,
 }
 
 /// Result of trying to install the pending update.
@@ -183,16 +222,98 @@ pub enum InstallOutcome {
     /// The installer was started for this version. On Windows the process has already ended at this point, so this
     /// is only seen with test backends.
     Installing(String),
-    /// The installer could not be started; the pending update was removed and is downloaded again later.
+    /// The installer could not be started (or was started before without installing it); the pending update was
+    /// removed and is downloaded again later.
     Failed(String),
+    /// A check is running ([`Updater::install_now`] only); nothing was installed.
+    Busy,
 }
 
-/// The update state machine: when to check, what to keep, when to install.
-#[derive(Debug)]
+/// What the updater is doing or did last, for the Settings page (ADR 0001 #41). Serialized with a `state` tag:
+/// `{ "state": "downloading", "version": "0.2.0" }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum UpdateStatus {
+    /// Updates are off in this build (debug builds).
+    Disabled {
+        /// Why, for the page to show ([`DISABLED_REASON`]).
+        reason: String,
+    },
+    /// Nothing checked yet in this session.
+    Idle,
+    /// Asking the update endpoint.
+    Checking,
+    /// The endpoint announces nothing newer.
+    UpToDate,
+    /// Downloading and verifying a newer release.
+    Downloading {
+        /// The version being downloaded.
+        version: String,
+    },
+    /// A downloaded, verified update is pending and nothing runs. Never stored: [`Updater::view`] derives it from the
+    /// pending store, so it cannot outlive the update.
+    Ready {
+        /// The pending version.
+        version: String,
+    },
+    /// The installer of this version is being started; the app ends right after.
+    Installing {
+        /// The version being installed.
+        version: String,
+    },
+    /// The last check, download or install failed.
+    Failed {
+        /// Why, as the plugin or the store reported it.
+        error: String,
+    },
+}
+
+/// The update state the Settings page shows: [`Updater::view`] and the payload of the `update-status` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpdateView {
+    /// What the updater is doing or did last.
+    pub status: UpdateStatus,
+    /// The version of the downloaded update waiting to be installed ("Update now" is possible), if any.
+    pub pending: Option<String>,
+    /// Grows with every status change; a page keeps the view with the highest one, so a command reply that was
+    /// taken before a newer `update-status` event cannot roll the page back.
+    pub seq: u64,
+}
+
+/// Called with the new view after every status change.
+pub type StatusListener = Box<dyn Fn(&UpdateView) + Send + Sync>;
+
+/// The update state machine: when to check, what to keep, when to install, and what to show.
 pub struct Updater<B> {
     backend: B,
     store: PendingStore,
     enabled: bool,
+    /// What runs or ran last (never [`UpdateStatus::Ready`], see [`Updater::view`]) and the change counter.
+    status: Mutex<(UpdateStatus, u64)>,
+    /// Set while a check or [`Updater::install_now`] runs, so neither starts twice.
+    running: AtomicBool,
+    listener: Option<StatusListener>,
+}
+
+impl<B: std::fmt::Debug> std::fmt::Debug for Updater<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Updater")
+            .field("backend", &self.backend)
+            .field("store", &self.store)
+            .field("enabled", &self.enabled)
+            .field("status", &self.status.lock().0)
+            .field("running", &self.running.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Clears [`Updater::running`] when a check or an install ends, also on a panic.
+struct RunningGuard<'a>(&'a AtomicBool);
+
+impl Drop for RunningGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl<B: UpdateBackend> Updater<B> {
@@ -203,7 +324,17 @@ impl<B: UpdateBackend> Updater<B> {
             backend,
             store,
             enabled,
+            status: Mutex::new((UpdateStatus::Idle, 0)),
+            running: AtomicBool::new(false),
+            listener: None,
         }
+    }
+
+    /// Calls `listener` with the new view after every status change (the app emits it as `update-status`).
+    #[must_use]
+    pub fn with_listener(mut self, listener: impl Fn(&UpdateView) + Send + Sync + 'static) -> Self {
+        self.listener = Some(Box::new(listener));
+        self
     }
 
     /// Whether this updater checks and installs at all.
@@ -211,11 +342,72 @@ impl<B: UpdateBackend> Updater<B> {
         self.enabled
     }
 
-    /// One check: ask the endpoint, download a newer release unless it is already pending, store it.
+    /// The current status and the pending version. While nothing runs (idle or up to date) and an update is pending,
+    /// the status is [`UpdateStatus::Ready`]; it is derived from the store on every call, so it is never stale.
+    pub fn view(&self) -> UpdateView {
+        let (stored, seq) = self.status.lock().clone();
+        if !self.enabled {
+            // A disabled updater may have no store directory; it never reads one.
+            return UpdateView {
+                status: UpdateStatus::Disabled {
+                    reason: DISABLED_REASON.to_owned(),
+                },
+                pending: None,
+                seq,
+            };
+        }
+        let pending = self.store.pending_version();
+        let status = match (stored, &pending) {
+            (UpdateStatus::Idle | UpdateStatus::UpToDate, Some(version)) => UpdateStatus::Ready {
+                version: version.clone(),
+            },
+            (stored, _) => stored,
+        };
+        UpdateView { status, pending, seq }
+    }
+
+    fn set_status(&self, status: UpdateStatus) {
+        {
+            let mut guard = self.status.lock();
+            guard.0 = status;
+            guard.1 += 1;
+        }
+        if let Some(listener) = &self.listener {
+            listener(&self.view());
+        }
+    }
+
+    /// Claims the running flag; `None` while a check or an install already runs.
+    fn claim(&self) -> Option<RunningGuard<'_>> {
+        // `then`, not `then_some`: a guard built for nothing would clear the flag of the check that holds it.
+        (!self.running.swap(true, Ordering::AcqRel)).then(|| RunningGuard(&self.running))
+    }
+
+    /// One check: ask the endpoint, download a newer release unless it is already pending, store it. Used by the
+    /// background thread and by "Check for updates"; while a check (or [`Self::install_now`]) runs, another returns
+    /// [`CheckOutcome::AlreadyRunning`] at once.
     pub fn check_once(&self) -> CheckOutcome {
         if !self.enabled {
             return CheckOutcome::Disabled;
         }
+        let Some(_running) = self.claim() else {
+            tracing::info!("update check: another check or an install is running; not starting a second one");
+            return CheckOutcome::AlreadyRunning;
+        };
+        let outcome = self.check_claimed();
+        match &outcome {
+            // The view shows a pending update as ready.
+            CheckOutcome::UpToDate | CheckOutcome::AlreadyPending(_) | CheckOutcome::Downloaded(_) => {
+                self.set_status(UpdateStatus::UpToDate);
+            }
+            CheckOutcome::Failed(error) => self.set_status(UpdateStatus::Failed { error: error.clone() }),
+            CheckOutcome::Disabled | CheckOutcome::AlreadyRunning => {}
+        }
+        outcome
+    }
+
+    fn check_claimed(&self) -> CheckOutcome {
+        self.set_status(UpdateStatus::Checking);
         tracing::info!("update check: asking the update endpoint");
         let announced = match self.backend.check() {
             Ok(Some(announced)) => announced,
@@ -233,6 +425,9 @@ impl<B: UpdateBackend> Updater<B> {
             return CheckOutcome::AlreadyPending(announced.version);
         }
         tracing::info!(version = %announced.version, "update available; downloading");
+        self.set_status(UpdateStatus::Downloading {
+            version: announced.version.clone(),
+        });
         let bytes = match self.backend.download(&announced) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -248,7 +443,7 @@ impl<B: UpdateBackend> Updater<B> {
             version = %announced.version,
             size = bytes.len(),
             dir = %self.store.dir().display(),
-            "update downloaded and verified; installs on the next quit or start"
+            "update downloaded and verified; installs on the next quit or start, or with Update now"
         );
         CheckOutcome::Downloaded(announced.version)
     }
@@ -268,10 +463,12 @@ impl<B: UpdateBackend> Updater<B> {
         }
     }
 
-    /// Installs the pending update if there is a valid one. The pending files are removed before the installer
-    /// starts, so a failing installer can never cause a start/install loop. `before_install` runs right before the
-    /// installer starts (and only then). `restart`: see [`UpdateBackend::install`].
-    pub fn install_pending(&self, restart: bool, before_install: impl FnOnce()) -> InstallOutcome {
+    /// Installs the pending update if there is a valid one. The pending files stay until the installer really
+    /// launched (the process ends then); they are marked as attempted first, so an update whose installer ran without
+    /// installing it is discarded the next time instead of started again (no start/install loop), and they are
+    /// removed when the installer cannot be started. `before_install` runs right before the installer starts (and
+    /// only then). `restart`: see [`UpdateBackend::install`].
+    pub fn install_pending(&self, restart: &Restart, before_install: impl FnOnce()) -> InstallOutcome {
         if !self.enabled {
             return InstallOutcome::Disabled;
         }
@@ -301,16 +498,55 @@ impl<B: UpdateBackend> Updater<B> {
                 return InstallOutcome::Discarded(err);
             }
         };
-        self.clear_logged();
+        if self.store.attempted() {
+            let err = format!("the installer of {version} ran before without installing it");
+            tracing::warn!(%version, "pending update was started before and is still not installed; removing it");
+            self.clear_logged();
+            return InstallOutcome::Failed(err);
+        }
+        if let Err(err) = self.store.mark_attempted() {
+            // Without the marker a failing installer could loop; fall back to removing the update first.
+            tracing::warn!(%err, "cannot mark the pending update as attempted; removing it before installing");
+            self.clear_logged();
+        }
+        self.set_status(UpdateStatus::Installing {
+            version: version.clone(),
+        });
         before_install();
-        tracing::info!(%version, restart, "starting the update installer");
+        tracing::info!(%version, ?restart, "starting the update installer");
         match self.backend.install(&announced.manifest, &pending.bytes, restart) {
             Ok(()) => InstallOutcome::Installing(version),
             Err(err) => {
                 tracing::error!(%version, %err, "cannot start the update installer; downloading it again later");
+                self.clear_logged();
+                self.set_status(UpdateStatus::Failed { error: err.clone() });
                 InstallOutcome::Failed(err)
             }
         }
+    }
+
+    /// "Update now" (ADR 0001 #41): installs the pending update with `restart`, unless a check runs
+    /// ([`InstallOutcome::Busy`]); no check starts while it runs. `before_install` runs only once the stored update
+    /// verified, right before the installer starts; the app releases the devices there. A pending update that is
+    /// stale or fails verification is removed, and the status says so.
+    pub fn install_now(&self, restart: Restart, before_install: impl FnOnce()) -> InstallOutcome {
+        if !self.enabled {
+            return InstallOutcome::Disabled;
+        }
+        let Some(_running) = self.claim() else {
+            tracing::info!("update now: a check is running; not installing");
+            return InstallOutcome::Busy;
+        };
+        tracing::info!("update now: installing the pending update");
+        let outcome = self.install_pending(&restart, before_install);
+        match &outcome {
+            InstallOutcome::Stale => self.set_status(UpdateStatus::UpToDate),
+            InstallOutcome::Discarded(error) => {
+                self.set_status(UpdateStatus::Failed { error: error.clone() })
+            }
+            _ => {}
+        }
+        outcome
     }
 
     fn clear_logged(&self) {
@@ -376,22 +612,78 @@ impl<R: Runtime> UpdateBackend for TauriBackend<R> {
         Ok(Some(update.version))
     }
 
-    fn install(&self, manifest: &Value, bytes: &[u8], restart: bool) -> Result<(), String> {
-        let update = self
-            .restore(manifest)?
+    fn install(&self, manifest: &Value, bytes: &[u8], restart: &Restart) -> Result<(), String> {
+        let builder = self.app.updater_builder();
+        // The plugin's own restart always passes this process's arguments; for other arguments it is off and the
+        // NSIS restart flags are passed as installer arguments instead (see `nsis_restart_args`).
+        let builder = match restart {
+            Restart::WithArgs(args) => builder.installer_args(nsis_restart_args(args)),
+            Restart::No | Restart::SameArgs => builder,
+        };
+        let update = builder
+            .build()
+            .map_err(|err| format!("updater unavailable: {err}"))?
+            .restore_update(manifest.clone())
+            .map_err(|err| format!("invalid update manifest: {err}"))?
             .ok_or_else(|| "the pending update is no longer an update".to_owned())?;
         update
-            .restart_after_install(restart)
+            .restart_after_install(*restart == Restart::SameArgs)
             .install(bytes)
             .map_err(|err| err.to_string())
     }
 }
 
+/// The NSIS installer arguments that start the app after a quiet install with `args`, as the updater plugin builds
+/// them for its own restart (`/R`, then `/ARGS` and each argument escaped like the plugin's
+/// `escape_nsis_current_exe_arg`). Valid for the quiet and passive install modes and the NSIS bundle this app ships
+/// (`tauri.conf.json`, tested in `updater_config_in_tauri_conf_parses`).
+pub fn nsis_restart_args(args: &[String]) -> Vec<String> {
+    let mut out = vec!["/R".to_owned()];
+    if !args.is_empty() {
+        out.push("/ARGS".to_owned());
+        out.extend(args.iter().map(|a| escape_nsis_arg(a)));
+    }
+    out
+}
+
+/// Quotes an argument for the NSIS command line like the updater plugin does: quoted when it is empty or holds a
+/// space, tab or `/` (so NSIS does not read it as an option), backslashes before a quote doubled and the quote
+/// escaped.
+fn escape_nsis_arg(arg: &str) -> String {
+    let quote = arg.is_empty() || arg.contains([' ', '\t', '/']);
+    let mut out = String::with_capacity(arg.len() + 2);
+    if quote {
+        out.push('"');
+    }
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+        } else {
+            if c == '"' {
+                // n backslashes before a quote become 2n + 1.
+                out.extend(std::iter::repeat_n('\\', backslashes + 1));
+            }
+            backslashes = 0;
+        }
+        out.push(c);
+    }
+    if quote {
+        out.extend(std::iter::repeat_n('\\', backslashes));
+        out.push('"');
+    }
+    out
+}
+
 /// The updater the app manages as Tauri state.
 pub type AppUpdater<R> = Arc<Updater<TauriBackend<R>>>;
 
-/// Creates the app's updater: enabled in release builds that can determine `%LOCALAPPDATA%`.
-pub fn create<R: Runtime>(app: &AppHandle<R>) -> AppUpdater<R> {
+/// Creates the app's updater: enabled in release builds that can determine `%LOCALAPPDATA%`. Every status change is
+/// passed to `listener` (the app emits it as `update-status`).
+pub fn create<R: Runtime>(
+    app: &AppHandle<R>,
+    listener: impl Fn(&UpdateView) + Send + Sync + 'static,
+) -> AppUpdater<R> {
     let dir = updates_dir();
     let enabled = enabled_for_build() && dir.is_some();
     if enabled_for_build() && dir.is_none() {
@@ -401,7 +693,7 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> AppUpdater<R> {
         tracing::info!("debug build: updates are off");
     }
     let store = PendingStore::new(dir.unwrap_or_default());
-    Arc::new(Updater::new(TauriBackend::new(app.clone()), store, enabled))
+    Arc::new(Updater::new(TauriBackend::new(app.clone()), store, enabled).with_listener(listener))
 }
 
 /// Starts the background thread that checks now and every [`CHECK_INTERVAL`]. Does nothing when updates are off.
@@ -434,7 +726,7 @@ mod tests {
         Check,
         Download(String),
         Verify(String),
-        Install { version: String, restart: bool },
+        Install { version: String, restart: Restart },
     }
 
     /// Scripted backend. Manifests are `{"version": "..."}`; a package is valid when its bytes equal
@@ -476,10 +768,10 @@ mod tests {
             }
             Ok(Some(version))
         }
-        fn install(&self, manifest: &Value, _bytes: &[u8], restart: bool) -> Result<(), String> {
+        fn install(&self, manifest: &Value, _bytes: &[u8], restart: &Restart) -> Result<(), String> {
             self.calls.lock().push(Call::Install {
                 version: version_of(manifest),
-                restart,
+                restart: restart.clone(),
             });
             match &self.install_error {
                 Some(err) => Err(err.clone()),
@@ -561,7 +853,7 @@ mod tests {
         let updater = Updater::new(fake(), store.clone(), false);
         assert_eq!(updater.check_once(), CheckOutcome::Disabled);
         assert_eq!(
-            updater.install_pending(false, || panic!("must not install")),
+            updater.install_pending(&Restart::No, || panic!("must not install")),
             InstallOutcome::Disabled
         );
         let mut slept = false;
@@ -658,7 +950,7 @@ mod tests {
         let store = temp_store("nothing");
         let updater = updater(fake(), &store);
         assert_eq!(
-            updater.install_pending(false, || panic!("must not install")),
+            updater.install_pending(&Restart::No, || panic!("must not install")),
             InstallOutcome::NothingPending
         );
         assert!(calls(&updater).is_empty());
@@ -671,7 +963,7 @@ mod tests {
         let updater = updater(fake(), &store);
         let mut before = 0;
         assert_eq!(
-            updater.install_pending(false, || before += 1),
+            updater.install_pending(&Restart::No, || before += 1),
             InstallOutcome::Installing("0.2.0".into())
         );
         assert_eq!(before, 1);
@@ -681,14 +973,21 @@ mod tests {
                 Call::Verify("0.2.0".into()),
                 Call::Install {
                     version: "0.2.0".into(),
-                    restart: false
+                    restart: Restart::No
                 }
             ]
         );
-        // Consumed: a second exit path (e.g. `RunEvent::Exit` after tray Quit) installs nothing.
+        // Kept until the installer really launched (on Windows the process has ended by then), but marked: if that
+        // installer did not install it, the next attempt removes it instead of starting it again.
+        assert_eq!(store.pending_version().as_deref(), Some("0.2.0"));
+        assert!(store.attempted());
+        assert!(matches!(
+            updater.install_pending(&Restart::No, || panic!("must not install twice")),
+            InstallOutcome::Failed(_)
+        ));
         assert_eq!(store.pending_version(), None);
         assert_eq!(
-            updater.install_pending(false, || panic!("must not install twice")),
+            updater.install_pending(&Restart::No, || panic!("must not install")),
             InstallOutcome::NothingPending
         );
         let _ = fs::remove_dir_all(store.dir());
@@ -700,14 +999,14 @@ mod tests {
         store.save(&announced("0.3.0"), b"installer").expect("save");
         let updater = updater(fake(), &store);
         assert_eq!(
-            updater.install_pending(true, || {}),
+            updater.install_pending(&Restart::SameArgs, || {}),
             InstallOutcome::Installing("0.3.0".into())
         );
         assert_eq!(
             calls(&updater).last(),
             Some(&Call::Install {
                 version: "0.3.0".into(),
-                restart: true
+                restart: Restart::SameArgs
             })
         );
         let _ = fs::remove_dir_all(store.dir());
@@ -719,7 +1018,7 @@ mod tests {
         store.save(&announced("0.1.0"), b"installer").expect("save");
         let updater = updater(fake(), &store);
         assert_eq!(
-            updater.install_pending(true, || panic!("must not install")),
+            updater.install_pending(&Restart::SameArgs, || panic!("must not install")),
             InstallOutcome::Stale
         );
         assert_eq!(store.pending_version(), None);
@@ -732,7 +1031,7 @@ mod tests {
         store.save(&announced("0.2.0"), b"evil").expect("save");
         let updater = updater(fake(), &store);
         assert_eq!(
-            updater.install_pending(false, || panic!("must not install")),
+            updater.install_pending(&Restart::No, || panic!("must not install")),
             InstallOutcome::Discarded("bad signature".into())
         );
         assert_eq!(store.pending_version(), None);
@@ -747,7 +1046,7 @@ mod tests {
         fs::write(store.dir().join(PENDING_JSON), b"{not json").expect("write");
         let updater = updater(fake(), &store);
         assert!(matches!(
-            updater.install_pending(false, || panic!("must not install")),
+            updater.install_pending(&Restart::No, || panic!("must not install")),
             InstallOutcome::Discarded(_)
         ));
         assert!(!store.dir().join(PENDING_JSON).exists());
@@ -759,7 +1058,7 @@ mod tests {
         )
         .expect("write");
         assert!(matches!(
-            updater.install_pending(false, || panic!("must not install")),
+            updater.install_pending(&Restart::No, || panic!("must not install")),
             InstallOutcome::Discarded(_)
         ));
         let _ = fs::remove_dir_all(store.dir());
@@ -775,15 +1074,400 @@ mod tests {
         };
         let updater = updater(backend, &store);
         assert_eq!(
-            updater.install_pending(true, || {}),
+            updater.install_pending(&Restart::SameArgs, || {}),
             InstallOutcome::Failed("ShellExecute failed".into())
         );
-        // Removed before the installer started, so the next start does not try again.
+        // Removed when the installer did not start, so the next start does not try again.
         assert_eq!(
-            updater.install_pending(true, || panic!("must not retry")),
+            updater.install_pending(&Restart::SameArgs, || panic!("must not retry")),
             InstallOutcome::NothingPending
         );
         let _ = fs::remove_dir_all(store.dir());
+    }
+
+    /// An updater whose listener records every status it is told about.
+    fn recording(backend: Fake, store: &PendingStore) -> (Updater<Fake>, Arc<Mutex<Vec<UpdateView>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let updater = updater(backend, store).with_listener(move |view| sink.lock().push(view.clone()));
+        (updater, seen)
+    }
+
+    fn statuses(seen: &Mutex<Vec<UpdateView>>) -> Vec<UpdateStatus> {
+        seen.lock().iter().map(|v| v.status.clone()).collect()
+    }
+
+    fn ready(version: &str) -> UpdateStatus {
+        UpdateStatus::Ready {
+            version: version.into(),
+        }
+    }
+
+    fn update_now() -> Restart {
+        Restart::WithArgs(Vec::new())
+    }
+
+    #[test]
+    fn status_starts_idle_disabled_or_ready() {
+        let store = temp_store("status-start");
+        assert_eq!(updater(fake(), &store).view().status, UpdateStatus::Idle);
+        let disabled = Updater::new(fake(), store.clone(), false);
+        assert_eq!(
+            disabled.view(),
+            UpdateView {
+                status: UpdateStatus::Disabled {
+                    reason: DISABLED_REASON.into()
+                },
+                pending: None,
+                seq: 0,
+            }
+        );
+        store.save(&announced("0.2.0"), b"installer").expect("save");
+        let view = updater(fake(), &store).view();
+        assert_eq!(view.status, ready("0.2.0"));
+        assert_eq!(view.pending.as_deref(), Some("0.2.0"));
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    /// The start path removes a pending update that is stale or invalid: the page then shows idle, never a "ready"
+    /// for an update that is gone.
+    #[test]
+    fn start_install_that_removes_the_update_shows_idle_not_ready() {
+        for (version, bytes) in [("0.1.0", &b"installer"[..]), ("0.2.0", &b"evil"[..])] {
+            let store = temp_store("status-start-stale");
+            store.save(&announced(version), bytes).expect("save");
+            let (updater, seen) = recording(fake(), &store);
+            assert_eq!(updater.view().status, ready(version));
+            let outcome = updater.install_pending(&Restart::SameArgs, || panic!("must not install"));
+            assert!(
+                matches!(outcome, InstallOutcome::Stale | InstallOutcome::Discarded(_)),
+                "{outcome:?}"
+            );
+            assert_eq!(
+                updater.view(),
+                UpdateView {
+                    status: UpdateStatus::Idle,
+                    pending: None,
+                    seq: 0
+                }
+            );
+            assert!(seen.lock().is_empty());
+            let _ = fs::remove_dir_all(store.dir());
+        }
+    }
+
+    #[test]
+    fn status_up_to_date() {
+        let store = temp_store("status-uptodate");
+        let (updater, seen) = recording(fake(), &store);
+        assert_eq!(updater.check_once(), CheckOutcome::UpToDate);
+        assert_eq!(
+            statuses(&seen),
+            vec![UpdateStatus::Checking, UpdateStatus::UpToDate]
+        );
+        assert_eq!(updater.view().pending, None);
+    }
+
+    #[test]
+    fn status_downloading_then_ready() {
+        let store = temp_store("status-download");
+        let backend = fake();
+        *backend.check.lock() = Some(Ok(Some(announced("0.2.0"))));
+        *backend.download.lock() = Some(Ok(b"installer".to_vec()));
+        let (updater, seen) = recording(backend, &store);
+        assert_eq!(updater.check_once(), CheckOutcome::Downloaded("0.2.0".into()));
+        assert_eq!(
+            statuses(&seen),
+            vec![
+                UpdateStatus::Checking,
+                UpdateStatus::Downloading {
+                    version: "0.2.0".into()
+                },
+                ready("0.2.0"),
+            ]
+        );
+        assert_eq!(
+            seen.lock().last().and_then(|v| v.pending.clone()).as_deref(),
+            Some("0.2.0")
+        );
+
+        // A second check finds it already downloaded: ready again, no download.
+        seen.lock().clear();
+        assert_eq!(updater.check_once(), CheckOutcome::AlreadyPending("0.2.0".into()));
+        assert_eq!(statuses(&seen), vec![UpdateStatus::Checking, ready("0.2.0")]);
+
+        // The pending update disappears (removed elsewhere): the view follows the store, no stale "ready".
+        store.clear().expect("clear");
+        assert_eq!(updater.view().status, UpdateStatus::UpToDate);
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn every_status_change_has_a_higher_seq() {
+        let store = temp_store("status-seq");
+        let backend = fake();
+        *backend.check.lock() = Some(Ok(Some(announced("0.2.0"))));
+        *backend.download.lock() = Some(Ok(b"installer".to_vec()));
+        let (updater, seen) = recording(backend, &store);
+        let before = updater.view().seq;
+        updater.check_once();
+        let seqs: Vec<u64> = seen.lock().iter().map(|v| v.seq).collect();
+        assert_eq!(seqs, vec![before + 1, before + 2, before + 3]);
+        assert_eq!(updater.view().seq, before + 3, "reading does not count");
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn status_failed_keeps_a_pending_update_installable() {
+        let store = temp_store("status-fail");
+        let backend = fake();
+        *backend.check.lock() = Some(Err("offline".into()));
+        let (updater, seen) = recording(backend, &store);
+        assert_eq!(updater.check_once(), CheckOutcome::Failed("offline".into()));
+        assert_eq!(
+            statuses(&seen),
+            vec![
+                UpdateStatus::Checking,
+                UpdateStatus::Failed {
+                    error: "offline".into()
+                }
+            ]
+        );
+
+        // Failed download of a newer version while an older one is pending: the old one stays installable.
+        store.save(&announced("0.2.0"), b"installer").expect("save");
+        *updater.backend.check.lock() = Some(Ok(Some(announced("0.3.0"))));
+        *updater.backend.download.lock() = Some(Err("bad signature".into()));
+        assert_eq!(updater.check_once(), CheckOutcome::Failed("bad signature".into()));
+        let view = updater.view();
+        assert_eq!(
+            view.status,
+            UpdateStatus::Failed {
+                error: "bad signature".into()
+            }
+        );
+        assert_eq!(view.pending.as_deref(), Some("0.2.0"));
+
+        // Up to date with something still pending: it shows as ready.
+        *updater.backend.check.lock() = Some(Ok(None));
+        assert_eq!(updater.check_once(), CheckOutcome::UpToDate);
+        assert_eq!(updater.view().status, ready("0.2.0"));
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn a_running_check_is_not_started_twice() {
+        let store = temp_store("status-running");
+        let (updater, seen) = recording(fake(), &store);
+        let guard = updater.claim().expect("free");
+        assert_eq!(updater.check_once(), CheckOutcome::AlreadyRunning);
+        assert_eq!(
+            updater.install_now(update_now(), || panic!("must not install")),
+            InstallOutcome::Busy
+        );
+        assert!(calls(&updater).is_empty());
+        assert!(seen.lock().is_empty(), "nothing started, nothing reported");
+        drop(guard);
+        assert_eq!(updater.check_once(), CheckOutcome::UpToDate);
+        // The flag is free again after a check.
+        assert!(updater.claim().is_some());
+    }
+
+    #[test]
+    fn a_check_blocks_a_concurrent_check() {
+        /// A backend whose check waits until the test lets it go.
+        #[derive(Debug)]
+        struct Slow {
+            entered: std::sync::mpsc::SyncSender<()>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+            checks: AtomicUsize,
+        }
+        impl UpdateBackend for Slow {
+            fn check(&self) -> Result<Option<Announced>, String> {
+                self.checks.fetch_add(1, Ordering::SeqCst);
+                let _ = self.entered.send(());
+                let _ = self.release.lock().recv();
+                Ok(None)
+            }
+            fn download(&self, _: &Announced) -> Result<Vec<u8>, String> {
+                Err("unused".into())
+            }
+            fn verify(&self, _: &Value, _: &[u8]) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            fn install(&self, _: &Value, _: &[u8], _: &Restart) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let store = temp_store("status-concurrent");
+        let updater = Arc::new(Updater::new(
+            Slow {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+                checks: AtomicUsize::new(0),
+            },
+            store,
+            true,
+        ));
+        let background = {
+            let updater = updater.clone();
+            std::thread::spawn(move || updater.check_once())
+        };
+        entered_rx.recv().expect("background check started");
+        assert_eq!(updater.view().status, UpdateStatus::Checking);
+        // "Check for updates" while the background check runs.
+        assert_eq!(updater.check_once(), CheckOutcome::AlreadyRunning);
+        release_tx.send(()).expect("release");
+        assert_eq!(background.join().expect("join"), CheckOutcome::UpToDate);
+        assert_eq!(updater.backend.checks.load(Ordering::SeqCst), 1);
+        assert_eq!(updater.view().status, UpdateStatus::UpToDate);
+    }
+
+    #[test]
+    fn update_now_installs_with_its_restart_after_before_install() {
+        let store = temp_store("status-install");
+        store.save(&announced("0.2.0"), b"installer").expect("save");
+        let (updater, seen) = recording(fake(), &store);
+        let mut released = false;
+        let restart = Restart::WithArgs(vec!["--other".into()]);
+        assert_eq!(
+            updater.install_now(restart.clone(), || released = true),
+            InstallOutcome::Installing("0.2.0".into())
+        );
+        assert!(released, "devices are released before the installer starts");
+        assert_eq!(
+            calls(&updater),
+            vec![
+                Call::Verify("0.2.0".into()),
+                Call::Install {
+                    version: "0.2.0".into(),
+                    restart
+                }
+            ]
+        );
+        assert_eq!(
+            statuses(&seen),
+            vec![UpdateStatus::Installing {
+                version: "0.2.0".into()
+            }]
+        );
+        // Not deleted before the installer launched; only marked.
+        assert_eq!(store.pending_version().as_deref(), Some("0.2.0"));
+        assert!(store.attempted());
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn update_now_failures_show_in_the_status() {
+        // The installer does not start: devices were already released, the status says why.
+        let store = temp_store("status-install-fail");
+        store.save(&announced("0.2.0"), b"installer").expect("save");
+        let backend = Fake {
+            install_error: Some("ShellExecute failed".into()),
+            ..fake()
+        };
+        let (updater, seen) = recording(backend, &store);
+        let mut released = false;
+        assert_eq!(
+            updater.install_now(update_now(), || released = true),
+            InstallOutcome::Failed("ShellExecute failed".into())
+        );
+        assert!(released);
+        assert_eq!(
+            statuses(&seen).last(),
+            Some(&UpdateStatus::Failed {
+                error: "ShellExecute failed".into()
+            })
+        );
+        assert_eq!(store.pending_version(), None);
+
+        // A tampered update is removed without releasing anything.
+        store.save(&announced("0.2.0"), b"evil").expect("save");
+        let (updater, seen) = recording(fake(), &store);
+        assert_eq!(
+            updater.install_now(update_now(), || panic!("must not release")),
+            InstallOutcome::Discarded("bad signature".into())
+        );
+        assert_eq!(
+            statuses(&seen),
+            vec![UpdateStatus::Failed {
+                error: "bad signature".into()
+            }]
+        );
+        assert_eq!(updater.view().pending, None);
+
+        // An update that is no longer newer: up to date.
+        store.save(&announced("0.1.0"), b"installer").expect("save");
+        let (updater, seen) = recording(fake(), &store);
+        assert_eq!(updater.view().status, ready("0.1.0"));
+        assert_eq!(
+            updater.install_now(update_now(), || panic!("must not release")),
+            InstallOutcome::Stale
+        );
+        assert_eq!(statuses(&seen), vec![UpdateStatus::UpToDate]);
+        assert_eq!(updater.view().status, UpdateStatus::UpToDate);
+
+        // Nothing pending: nothing happens.
+        assert_eq!(
+            updater.install_now(update_now(), || panic!("must not release")),
+            InstallOutcome::NothingPending
+        );
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn disabled_updater_does_not_install_now() {
+        let store = temp_store("status-disabled");
+        store.save(&announced("0.2.0"), b"installer").expect("save");
+        let updater = Updater::new(fake(), store.clone(), false);
+        assert_eq!(
+            updater.install_now(update_now(), || panic!("must not release")),
+            InstallOutcome::Disabled
+        );
+        assert!(calls(&updater).is_empty());
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn status_json_shape() {
+        let view = UpdateView {
+            status: UpdateStatus::Downloading {
+                version: "0.2.0".into(),
+            },
+            pending: None,
+            seq: 7,
+        };
+        assert_eq!(
+            serde_json::to_value(&view).expect("json"),
+            json!({ "status": { "state": "downloading", "version": "0.2.0" }, "pending": null, "seq": 7 })
+        );
+        assert_eq!(
+            serde_json::to_value(UpdateStatus::UpToDate).expect("json"),
+            json!({ "state": "up_to_date" })
+        );
+        assert_eq!(
+            serde_json::to_value(UpdateStatus::Disabled {
+                reason: DISABLED_REASON.into()
+            })
+            .expect("json"),
+            json!({ "state": "disabled", "reason": "Updates are only available in installed builds" })
+        );
+    }
+
+    #[test]
+    fn nsis_restart_arguments_match_the_plugin() {
+        assert_eq!(nsis_restart_args(&[]), vec!["/R"]);
+        assert_eq!(
+            nsis_restart_args(&["--other".into(), "two words".into(), "a/b".into(), String::new()]),
+            vec!["/R", "/ARGS", "--other", "\"two words\"", "\"a/b\"", "\"\""]
+        );
+        // Quotes inside: backslashes before a quote doubled plus one; trailing backslashes doubled when quoted.
+        assert_eq!(escape_nsis_arg(r#"say"hi"#), r#"say\"hi"#);
+        assert_eq!(escape_nsis_arg(r#"a\"b"#), r#"a\\\"b"#);
+        assert_eq!(escape_nsis_arg(r"C:\dir with space\"), r#""C:\dir with space\\""#);
+        assert_eq!(escape_nsis_arg(r"C:\plain"), r"C:\plain");
     }
 
     #[test]

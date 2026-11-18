@@ -21,9 +21,10 @@
 //! ([`conflict_actions`]); what needs administrator rights runs in the [`elevated`] helper mode of this same
 //! executable, which `main` enters before anything here starts.
 //!
-//! Release builds update themselves silently from GitHub releases ([`updater`], ADR 0001 #39): a check after the
-//! start and every 6 hours downloads a signed update in the background; it is installed on the next quit, after the
-//! devices were released, or on the next start, before any device is opened.
+//! Release builds update themselves from GitHub releases ([`updater`], ADR 0001 #39, #41): a check after the start
+//! and every 6 hours (or "Check for updates" in Settings) downloads a signed update in the background; it is installed
+//! on the next quit, after the devices were released, on the next start, before any device is opened, or at once
+//! with "Update now" ([`install_update_now`]), which releases the devices first and restarts the app.
 //!
 //! The updater is its only network access (ADR 0001 #13, #39); it has no telemetry, changes other software's
 //! autostart only reversibly and only on a click (ADR 0001 #31), and enables its own autostart only when the user
@@ -46,6 +47,7 @@ pub mod tray;
 pub mod updater;
 
 use std::ffi::OsStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{AppHandle, Manager, RunEvent, Runtime, WindowEvent};
 
@@ -113,10 +115,31 @@ pub fn hide_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     }
 }
 
+/// Set by the first exit path that runs (tray Quit, the `quit` command, `--quit`, Update now), so exit paths never
+/// overlap: a second one is ignored instead of exiting while the first is releasing devices or starting the
+/// installer.
+static EXITING: AtomicBool = AtomicBool::new(false);
+
+/// Claims the exit for the caller; `false` when another exit path already runs.
+fn begin_exit() -> bool {
+    !EXITING.swap(true, Ordering::AcqRel)
+}
+
+/// Gives the exit back after an Update now that changed nothing (no release happened), so the app keeps running
+/// normally.
+fn cancel_exit() {
+    EXITING.store(false, Ordering::Release);
+}
+
 /// Orderly shutdown and process exit: releases every device to its hardware mode (once), installs a pending update
-/// (see [`install_update_on_exit`]), then exits. Tray Quit, the `quit` command and `--quit` call this; the run-loop
-/// exit events call [`AppState::shutdown_engine`] and [`install_update_on_exit`] directly.
+/// (see [`install_update_on_exit`]), then exits. Tray Quit, the `quit` command and `--quit` call this on the main
+/// thread; the run-loop exit events call [`AppState::shutdown_engine`] directly. Ignored while another exit path
+/// (e.g. Update now) runs.
 pub fn shutdown<R: Runtime>(app: &AppHandle<R>) {
+    if !begin_exit() {
+        tracing::info!("shutdown requested while CaseControl is already exiting or updating; ignored");
+        return;
+    }
     tracing::info!("shutting down");
     if let Some(state) = app.try_state::<AppState>() {
         state.shutdown_engine();
@@ -130,8 +153,99 @@ pub fn shutdown<R: Runtime>(app: &AppHandle<R>) {
 /// and the caller exits normally. A no-op in debug builds and when nothing is pending.
 pub fn install_update_on_exit<R: Runtime>(app: &AppHandle<R>) {
     if let Some(updater) = app.try_state::<updater::AppUpdater<R>>() {
-        updater.install_pending(false, || app.cleanup_before_exit());
+        updater.install_pending(&updater::Restart::No, || app.cleanup_before_exit());
     }
+}
+
+/// Shown when an update action is asked for in a build without updates (also the `disabled` status's reason).
+pub const UPDATES_DISABLED: &str = updater::DISABLED_REASON;
+
+/// The arguments CaseControl restarts with after Update now: the current command line without the program name,
+/// `--hidden` and `--quit`. The user clicked Update now in the window, so the new version must show it even when
+/// this instance was started hidden by autostart.
+pub fn update_now_args<I, S>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    args.into_iter()
+        .skip(1)
+        .filter(|a| {
+            let a = a.as_ref();
+            a != OsStr::new(HIDDEN_FLAG) && a != OsStr::new(QUIT_FLAG)
+        })
+        .map(|a| a.as_ref().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// "Update now" (ADR 0001 #41). Runs on the main thread, like the other exit paths ([`shutdown`]): once the pending
+/// update verified, writes a pending profile change and releases every device ([`AppState::shutdown_engine`]), runs
+/// Tauri's exit cleanup and starts the quiet installer, which starts the new version afterwards with
+/// [`update_now_args`]; on success the process ends here. Refused while another exit path runs.
+///
+/// Errors when nothing was installed and the app keeps running (no update pending, a check running, the update stale
+/// or invalid). If the installer cannot be started after the devices were released, CaseControl starts itself again
+/// with [`update_now_args`] and exits, so it comes back with its devices (without the update, which is downloaded
+/// again later).
+pub fn install_update_now<R: Runtime>(
+    app: &AppHandle<R>,
+    updater: &updater::AppUpdater<R>,
+) -> Result<updater::UpdateView, String> {
+    use updater::InstallOutcome;
+    tracing::info!("update now requested");
+    if !updater.enabled() {
+        return Err(UPDATES_DISABLED.to_owned());
+    }
+    if !begin_exit() {
+        tracing::info!("update now: CaseControl is already exiting; ignored");
+        return Err("CaseControl is closing.".to_owned());
+    }
+    let args = update_now_args(std::env::args_os());
+    let outcome = updater.install_now(updater::Restart::WithArgs(args.clone()), || {
+        tracing::info!("update now: releasing devices before the installer starts");
+        if let Some(state) = app.try_state::<AppState>() {
+            state.shutdown_engine();
+        }
+        app.cleanup_before_exit();
+    });
+    let result = match outcome {
+        InstallOutcome::Installing(version) => {
+            // Only seen with test backends: on Windows the plugin ended the process.
+            tracing::info!(%version, "update now: installer started");
+            return Ok(updater.view());
+        }
+        InstallOutcome::Failed(err) => {
+            tracing::error!(%err, ?args, "update now: the installer did not start; starting CaseControl again");
+            restart_with(app, &args);
+            return Err(format!("The update could not be installed: {err}"));
+        }
+        InstallOutcome::Disabled => Err(UPDATES_DISABLED.to_owned()),
+        InstallOutcome::Busy => Err("An update check is running. Try again when it has finished.".to_owned()),
+        InstallOutcome::NothingPending => Err("No update is ready to install.".to_owned()),
+        InstallOutcome::Stale => {
+            Err("The downloaded update is not newer than this version; it was removed.".to_owned())
+        }
+        InstallOutcome::Discarded(err) => Err(format!(
+            "The downloaded update could not be verified and was removed: {err}"
+        )),
+    };
+    // Nothing was released: the app keeps running.
+    cancel_exit();
+    result
+}
+
+/// Starts a new CaseControl process with `args` and exits this one. Called only after Tauri's exit cleanup, which
+/// released the single-instance lock, so the new process does not hand its arguments to this one.
+fn restart_with<R: Runtime>(app: &AppHandle<R>, args: &[String]) {
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if let Err(err) = std::process::Command::new(exe).args(args).spawn() {
+                tracing::error!(%err, "cannot start CaseControl again");
+            }
+        }
+        Err(err) => tracing::error!(%err, "cannot find the CaseControl executable to start it again"),
+    }
+    app.exit(0);
 }
 
 /// Starts the thread that writes the active profile after changes (ADR 0001 #40); it ends at shutdown.
@@ -253,6 +367,9 @@ pub fn run() {
             commands::get_settings,
             commands::set_settings,
             commands::set_default_color,
+            commands::update_status,
+            commands::check_for_updates,
+            commands::install_update,
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event
@@ -268,8 +385,11 @@ pub fn run() {
         .setup(move |app| {
             // A pending update is installed before the engine opens any device; the installer restarts the app with
             // the same arguments and this process ends here. Otherwise (nothing pending, debug build) start normally.
-            let updater = updater::create(app.handle());
-            updater.install_pending(true, || {});
+            let status_app = app.handle().clone();
+            let updater = updater::create(app.handle(), move |view| {
+                events::emit(&status_app, events::UPDATE_STATUS, view.clone());
+            });
+            updater.install_pending(&updater::Restart::SameArgs, || {});
             app.manage(updater.clone());
             let state = AppState::init();
             let start_minimized = state.settings().start_minimized;
@@ -364,6 +484,36 @@ mod tests {
         assert!(!parse(&["casecontrol.exe", "--QUIT"]).quit);
         assert!(!parse(&["casecontrol.exe", "quit"]).quit);
         assert_eq!(parse(&[]), LaunchArgs::default());
+    }
+
+    #[test]
+    fn update_now_restarts_without_hidden_or_quit() {
+        assert_eq!(
+            update_now_args([r"C:\Apps\casecontrol.exe", "--hidden"]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            update_now_args(["casecontrol.exe", "--hidden", "--other", "--quit", "two words"]),
+            vec!["--other".to_owned(), "two words".to_owned()]
+        );
+        // Exact matches only, like `LaunchArgs::parse`; the program name is never passed on.
+        assert_eq!(
+            update_now_args(["casecontrol.exe", "--hidden=false", "--HIDDEN"]),
+            vec!["--hidden=false".to_owned(), "--HIDDEN".to_owned()]
+        );
+        assert!(update_now_args(Vec::<String>::new()).is_empty());
+    }
+
+    #[test]
+    fn exit_paths_exclude_each_other() {
+        assert!(begin_exit(), "the first exit path claims the exit");
+        assert!(!begin_exit(), "a second one is refused while the first runs");
+        cancel_exit();
+        assert!(
+            begin_exit(),
+            "free again after an Update now that changed nothing"
+        );
+        cancel_exit();
     }
 
     #[test]

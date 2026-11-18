@@ -32,6 +32,7 @@ use crate::startup::{
     CloseTarget, ResolveRequest, StartupConflicts, plan_autostart, plan_close, plan_resolve,
 };
 use crate::state::AppState;
+use crate::updater::{AppUpdater, UpdateView};
 
 /// Which Rust profile this binary was compiled with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -762,6 +763,57 @@ pub async fn set_settings<R: Runtime>(
         Ok(SettingsView::of(&state.settings(), state.settings_error()))
     })
     .await
+}
+
+/// The managed updater, or an error while the app is still starting.
+fn app_updater<R: Runtime>(app: &AppHandle<R>) -> Result<AppUpdater<R>, String> {
+    app.try_state::<AppUpdater<R>>()
+        .map(|u| u.inner().clone())
+        .ok_or_else(|| "the app is still starting".to_owned())
+}
+
+/// The updater's status for the Settings page (ADR 0001 #41); changes arrive as `update-status`.
+#[tauri::command]
+pub fn update_status<R: Runtime>(app: AppHandle<R>) -> Result<UpdateView, String> {
+    Ok(app_updater(&app)?.view())
+}
+
+/// "Check for updates": checks now and downloads a newer signed release like the background check (same code path,
+/// same pending store). Resolves when the check has finished, with the status then; progress arrives as
+/// `update-status`. A check that is already running is not started again; this then resolves at once with the
+/// current status. Refused in builds without updates.
+#[tauri::command]
+pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> Result<UpdateView, String> {
+    let updater = app_updater(&app)?;
+    if !updater.enabled() {
+        return Err(crate::UPDATES_DISABLED.to_owned());
+    }
+    tracing::info!("check for updates requested");
+    tauri::async_runtime::spawn_blocking(move || {
+        updater.check_once();
+        updater.view()
+    })
+    .await
+    .map_err(err_string)
+}
+
+/// "Update now": releases the devices, installs the pending update and restarts the app (see
+/// [`crate::install_update_now`]). It runs on the main thread like tray Quit and the `quit` command; this command
+/// only waits for it. Resolves only when nothing was installed, with the reason as the error.
+#[tauri::command]
+pub async fn install_update<R: Runtime>(app: AppHandle<R>) -> Result<UpdateView, String> {
+    let updater = app_updater(&app)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let main_app = app.clone();
+    app.run_on_main_thread(move || {
+        // Nobody may be waiting any more (the page went away); the result is logged by `install_update_now`.
+        let _ = tx.send(crate::install_update_now(&main_app, &updater));
+    })
+    .map_err(err_string)?;
+    tauri::async_runtime::spawn_blocking(move || rx.recv())
+        .await
+        .map_err(err_string)?
+        .map_err(|_| "Update now ended without a result.".to_owned())?
 }
 
 /// Emits `devices-changed` (used after tray actions the frontend did not start).

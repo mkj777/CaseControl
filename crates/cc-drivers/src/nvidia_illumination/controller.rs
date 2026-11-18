@@ -228,8 +228,6 @@ pub struct IllumController<A> {
     last_sent: Option<ZoneControlParams>,
     /// Whether a `SetControl` was attempted since `initial` was read, i.e. whether release must write it back.
     dirty: bool,
-    /// Brightness of the "Direct" mode.
-    brightness: u8,
     /// The lighting the GPU showed on its own when control was last taken (what `release()` writes back).
     hardware: Option<ModeState>,
 }
@@ -265,7 +263,6 @@ impl<A: IllumApi> IllumController<A> {
             initial: Some(current),
             last_sent: None,
             dirty: false,
-            brightness: mapping::DEFAULT_BRIGHTNESS,
         })
     }
 
@@ -296,9 +293,13 @@ impl<A: IllumApi> IllumController<A> {
         Ok(())
     }
 
-    fn set_zone_color(&mut self, zone: usize, color: Rgb) {
+    /// Writes `color` into zone `zone` at mode brightness `brightness`. Direct colours (`set_direct`,
+    /// `set_zone_direct`) always use [`mapping::MAX_BRIGHTNESS`], so a brightness-only zone's level comes from the
+    /// colour's intensity alone (the engine applies device and master brightness to the colours already); only a
+    /// "Direct" mode state (`set_mode`) carries its own brightness, and it does not stick to later direct writes.
+    fn set_zone_color(&mut self, zone: usize, color: Rgb, brightness: u8) {
         let kind = self.kinds[zone];
-        if let Some(c) = mapping::direct_color(kind, color, self.brightness, self.treats_rgbw_as_rgb) {
+        if let Some(c) = mapping::direct_color(kind, color, brightness, self.treats_rgbw_as_rgb) {
             mapping::apply(&mut self.working.zones[zone], c);
         }
     }
@@ -330,7 +331,7 @@ impl<A: IllumApi + Send> Controller for IllumController<A> {
         }
         self.take_control()?;
         for (zone, &color) in colors.iter().enumerate() {
-            self.set_zone_color(zone, color);
+            self.set_zone_color(zone, color, mapping::MAX_BRIGHTNESS);
         }
         self.flush()
     }
@@ -346,7 +347,7 @@ impl<A: IllumApi + Send> Controller for IllumController<A> {
             )));
         };
         self.take_control()?;
-        self.set_zone_color(zone, *color);
+        self.set_zone_color(zone, *color, mapping::MAX_BRIGHTNESS);
         self.flush()
     }
 
@@ -363,11 +364,11 @@ impl<A: IllumApi + Send> Controller for IllumController<A> {
             }
         } else {
             let brightness = state.brightness.unwrap_or(u32::from(mapping::DEFAULT_BRIGHTNESS));
-            self.brightness = u8::try_from(brightness)
+            let brightness = u8::try_from(brightness)
                 .unwrap_or(mapping::MAX_BRIGHTNESS)
                 .min(mapping::MAX_BRIGHTNESS);
             for (zone, &color) in state.colors.iter().enumerate() {
-                self.set_zone_color(zone, color);
+                self.set_zone_color(zone, color, brightness);
             }
         }
         self.flush()
@@ -597,8 +598,44 @@ mod tests {
         assert_eq!(&bytes[z(2)..z(2) + 9], &[4, 0, 0, 0, 0, 0, 0, 0, 4]);
     }
 
+    /// Per-LED white levels (ADR 0001 #41): a slider value per zone is stored as the grey `Rgb::white_level(p)`, and
+    /// the driver writes that zone's own brightness `p` from it, independently of the other zones.
     #[test]
-    fn brightness_comes_from_direct_mode_state() {
+    fn per_zone_white_levels_reach_each_zone() {
+        let fake = Fake::with_state(rtx5080_params());
+        let mut c = controller(&fake);
+        for p in 0..=100u8 {
+            // Zone 0 follows the slider, zones 1 and 2 stay at fixed, different levels.
+            let colors = [Rgb::white_level(p), Rgb::white_level(25), Rgb::white_level(80)];
+            c.set_direct(&colors).expect("set");
+            let state = fake.state.lock().expect("lock").clone().expect("state");
+            assert_eq!(state.zones[0], single(p), "slider {p} %");
+            assert_eq!(state.zones[1], single(25));
+            assert_eq!(state.zones[2], single(80));
+            // What the profile stores reads back as the same slider value.
+            assert_eq!(colors[0].level_percent(), p);
+        }
+
+        // One zone at a time (set_zone): only that zone changes.
+        c.set_zone_direct(1, &[Rgb::white_level(7)]).expect("zone");
+        let state = fake.state.lock().expect("lock").clone().expect("state");
+        assert_eq!(
+            state.zones,
+            vec![single(100), single(7), single(80)],
+            "zone 1 alone changed"
+        );
+
+        // A device brightness of 50 % scales the stored grey before it reaches the driver (the engine's job): 80 %
+        // grey (204) at 50 % is 102, written as 40 %.
+        let scaled = Rgb::new(102, 102, 102);
+        c.set_zone_direct(2, &[scaled]).expect("zone");
+        let state = fake.state.lock().expect("lock").clone().expect("state");
+        assert_eq!(state.zones[2], single(40));
+    }
+
+    /// A "Direct" mode state's brightness applies to that state only; later direct colours are not dimmed by it.
+    #[test]
+    fn mode_brightness_does_not_stick_to_direct_writes() {
         let fake = Fake::with_state(rtx5080_params());
         let mut c = controller(&fake);
         let state = ModeState {
@@ -619,9 +656,31 @@ mod tests {
                 )),
                 Call::Set(ZoneControlParams::new(
                     false,
-                    vec![single(30), single(30), single(0)]
+                    vec![single(100), single(100), single(0)]
                 )),
             ]
+        );
+    }
+
+    /// Taken over with its own lighting (readback "Direct" at brightness 60), then a level slider at 100 %: the zone
+    /// shows 100 %, not 60 %.
+    #[test]
+    fn white_level_after_readback_takeover_is_not_capped() {
+        let fake = Fake::with_state(rtx5080_params());
+        let mut c = controller(&fake);
+        let own = c.hardware_mode().expect("readback");
+        assert_eq!(own.brightness, Some(60));
+        c.set_mode(&own).expect("takeover");
+        assert_eq!(
+            fake.state.lock().expect("lock").clone().expect("state").zones,
+            vec![single(50), single(60), single(60)]
+        );
+        c.set_zone_direct(0, &[Rgb::white_level(100)]).expect("level");
+        c.set_direct(&[Rgb::white_level(100), Rgb::white_level(40), Rgb::white_level(60)])
+            .expect("levels");
+        assert_eq!(
+            fake.state.lock().expect("lock").clone().expect("state").zones,
+            vec![single(100), single(40), single(60)]
         );
     }
 

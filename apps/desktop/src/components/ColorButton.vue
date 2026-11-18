@@ -3,12 +3,14 @@
 // "Colour button"; ADR 0001 #37: the fallback colour in the Lighting toolbar). It passes the picker's events
 // through: `update:modelValue` while dragging, `change` with the final value of a gesture. The popover is
 // non-modal: Escape closes it and returns focus to the circle; a click outside or moving focus out closes it too.
+// `align="end"` lines the popover up with the circle's right edge, for a circle at the right end of a row.
 import { nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 import ColorPicker from './ColorPicker.vue'
 
-const props = withDefaults(defineProps<{ modelValue: string; label: string; disabled?: boolean }>(), {
-  disabled: false,
-})
+const props = withDefaults(
+  defineProps<{ modelValue: string; label: string; disabled?: boolean; align?: 'start' | 'end' }>(),
+  { disabled: false, align: 'start' },
+)
 const emit = defineEmits<{ 'update:modelValue': [hex: string]; change: [hex: string] }>()
 
 const panelId = useId()
@@ -72,7 +74,7 @@ function onFocusOut(e: FocusEvent) {
       :disabled="disabled"
       @click="open = !open"
     />
-    <div v-if="open" :id="panelId" ref="panel" class="panel" role="dialog" :aria-label="label">
+    <div v-if="open" :id="panelId" ref="panel" class="panel" :class="{ end: align === 'end' }" role="dialog" :aria-label="label">
       <ColorPicker
         :model-value="modelValue"
         :disabled="disabled"
@@ -123,5 +125,10 @@ function onFocusOut(e: FocusEvent) {
   border-radius: var(--radius-md);
   background: var(--surface);
   box-shadow: var(--shadow-overlay);
+}
+
+.panel.end {
+  right: 0;
+  left: auto;
 }
 </style>
