@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "casecontrol-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "cc-config",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "cc-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc-core",
  "directories",
@@ -476,7 +476,7 @@ dependencies = [
 
 [[package]]
 name = "cc-conflicts"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc-core",
  "serde",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "cc-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bitflags 2.13.2",
  "serde",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "cc-drivers"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc-core",
  "cc-hid",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "cc-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc-config",
  "cc-core",
@@ -525,7 +525,7 @@ dependencies = [
 
 [[package]]
 name = "cc-hid"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc-core",
  "crossbeam-channel",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "cc-nvapi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "thiserror 2.0.21",
  "tracing",

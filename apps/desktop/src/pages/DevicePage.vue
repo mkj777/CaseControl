@@ -306,7 +306,7 @@ const brightnessHint = computed(() =>
 )
 
 async function sendBrightness(percent: number, persist: boolean) {
-  await setDeviceBrightness(props.id, percent, persist)
+  await setDeviceBrightness(props.id, percent)
   if (persist) await refreshDevices()
 }
 

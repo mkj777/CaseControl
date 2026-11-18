@@ -1,10 +1,10 @@
 //! The Settings page's view of `cc_config::Settings`, the patch the page sends back, and the pure functions that
 //! apply both (plus zone-size and brightness persistence and the engine configuration derived from settings).
 //!
-//! Device brightness persistence (ADR 0001 #33, rule documented on `cc_config::DeviceOverrides::brightness`): a
-//! profile stores the device brightness it was saved with; a change since the last profile apply or save is kept per
-//! device in the settings; applying a profile clears those, saving the active profile (`last_profile`) clears them
-//! too; on start the device brightness is `last_profile`'s map overlaid with them.
+//! Device brightness (ADR 0001 #33, #40) is part of the active profile and saved there with every change. Versions
+//! before ADR 0001 #40 kept changes since the last profile apply or save per device in the settings
+//! (`cc_config::DeviceOverrides::brightness`); on start those are laid over the active profile's map
+//! ([`start_brightness`]), saved into it and cleared ([`clear_brightness_overrides`]).
 
 use std::collections::BTreeMap;
 
@@ -143,13 +143,8 @@ pub fn record_zone_size(settings: &mut Settings, id: &DeviceId, zone_name: &str,
         .insert(zone_name.to_owned(), len);
 }
 
-/// Remembers that device `id` was set to `percent` brightness since the last profile apply or save.
-pub fn record_brightness(settings: &mut Settings, id: &DeviceId, percent: u8) {
-    settings.devices.entry(id.clone()).or_default().brightness = Some(percent.min(FULL_BRIGHTNESS));
-}
-
-/// Forgets every per-device brightness change (a profile was applied, or the active one saved). Device entries
-/// left with nothing in them are removed. Returns whether anything changed.
+/// Forgets every per-device brightness change an older version kept (they were saved into the active profile).
+/// Device entries left with nothing in them are removed. Returns whether anything changed.
 pub fn clear_brightness_overrides(settings: &mut Settings) -> bool {
     let mut changed = false;
     for ov in settings.devices.values_mut() {
@@ -159,8 +154,8 @@ pub fn clear_brightness_overrides(settings: &mut Settings) -> bool {
     changed
 }
 
-/// Device brightness at start: the map of `last_profile` (if it loaded) overlaid with the per-device changes made
-/// since. Devices in neither have 100.
+/// Device brightness at start: the map of `last_profile` (if it loaded) overlaid with the per-device changes an older
+/// version kept in the settings. Devices in neither have 100.
 pub fn start_brightness(last_profile: Option<&Profile>, settings: &Settings) -> BTreeMap<DeviceId, u8> {
     let mut map = last_profile.map(|p| p.brightness.clone()).unwrap_or_default();
     for (id, ov) in &settings.devices {
@@ -172,9 +167,9 @@ pub fn start_brightness(last_profile: Option<&Profile>, settings: &Settings) -> 
 }
 
 /// The engine configuration for `settings`: frame rate, disabled families, remembered zone sizes, master
-/// brightness, the per-device brightness changes (the last profile's own map is laid underneath when it is
-/// re-applied), the hidden devices (never taken over by brightness changes), the takeover default colour and the
-/// hidden zones it leaves black, hot-plug and resume handling on. `hardware_state` is the machine state
+/// brightness, the per-device brightness changes an older version kept (the active profile's own map is laid
+/// underneath when it is applied), the hidden devices (never taken over by brightness changes), the takeover default
+/// colour and the hidden zones it leaves black, hot-plug and resume handling on. `hardware_state` is the machine state
 /// (`hardware-state.toml`, ADR 0001 #38), which is not part of the settings.
 pub fn engine_config(settings: &Settings, hardware_state: HardwareState) -> EngineConfig {
     EngineConfig {
@@ -205,6 +200,11 @@ mod tests {
 
     fn msi() -> DeviceId {
         DeviceId::hid(0x1462, 0x7D75, None)
+    }
+
+    /// A device brightness change as versions before ADR 0001 #40 kept it in the settings.
+    fn record_brightness(settings: &mut Settings, id: &DeviceId, percent: u8) {
+        settings.devices.entry(id.clone()).or_default().brightness = Some(percent.min(FULL_BRIGHTNESS));
     }
 
     #[test]

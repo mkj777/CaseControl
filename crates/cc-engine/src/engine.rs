@@ -1223,6 +1223,49 @@ impl Shared {
         }
     }
 
+    /// Forgets the setting of every present device that has no entry in `keep` (ADR 0001 #40). A device the engine
+    /// drives is taken over anew, now without a setting: with the mode it shows on its own, else the default colour
+    /// (see [`Slot::take_over`]), and re-sent. Excluded and faulted devices only lose the setting. Returns the driven
+    /// devices none of these fit; the caller releases them.
+    fn reset_unlisted(&self, keep: &BTreeMap<DeviceId, DeviceSetting>) -> Vec<DeviceId> {
+        if self.is_closed() {
+            return Vec::new();
+        }
+        let mut st = self.state.lock();
+        let ids: Vec<DeviceId> = st
+            .devices
+            .keys()
+            .filter(|id| !keep.contains_key(*id))
+            .cloned()
+            .collect();
+        let mut release = Vec::new();
+        for id in ids {
+            let excluded = st.excluded.contains(&id);
+            let retake = match st.devices.get_mut(&id) {
+                Some(slot) => {
+                    slot.setting = None;
+                    let retake = !excluded && !slot.is_faulted() && slot.want.is_some();
+                    if retake {
+                        slot.want = None;
+                    }
+                    retake
+                }
+                None => false,
+            };
+            if !retake {
+                continue;
+            }
+            st.take_over(&id);
+            if st.devices.get(&id).is_some_and(|s| s.want.is_some()) {
+                debug!(%id, "device not in the profile; taken over with its own mode or the default colour");
+                self.refresh_locked(&mut st, Some(&id));
+            } else {
+                release.push(id);
+            }
+        }
+        release
+    }
+
     /// Releases every device that is not faulted; counts the ones that were driven before.
     fn release_all(&self) -> ReleaseReport {
         let ids: Vec<(DeviceId, bool)> = self
@@ -1724,14 +1767,34 @@ impl EngineHandle {
         report
     }
 
-    /// The current setting of every device that has one, for saving as a profile.
+    /// Applies a whole profile (ADR 0001 #40): like [`apply`](Self::apply), and every connected device without an
+    /// entry in `settings` forgets its setting. Such a device that the engine drives is taken over anew with the mode
+    /// it shows on its own (`DeviceView::hardware`), else the default colour (see
+    /// [`set_default_color`](Self::set_default_color)), or released when neither fits it; excluded and faulted
+    /// devices are left alone apart from the forgotten setting. So after the call the devices show the profile and,
+    /// where it has nothing, their own lighting or the fallback, never a setting of an earlier profile.
+    pub fn apply_replacing(&self, settings: &BTreeMap<DeviceId, DeviceSetting>) -> ApplyReport {
+        for id in self.shared().reset_unlisted(settings) {
+            if let Err(e) = self.shared().release(&id) {
+                warn!(%id, error = %e, "device not in the profile could not be released");
+            }
+        }
+        self.apply(settings)
+    }
+
+    /// The current setting of every device that has one, for saving as a profile: what the engine drives the device
+    /// with (also when the frame has not gone out yet), else the setting it was last driven with.
     pub fn current_settings(&self) -> BTreeMap<DeviceId, DeviceSetting> {
         self.shared()
             .state
             .lock()
             .devices
             .iter()
-            .filter_map(|(id, s)| s.setting.clone().map(|set| (id.clone(), set)))
+            .filter_map(|(id, s)| {
+                s.wanted_setting()
+                    .or_else(|| s.setting.clone())
+                    .map(|set| (id.clone(), set))
+            })
             .collect()
     }
 

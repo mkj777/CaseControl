@@ -286,7 +286,30 @@ re-plugged device still starts undriven.
 the last good own lighting per device, ADR 0001 #38; see Engine), logs in `%LOCALAPPDATA%\CaseControl\logs`.
 Settings: `autostart`, `start_minimized`, `frame_rate`, `detectors.<family> = true|false`, `conflicts.check_openrgb_port`,
 `conflicts.dont_ask` (catalog ids the start dialog no longer asks about), `conflicts.previous_start_types` (service name
--> start type before CaseControl set it to Manual), `last_profile`. Profile: per `DeviceId` a `ModeState` or a direct color buffer plus per-zone overrides. Unknown keys preserved.
+-> start type before CaseControl set it to Manual), `last_profile`. Profile: per `DeviceId` a `ModeState` or a direct color buffer, plus the device brightness per `DeviceId`. Unknown keys preserved.
+
+Profiles (ADR 0001 #24, #33, #40):
+
+- There is always exactly one active profile (`last_profile`). On start: without any profile, "Profile 1" is created
+  from what the devices show (usually empty) and made active; with profiles but an empty or dangling `last_profile`,
+  the first in list order (case-insensitive sort) becomes active; the active profile is then applied.
+- Autosave: every change to what a device shows (`set_direct`, `set_zone`, `set_mode`, `set_device_brightness`, and
+  the takeovers of `connect_all` / `set_master_brightness`) marks the active profile changed. A writer thread
+  (`autosave.rs`) writes it at most every 300 ms (the first change after a quiet period at once, a burst as one
+  trailing write with the latest values); profile operations and the exit path flush a pending change first. The
+  write merges the engine's `current_settings()` (what it drives each connected device with) into the profile file
+  (entries of devices that are not connected stay) and replaces the brightness map with the engine's. There is no
+  Save / Save as, and `set_device_brightness(id, percent)` has no `persist` flag any more.
+- Applying a profile (switch, start, new, duplicate, delete of the active one) uses `EngineHandle::apply_replacing`:
+  connected devices the profile has no entry for forget their setting and, if driven, fall back to their own mode
+  (readback), else the fallback colour (ADR 0001 #36); a device none of these fit is released.
+- New profile: empty (no settings, no brightness entries), named "Profile N" with the lowest free N >= 1, becomes
+  active and is applied. Duplicate: "<name> copy", then "<name> copy 2", ... (the name is cut so the suffix fits 64
+  characters), becomes active. Rename: any profile; the active one follows. Delete: refused for the last profile;
+  deleting the active one activates the first remaining one in list order and applies it.
+- Global per-device overrides (hidden devices and zones, zone sizes) and the fallback colour are settings, not part
+  of profiles. Device brightness changes that versions before ADR 0001 #40 kept in the settings are laid over the
+  active profile on the next start, saved into it and cleared.
 
 ## Desktop app (`apps/desktop`)
 
@@ -302,8 +325,8 @@ Settings: `autostart`, `start_minimized`, `frame_rate`, `detectors.<family> = tr
   single-instance lock and returns without running the app (exit code 0). `--elevated-actions` is handled separately
   by `main` (see Conflicts).
 - Commands: `list_devices`, `set_direct`, `set_zone`, `set_mode`, `resize_zone`, `save_to_hardware`, `release_device`,
-  `release_all`, `connect_all`, `set_device_brightness`, `set_master_brightness`, `rescan`, `set_device_hidden`, `set_zone_hidden`, `list_profiles/save_profile/apply_profile/
-  rename_profile/delete_profile`, `scan_conflicts`, `startup_conflicts`, `resolve_conflicts`, `close_program`,
+  `release_all`, `connect_all`, `set_device_brightness`, `set_master_brightness`, `rescan`, `set_device_hidden`, `set_zone_hidden`, `list_profiles/apply_profile/
+  create_profile/duplicate_profile/rename_profile/delete_profile`, `scan_conflicts`, `startup_conflicts`, `resolve_conflicts`, `close_program`,
   `set_autostart`, `set_dont_ask`, `get_settings/set_settings`, `set_default_color`. Shapes that changed with ADR 0001
   #36: `release_all`
   returns `{ released: number, failed: { id, error }[] }` (the frontend shows "N devices released" when `released`
@@ -328,7 +351,8 @@ Settings: `autostart`, `start_minimized`, `frame_rate`, `detectors.<family> = tr
   page, which offers End process / Stop service (`close_program`), Turn off / Re-enable autostart and the
   "Don't ask again" switch.
 - Frontend: Vue 3 + TS + Vite, pnpm, `@tauri-apps/api`. English UI. Pages: Lighting (the devices overview,
-  `/lighting`; called Devices until ADR 0001 #37), Profiles, Conflicts, Settings.
+  `/lighting`; called Devices until ADR 0001 #37), Conflicts, Settings. Profiles are picked and managed in a
+  dropdown in the Lighting toolbar (ADR 0001 #40); the Profiles page is gone.
   Visual direction: dark and spacious, few large elements, device preview in focus (ADR 0001 #15); components from
   the design system (`docs/design-system.md`, ADR 0001 #30).
 

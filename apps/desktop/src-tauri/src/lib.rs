@@ -1,15 +1,18 @@
 //! CaseControl desktop shell (Tauri 2).
 //!
-//! One process (ADR 0001 #3): a window with the Devices, Profiles, Conflicts and Settings pages, a tray icon
+//! One process (ADR 0001 #3): a window with the Lighting, Conflicts and Settings pages, a tray icon
 //! with Show / Apply profile / Release devices / Quit, close-to-tray, a single-instance guard, autostart
 //! registration, file logging, and the IPC commands and events the pages use. The window has no Windows title bar
 //! (ADR 0001 #29); the frontend draws its own window controls. Devices and zones the user hid are kept out of
 //! control by the commands (see [`hidden`], ADR 0001 #26).
 //!
 //! On start it loads settings and profiles (`cc-config`), starts the device engine (`cc-engine`) with every
-//! compiled-in driver (`cc-drivers`) and re-applies the last applied profile. Every exit path (tray Quit, the
+//! compiled-in driver (`cc-drivers`) and applies the active profile; there is always exactly one, created as "Profile
+//! 1" when none exists, and every change to what a device shows is saved into it by a coalescing autosave thread
+//! ([`autosave`], ADR 0001 #40). Every exit path (tray Quit, the
 //! `quit` command, a second instance started with `--quit`, `RunEvent::ExitRequested`/`Exit` (no update install there), which also covers
-//! Windows session end) releases the devices through [`AppState::shutdown_engine`] exactly once. A `--quit`
+//! Windows session end) writes a pending profile change and releases the devices through
+//! [`AppState::shutdown_engine`] exactly once. A `--quit`
 //! process itself never starts the engine (see [`run`]).
 //!
 //! After the start (also a hidden one) a background thread scans for conflicting software; if RGB suites affect a
@@ -26,6 +29,7 @@
 //! autostart only reversibly and only on a click (ADR 0001 #31), and enables its own autostart only when the user
 //! switches it on in Settings.
 
+pub mod autosave;
 pub mod autostart;
 pub mod commands;
 pub mod conflict_actions;
@@ -130,6 +134,20 @@ pub fn install_update_on_exit<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// Starts the thread that writes the active profile after changes (ADR 0001 #40); it ends at shutdown.
+fn spawn_autosave<R: Runtime>(app: AppHandle<R>) {
+    let spawned = std::thread::Builder::new()
+        .name("cc-autosave".into())
+        .spawn(move || {
+            if let Some(state) = app.try_state::<AppState>() {
+                state.run_autosave();
+            }
+        });
+    if let Err(err) = spawned {
+        tracing::error!(%err, "cannot start the autosave thread; profile changes are saved only on exit and switch");
+    }
+}
+
 /// Scans for conflicts on a background thread after the start (device control is already running). If the start
 /// dialog has programs to ask about, shows the window (also after a hidden start) and emits `startup-conflicts`.
 fn spawn_startup_check<R: Runtime>(app: AppHandle<R>) {
@@ -221,8 +239,9 @@ pub fn run() {
             commands::set_device_hidden,
             commands::set_zone_hidden,
             commands::list_profiles,
-            commands::save_profile,
             commands::apply_profile,
+            commands::create_profile,
+            commands::duplicate_profile,
             commands::rename_profile,
             commands::delete_profile,
             commands::scan_conflicts,
@@ -258,7 +277,7 @@ pub fn run() {
             if let Ok(engine) = state.engine() {
                 events::spawn_forwarder(app.handle().clone(), engine.subscribe());
             }
-            state.apply_last_profile();
+            state.start_profiles();
             let profiles = state.profile_list().unwrap_or_else(|err| {
                 tracing::warn!(%err, "cannot list profiles for the tray");
                 profiles::ProfileList {
@@ -267,6 +286,7 @@ pub fn run() {
                 }
             });
             app.manage(state);
+            spawn_autosave(app.handle().clone());
             tray::create(app.handle(), &profiles)?;
             // The window is declared with `visible: false` so a hidden start never flashes it.
             if !launch.hidden && !start_minimized {

@@ -2797,3 +2797,63 @@ fn faulted_release_only_covers_the_backends_of_the_pass() {
     assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
     e.shutdown(SECOND);
 }
+
+#[test]
+fn apply_replacing_resets_unlisted_devices_to_their_own_mode_or_the_default_colour() {
+    let log = Log::default();
+    let wave_hw = with_effects(spec(id(2), "B", DeviceKind::Light), true);
+    wave_hw.behavior.lock().hardware = Some(wave());
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            spec(id(1), "A", DeviceKind::Light),
+            wave_hw,
+            spec(id(3), "C", DeviceKind::Light),
+            spec(id(4), "D", DeviceKind::Light),
+        ],
+        &log,
+    );
+    let e = engine(60, vec![Box::new(b)]);
+    e.set_excluded(HashSet::from([id(4)]));
+    // 1 and 2 are driven with colours of an earlier profile; 3 had a setting and was released; 4 is hidden.
+    drive(&e, &log, 1);
+    e.set_direct(&id(2), vec![GREEN; 7]).unwrap();
+    assert!(shows(&log, 2, &[GREEN; 7]));
+    drive(&e, &log, 3);
+    e.release(&id(3)).unwrap();
+    drive(&e, &log, 4);
+
+    // An empty profile: driven devices fall back to their own mode, else the default colour.
+    let report = e.apply_replacing(&BTreeMap::new());
+    assert!(report.applied.is_empty() && report.missing.is_empty());
+    assert!(shows(&log, 1, &[Rgb::WHITE; 7]));
+    assert!(shows_mode(&log, 2, "3"));
+    let current = e.current_settings();
+    assert_eq!(
+        current.get(&id(1)),
+        Some(&DeviceSetting::Direct {
+            colors: vec![Rgb::WHITE; 7]
+        })
+    );
+    assert_eq!(current.get(&id(2)), Some(&DeviceSetting::Mode { state: wave() }));
+    // The released device forgets its setting: a later takeover uses the default colour, not red.
+    assert_eq!(current.get(&id(3)), None);
+    assert_eq!(e.device(&id(3)).unwrap().status, DeviceStatus::Released);
+    // The hidden device is not taken over again; it only forgets the setting.
+    assert_eq!(
+        e.device(&id(4)).unwrap().setting,
+        None,
+        "excluded devices lose the setting"
+    );
+    e.connect_all();
+    assert!(shows(&log, 3, &[Rgb::WHITE; 7]));
+
+    // A listed device gets its entry; the others are reset again.
+    let blue = DeviceSetting::Direct {
+        colors: vec![BLUE; 7],
+    };
+    let report = e.apply_replacing(&BTreeMap::from([(id(1), blue.clone())]));
+    assert_eq!(report.applied, [id(1)]);
+    assert!(shows(&log, 1, &[BLUE; 7]));
+    assert_eq!(e.current_settings().get(&id(1)), Some(&blue));
+}

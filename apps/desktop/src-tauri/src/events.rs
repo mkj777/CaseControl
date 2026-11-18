@@ -15,7 +15,7 @@ pub const DEVICE_FAULTED: &str = "device-faulted";
 pub const DEVICE_STATE_CHANGED: &str = "device-state-changed";
 /// Device colours or status changed through a path the frontend did not start (tray actions); no payload.
 pub const DEVICES_CHANGED: &str = "devices-changed";
-/// Profiles were saved, renamed, deleted or applied; payload: `ProfileList`.
+/// Profiles were created, duplicated, renamed, deleted or switched; payload: `ProfileList`.
 pub const PROFILES_CHANGED: &str = "profiles-changed";
 /// A conflict scan finished or conflict settings / autostart changed; payload: `ConflictScan`.
 pub const CONFLICTS_UPDATED: &str = "conflicts-updated";
