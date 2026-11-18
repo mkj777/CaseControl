@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! The Windows implementation of [`NvApi`]: dynamic loading of `nvapi64.dll` and the safe calls.
 
 use core::ffi::{c_char, c_void};

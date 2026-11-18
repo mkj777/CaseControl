@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! The 60% key layout (Wooting 60HE family), from `matrix_map_60` and `led_names_60HE` in
 //! `reference/openrgb/WootingKeyboardController/RGBController_WootingKeyboard.cpp`.
 //!

@@ -14,7 +14,7 @@ use cc_core::{
 };
 use parking_lot::Mutex;
 
-use crate::engine::{EngineConfig, EngineHandle, start_with};
+use crate::engine::{EngineConfig, EngineHandle, Shared, start_with};
 use crate::error::EngineError;
 use crate::hotplug::HotplugSource;
 use crate::view::{DeviceStatus, Takeover};
@@ -48,6 +48,10 @@ struct Behavior {
     own_lighting: Option<Vec<u8>>,
     /// What `off_mode` reports.
     off_mode: Option<u32>,
+    /// How long `release` blocks (before it logs).
+    release_delay: Duration,
+    /// `shows_own_lighting` reports `false` (the device was opened on a state CaseControl left).
+    left_by_us: bool,
 }
 
 struct FakeCtrl {
@@ -122,6 +126,8 @@ impl Controller for FakeCtrl {
     }
 
     fn release(&mut self) -> Result<(), DeviceError> {
+        let delay = self.behavior.lock().release_delay;
+        std::thread::sleep(delay);
         self.log("release".into());
         if self.behavior.lock().fail_release {
             return Err(DeviceError::Transport("release failed".into()));
@@ -139,6 +145,10 @@ impl Controller for FakeCtrl {
 
     fn off_mode(&self) -> Option<u32> {
         self.behavior.lock().off_mode
+    }
+
+    fn shows_own_lighting(&self) -> bool {
+        !self.behavior.lock().left_by_us
     }
 }
 
@@ -349,6 +359,7 @@ fn fast_timing() -> Timing {
         resume_retry: Duration::from_millis(300),
         resume_window: Duration::from_secs(2),
         resume_poll: Duration::from_millis(10),
+        faulted_release: Duration::from_millis(500),
     }
 }
 
@@ -2492,8 +2503,8 @@ fn own_lighting_is_recorded_once_and_handed_to_later_detections() {
     assert_eq!(saved.get(&id(1)), Some(&[1u8, 2, 3][..]));
     assert_eq!(saved.get(&id(9)), Some(&[9u8][..]));
 
-    // Re-opened with the same readback: handed to the driver, not written again.
-    std::fs::write(&file.0, "marker").unwrap();
+    // Re-opened with the same readback: handed to the driver, and still what is remembered (the file itself changes
+    // with the "unreleased" marker of the fault and the release).
     fault(&e, &board, 1);
     e.rescan();
     assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
@@ -2502,7 +2513,9 @@ fn own_lighting_is_recorded_once_and_handed_to_later_detections() {
         contexts.lock().last().unwrap().own_lighting.get(&id(1)),
         Some(&vec![1, 2, 3])
     );
-    assert_eq!(std::fs::read_to_string(&file.0).unwrap(), "marker");
+    let saved = HardwareState::load_from(file.0.clone());
+    assert_eq!(saved.get(&id(1)), Some(&[1u8, 2, 3][..]));
+    assert!(!saved.is_unreleased(&id(1)));
 
     // A different readback replaces it.
     board.behavior.lock().own_lighting = Some(vec![4]);
@@ -2641,4 +2654,146 @@ fn take_over_all_retakes_devices_only_after_a_release() {
                 == DeviceStatus::Active));
         }
     }
+}
+
+/// Whether device `n` carries the "unreleased" marker, in the engine and in the file.
+fn unreleased(e: &EngineHandle, file: &TempFile, n: u16) -> bool {
+    let engine = e.hardware_state().is_unreleased(&id(n));
+    let saved = HardwareState::load_from(file.0.clone()).is_unreleased(&id(n));
+    assert_eq!(engine, saved, "engine and file agree");
+    engine
+}
+
+#[test]
+fn unreleased_marker_follows_writes_and_releases() {
+    let file = TempFile::new("unreleased");
+    let log = Log::default();
+    let board = spec(id(1), "Board", DeviceKind::Motherboard);
+    let b = FakeBackend::new("f", vec![board.clone()], &log);
+    let contexts = Arc::clone(&b.contexts);
+    let e = start_with(
+        EngineConfig {
+            hardware_state: HardwareState::load_from(file.0.clone()),
+            ..cfg(60)
+        },
+        vec![Box::new(b)],
+        None,
+        fast_timing(),
+    )
+    .unwrap();
+    assert!(!unreleased(&e, &file, 1), "opened, not written");
+
+    // Set before the first write, cleared after a successful release.
+    drive(&e, &log, 1);
+    assert!(unreleased(&e, &file, 1));
+    e.set_mode(&id(1), static_red()).unwrap();
+    assert!(unreleased(&e, &file, 1));
+    e.release(&id(1)).unwrap();
+    assert!(!unreleased(&e, &file, 1));
+
+    // A fault leaves it set; a failed release of the faulted device too, so the next open sees it. The new
+    // controller found the device's own lighting (`shows_own_lighting`), which clears it.
+    drive(&e, &log, 1);
+    fault(&e, &board, 1);
+    assert!(unreleased(&e, &file, 1));
+    board.behavior.lock().fail_release = true;
+    e.rescan();
+    assert!(contexts.lock().last().unwrap().is_unreleased(&id(1)));
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
+    assert!(!unreleased(&e, &file, 1));
+    board.behavior.lock().fail_release = false;
+
+    // A controller that hands back a state CaseControl left keeps the marker, at open and after a release.
+    drive(&e, &log, 1);
+    fault(&e, &board, 1);
+    board.behavior.lock().fail_release = true;
+    board.behavior.lock().left_by_us = true;
+    e.rescan();
+    board.behavior.lock().fail_release = false;
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
+    assert!(unreleased(&e, &file, 1), "kept at open");
+    drive(&e, &log, 1);
+    e.release(&id(1)).unwrap();
+    assert!(unreleased(&e, &file, 1), "kept after the release");
+
+    // Released on shutdown by a controller that found its own lighting: cleared.
+    board.behavior.lock().left_by_us = false;
+    drive(&e, &log, 1);
+    e.shutdown(SECOND);
+    assert!(!HardwareState::load_from(file.0.clone()).is_unreleased(&id(1)));
+}
+
+#[test]
+fn faulted_device_whose_worker_does_not_stop_in_time_is_not_reopened_in_that_pass() {
+    let log = Log::default();
+    let s = spec(id(1), "A", DeviceKind::Light);
+    let other = spec(id(2), "B", DeviceKind::Light);
+    let b = FakeBackend::new("f", vec![s.clone(), other.clone()], &log);
+    let contexts = Arc::clone(&b.contexts);
+    let marks = Arc::clone(&b.detect_marks);
+    let e = start_with(
+        cfg(60),
+        vec![Box::new(b)],
+        None,
+        Timing {
+            faulted_release: Duration::from_millis(30),
+            ..fast_timing()
+        },
+    )
+    .unwrap();
+    fault(&e, &s, 1);
+    fault(&e, &other, 2);
+    // Device 1's worker is stuck in its release well past the deadline; device 2's releases at once.
+    s.behavior.lock().release_delay = Duration::from_millis(400);
+
+    let start = Instant::now();
+    e.rescan();
+    assert!(
+        start.elapsed() < Duration::from_millis(300),
+        "one deadline for all, not a wait per device"
+    );
+    let ctx = contexts.lock().last().unwrap().clone();
+    assert!(ctx.is_skipped(&id(1)), "not opened alongside the old worker");
+    assert!(!ctx.is_skipped(&id(2)));
+    assert!(matches!(
+        e.device(&id(1)).unwrap().status,
+        DeviceStatus::Faulted { .. }
+    ));
+    assert_eq!(e.device(&id(2)).unwrap().status, DeviceStatus::Released);
+
+    // The old worker finishes its release later; the next pass re-opens the device after it.
+    assert!(wait_until(SECOND, || entries(
+        &log,
+        &format!("{} release", id(1))
+    )
+    .len()
+        == 1));
+    e.rescan();
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
+    let release_at = log
+        .lock()
+        .iter()
+        .position(|(_, l)| *l == format!("{} release", id(1)))
+        .unwrap();
+    assert!(release_at < *marks.lock().last().unwrap());
+    assert_eq!(entries(&log, &format!("{} release", id(1))).len(), 1);
+    e.shutdown(SECOND);
+}
+
+#[test]
+fn faulted_release_only_covers_the_backends_of_the_pass() {
+    let log = Log::default();
+    let s = spec(id(1), "A", DeviceKind::Light);
+    let a = FakeBackend::new("fam_a", vec![s.clone()], &log);
+    let mut other = FakeBackend::new("fam_b", vec![], &log);
+    other.bus = Bus::NvApi;
+    let e = engine(60, vec![Box::new(a), Box::new(other)]);
+    fault(&e, &s, 1);
+    // A pass over another bus leaves the faulted HID device and its worker alone.
+    Shared::detect_new(e.shared(), Some(Bus::NvApi));
+    assert!(entries(&log, "release").is_empty());
+    e.rescan();
+    assert_eq!(entries(&log, "release").len(), 1);
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
+    e.shutdown(SECOND);
 }

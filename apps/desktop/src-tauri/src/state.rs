@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use cc_config::{HardwareState, Paths, Profile, ProfileStore, Settings};
 use cc_conflicts::ScanReport;
-use cc_engine::{ApplyReport, EngineConfig, EngineHandle};
+use cc_engine::{ApplyReport, EngineHandle};
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::prefs::{engine_config, start_brightness};
@@ -79,11 +79,11 @@ impl AppState {
             Ok(s) => HardwareState::load(&s.paths),
             Err(_) => HardwareState::in_memory(),
         };
-        let config = EngineConfig {
-            hardware_state,
-            ..engine_config(&settings)
-        };
-        let engine = cc_engine::start(config, cc_drivers::all_backends()).map_err(|err| {
+        let engine = cc_engine::start(
+            engine_config(&settings, hardware_state),
+            cc_drivers::all_backends(),
+        )
+        .map_err(|err| {
             tracing::error!(%err, "engine failed to start");
             format!("The device engine could not start: {err}")
         });

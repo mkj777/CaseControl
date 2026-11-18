@@ -1,7 +1,8 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! `#[repr(C)]` mirror of the NvAPI illumination ABI.
 //!
 //! Every layout, enum value and function id here is copied from OpenRGB's
-//! `dependencies/NVFC/nvapi.h` and `nvapi.cpp` (vendored at `reference/openrgb/NVFC/`), with the
+//! `dependencies/NVFC/nvapi.h` and `nvapi.cpp` (upstream only; no longer vendored here), with the
 //! exceptions called out explicitly (the status code table, see [`NvStatus`]).
 //!
 //! Layout notes that apply to the whole module:

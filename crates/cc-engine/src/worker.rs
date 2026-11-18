@@ -15,6 +15,11 @@
 //! out; an explicit release makes it released again. The worker reports both changes to the engine, which emits
 //! `DeviceStateChanged`.
 //!
+//! "Unreleased" marker (ADR 0001 #38): before the first write after it was opened or last released, the worker sets
+//! the device's persisted marker (CaseControl wrote to it and did not hand it back); after a successful release it
+//! clears it again, unless the driver says the release hands back a state CaseControl left
+//! (`Controller::shows_own_lighting`). A device still marked at the next open was left in CaseControl's state.
+//!
 //! Resume (after sleep or hibernate): [`Command::Reassert`] makes the worker hand the device back once (`release()`,
 //! which also clears the driver's "already sent" caches and makes it re-send its init) and then send the current
 //! output again. Reset and send are retried together with the usual back-off; if the device still does not take
@@ -95,6 +100,9 @@ pub(crate) struct Timing {
     pub resume_window: Duration,
     /// First pause between those checks; it doubles up to one second.
     pub resume_poll: Duration,
+    /// How long detection waits for the workers of faulted devices to release them before opening them again; a
+    /// device whose worker has not ended by then is not opened in that pass.
+    pub faulted_release: Duration,
 }
 
 impl Default for Timing {
@@ -110,6 +118,7 @@ impl Default for Timing {
             resume_retry: Duration::from_secs(5),
             resume_window: Duration::from_secs(20),
             resume_poll: Duration::from_millis(250),
+            faulted_release: Duration::from_millis(500),
         }
     }
 }
@@ -151,6 +160,8 @@ pub(crate) struct Worker {
     /// drivers make a release of an untouched device a no-op, except where the reference resets on purpose
     /// (Wooting cleans up after a crashed earlier run).
     needs_release: bool,
+    /// The persisted "unreleased" marker was set by this worker and not cleared since (see the module docs).
+    marked: bool,
     /// Sequence number of the last frame, mode or release that was applied (or superseded everything before it).
     last_seq: u64,
     last_frame: Option<Instant>,
@@ -185,6 +196,7 @@ impl Worker {
             dirty: None,
             shown_mode: None,
             needs_release: true,
+            marked: false,
             last_seq: 0,
             last_frame: None,
             failures: 0,
@@ -365,9 +377,27 @@ impl Worker {
         }
     }
 
+    /// Sets the persisted "unreleased" marker before a write, once until the next release.
+    fn mark_written(&mut self) {
+        if !self.marked {
+            self.shared.set_unreleased(&self.id, true);
+            self.marked = true;
+        }
+    }
+
+    /// A release succeeded: clears the "unreleased" marker unless the driver handed back a state CaseControl left.
+    fn released(&mut self) {
+        self.needs_release = false;
+        if self.ctrl.shows_own_lighting() {
+            self.shared.set_unreleased(&self.id, false);
+            self.marked = false;
+        }
+    }
+
     /// Sends one output to the device and remembers which mode it shows.
     fn send_out(&mut self, out: &Out) -> Result<(), DeviceError> {
         self.needs_release = true;
+        self.mark_written();
         let r = match out {
             Out::Direct(colors) => self.ctrl.set_direct(colors),
             Out::Mode(state) => self.ctrl.set_mode(state),
@@ -461,7 +491,7 @@ impl Worker {
             Command::Release { seq, reply } => {
                 let r = self.ordered(seq, |w| w.ctrl.release());
                 if r == Ok(true) {
-                    self.needs_release = false;
+                    self.released();
                     self.mark_released();
                     self.reset = false;
                     self.resumed();
@@ -486,6 +516,9 @@ impl Worker {
             }
             Command::Save(reply) => {
                 self.needs_release = true;
+                if self.local != Local::Faulted {
+                    self.mark_written();
+                }
                 let r = self.guarded(|w| w.ctrl.save_to_hardware());
                 let _ = reply.send(r);
             }
@@ -498,7 +531,7 @@ impl Worker {
                             debug!(id = %self.id, error = %e, "release of the faulted device on stop failed");
                         }
                         Err(e) => warn!(id = %self.id, error = %e, "release on stop failed"),
-                        Ok(()) => {}
+                        Ok(()) => self.released(),
                     }
                     r
                 } else {

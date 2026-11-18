@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! The Illumination V1 detect table, ported from OpenRGB's `NVIDIAIlluminationControllerDetect_Windows_Linux.cpp`
 //! (`device_list[]`) with the symbolic ids resolved from `reference/openrgb/pci_ids/pci_ids.h`.
 //!

@@ -8,9 +8,10 @@
 //! - [`ProfileStore`]: one file per [`Profile`], identified by the profile's `name` (case-insensitive); file names
 //!   are derived from it and sanitized.
 //! - [`DeviceSetting`] / [`Profile`]: the profile types shared with `cc-engine`.
-//! - [`HardwareState`]: machine state remembered between runs (`%APPDATA%\CaseControl\hardware-state.toml`), today
-//!   the last good own lighting of each device as driver-opaque bytes (ADR 0001 #38). Not user configuration:
-//!   rewritten whole, only when a value changes; unreadable content is ignored with a warning.
+//! - [`HardwareState`]: machine state remembered between runs (`%APPDATA%\CaseControl\hardware-state.toml`): the
+//!   last good own lighting of each device as driver-opaque bytes and the "unreleased" marker (ADR 0001 #38).
+//!   Not user configuration: rewritten whole, only when a value changes; content that does not parse is ignored with
+//!   a warning, a file that cannot be read is never overwritten. [`HardwareSnapshot`] is a read-only copy.
 //!
 //! What this crate deliberately does not do: no I/O outside [`Paths`], no registry access (the `autostart` flag only
 //! records intent; the desktop app applies it), no device access, no network, no file watching, and no logging setup
@@ -26,7 +27,7 @@ mod settings;
 mod store;
 
 pub use error::{ConfigError, Result};
-pub use hardware_state::HardwareState;
+pub use hardware_state::{HardwareSnapshot, HardwareState};
 pub use paths::Paths;
 pub use profile::{DeviceSetting, Profile};
 pub use settings::{

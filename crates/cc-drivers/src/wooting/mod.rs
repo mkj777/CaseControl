@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! Wooting keyboards with V3 firmware (usage page 0xFF55); in v1 only the Wooting 60HE (ARM), `31E3:1310`.
 //!
 //! Ported from `reference/openrgb/WootingKeyboardController/` (V3 controller, 60% layout, detector). One matrix

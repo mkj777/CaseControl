@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! Pure colour-to-params mapping, ported from `NVIDIAIlluminationV1Controller::setZone`.
 
 use cc_core::Rgb;

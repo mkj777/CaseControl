@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use cc_config::{DeviceSetting, HardwareState};
+use cc_config::{DeviceSetting, HardwareSnapshot, HardwareState};
 use cc_core::{
     Backend, Bus, Controller, DetectContext, Detected, DeviceDescription, DeviceError, DeviceId, EngineEvent,
     HotplugEvent, ModeState, Rgb,
@@ -35,13 +35,11 @@ const MAX_REMOVED: usize = 64;
 /// A device removed this long before a resume counts as lost in the sleep (Windows may deliver the removals of a
 /// sleep shortly before the resume broadcast).
 const RESUME_LOOKBACK: Duration = Duration::from_secs(10);
-/// How long detection waits for the worker of a faulted device to release it before opening the device again.
-const FAULTED_RELEASE_TIMEOUT: Duration = Duration::from_millis(500);
 /// Bounds of the frame rate.
 const FPS_RANGE: std::ops::RangeInclusive<u32> = 1..=60;
 
-/// Engine configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Engine configuration. Not `Clone`: it owns the machine state, whose file only the engine writes.
+#[derive(Debug)]
 pub struct EngineConfig {
     /// Maximum colour frames per second and device, `1..=60`.
     pub frame_rate: u32,
@@ -67,9 +65,11 @@ pub struct EngineConfig {
     /// Zones, by name per device, that every direct output leaves black (the app's hidden zones); see
     /// [`EngineHandle::set_dark_zones`].
     pub dark_zones: BTreeMap<DeviceId, BTreeSet<String>>,
-    /// The machine state remembered between runs (ADR 0001 #38): the last good own lighting of each device. Every
-    /// detection hands it to the drivers (`DetectContext::own_lighting`); what a newly opened controller reports
-    /// through `Controller::own_lighting` is recorded in it, which writes its file when the value changed.
+    /// The machine state remembered between runs (ADR 0001 #38): the last good own lighting of each device and the
+    /// "unreleased" marker. Every detection hands both to the drivers (`DetectContext::own_lighting`,
+    /// `DetectContext::unreleased`); what a newly opened controller reports through `Controller::own_lighting` is
+    /// recorded in it; a worker sets the marker before its first write after a takeover and clears it after a
+    /// successful release (when `Controller::shows_own_lighting`). The file is written only when a value changed.
     pub hardware_state: HardwareState,
 }
 
@@ -535,21 +535,40 @@ impl Shared {
         if this.is_closed() {
             return;
         }
+        let disabled = this.state.lock().disabled_families.clone();
+        let in_pass = |backend: &dyn Backend| {
+            bus.is_none_or(|b| backend.bus() == b) && !disabled.contains(backend.name())
+        };
+        let families: HashSet<&str> = this
+            .backends
+            .iter()
+            .filter(|b| in_pass(b.as_ref()))
+            .map(|b| b.name())
+            .collect();
         // Faulted devices are retried: a fresh controller replaces the faulted one. The faulted controller hands its
-        // device back first (best effort), so the new one does not read our own output as the device's lighting.
-        this.release_faulted();
-        let own_lighting = this.hardware_state.lock().own_lighting().clone();
+        // device back first (best effort), so the new one does not read our own output as the device's lighting. A
+        // device whose old worker did not stop in time is left for a later pass.
+        let still_running = this.release_faulted(&families);
+        let (own_lighting, unreleased) = {
+            let hw = this.hardware_state.lock();
+            (
+                hw.own_lighting().clone(),
+                hw.unreleased().iter().cloned().collect(),
+            )
+        };
         let ctx = {
             let st = this.state.lock();
             DetectContext {
-                disabled_families: st.disabled_families.clone(),
+                disabled_families: disabled.clone(),
                 skip: st
                     .devices
                     .iter()
                     .filter(|(_, s)| !matches!(s.status, DeviceStatus::Faulted { .. }))
                     .map(|(id, _)| id.clone())
+                    .chain(still_running)
                     .collect(),
                 own_lighting,
+                unreleased,
             }
         };
         let mut found = Vec::new();
@@ -558,7 +577,7 @@ impl Shared {
             if this.is_closed() {
                 return;
             }
-            if bus.is_some_and(|b| backend.bus() != b) || !ctx.is_enabled(backend.name()) {
+            if !in_pass(backend.as_ref()) {
                 continue;
             }
             for d in backend.detect(&ctx) {
@@ -593,53 +612,100 @@ impl Shared {
         }
     }
 
-    /// Stops the worker of every faulted device that still has one, releasing its device first (best effort, within
-    /// [`FAULTED_RELEASE_TIMEOUT`] each). The slot stays (faulted, without a worker) until detection replaces it.
-    fn release_faulted(&self) {
-        let stopping: Vec<(DeviceId, Sender<Command>, JoinHandle<()>)> = {
+    /// Stops the worker of every faulted device of `families` that still has one, releasing its device first (best
+    /// effort): all stops are sent first, then all are awaited until one deadline ([`Timing::faulted_release`]). The
+    /// slot stays (faulted, without a worker) until detection replaces it. Returns the devices whose worker did not
+    /// end in time: their thread handle goes back into the slot, and they must not be opened again in this pass, so
+    /// an old worker never writes to a device a new controller opened. A later pass tries again.
+    fn release_faulted(&self, families: &HashSet<&str>) -> Vec<DeviceId> {
+        type Stopping = (
+            DeviceId,
+            u64,
+            Option<Receiver<Result<(), DeviceError>>>,
+            JoinHandle<()>,
+        );
+        let stopping: Vec<Stopping> = {
             let mut st = self.state.lock();
             st.devices
                 .iter_mut()
-                .filter(|(_, s)| s.is_faulted())
-                .filter_map(|(id, s)| s.thread.take().map(|t| (id.clone(), s.tx.clone(), t)))
+                .filter(|(_, s)| s.is_faulted() && families.contains(s.family.as_str()))
+                .filter_map(|(id, s)| {
+                    let thread = s.thread.take()?;
+                    let (reply, rx) = crossbeam_channel::bounded(1);
+                    let sent = s.tx.try_send(Command::Stop {
+                        release: true,
+                        reply: Some(reply),
+                    });
+                    // A full queue means a worker stuck in a driver call: no answer to wait for. A closed one means
+                    // it already ended.
+                    let rx = match sent {
+                        Ok(()) => Some(rx),
+                        Err(crossbeam_channel::TrySendError::Full(_)) => None,
+                        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                            let (_, closed) = crossbeam_channel::bounded(0);
+                            Some(closed)
+                        }
+                    };
+                    Some((id.clone(), s.generation, rx, thread))
+                })
                 .collect()
         };
-        for (id, tx, thread) in stopping {
-            let r = self.acked_within(
-                &id,
-                tx,
-                |reply| Command::Stop {
-                    release: true,
-                    reply: Some(reply),
-                },
-                FAULTED_RELEASE_TIMEOUT,
-            );
-            match &r {
-                Ok(()) => debug!(%id, "faulted device released before re-opening it"),
-                Err(e) => {
-                    debug!(%id, error = %e, "release of the faulted device before re-opening it failed")
+        let deadline = Instant::now() + self.timing.faulted_release;
+        let mut still_running = Vec::new();
+        for (id, generation, rx, thread) in stopping {
+            let ended = match rx.map(|rx| rx.recv_deadline(deadline)) {
+                Some(Ok(r)) => {
+                    match r {
+                        Ok(()) => debug!(%id, "faulted device released before re-opening it"),
+                        Err(e) => {
+                            debug!(%id, error = %e, "release of the faulted device before re-opening it failed")
+                        }
+                    }
+                    true
                 }
+                Some(Err(crossbeam_channel::RecvTimeoutError::Disconnected)) => true,
+                Some(Err(crossbeam_channel::RecvTimeoutError::Timeout)) | None => thread.is_finished(),
+            };
+            if ended {
+                // The worker ends right after it answered (or already has).
+                if thread.join().is_err() {
+                    warn!(%id, "device thread panicked");
+                }
+                continue;
             }
-            // The worker ends right after it answered (or already has); one stuck in a driver call is left behind.
-            if matches!(
-                r,
-                Ok(()) | Err(EngineError::Device(_) | EngineError::UnknownDevice(_))
-            ) && thread.join().is_err()
-            {
-                warn!(%id, "device thread panicked");
+            warn!(%id, "faulted device's worker did not stop in time; not re-opening it in this pass");
+            let mut st = self.state.lock();
+            if let Some(slot) = st.devices.get_mut(&id).filter(|s| s.generation == generation) {
+                slot.thread = Some(thread);
             }
+            still_running.push(id);
+        }
+        still_running
+    }
+
+    /// Remembers what a newly opened controller reports as the device's own lighting (ADR 0001 #38), and clears the
+    /// device's "unreleased" marker when the controller found (or restored) its own lighting.
+    fn record_open(&self, id: &DeviceId, ctrl: &dyn Controller) {
+        if let Some(bytes) = ctrl.own_lighting() {
+            match self.hardware_state.lock().record_own_lighting(id, &bytes) {
+                Ok(true) => info!(%id, "own lighting remembered"),
+                Ok(false) => {}
+                Err(e) => warn!(%id, error = %e, "cannot save the device's own lighting"),
+            }
+        }
+        if ctrl.shows_own_lighting() {
+            self.set_unreleased(id, false);
         }
     }
 
-    /// Remembers what a newly opened controller reports as the device's own lighting (ADR 0001 #38).
-    fn record_own_lighting(&self, id: &DeviceId, ctrl: &dyn Controller) {
-        let Some(bytes) = ctrl.own_lighting() else {
-            return;
-        };
-        match self.hardware_state.lock().record_own_lighting(id, &bytes) {
-            Ok(true) => info!(%id, "own lighting remembered"),
+    /// Sets or clears the persisted "unreleased" marker of `id` (ADR 0001 #38): CaseControl wrote to the device and
+    /// did not hand it back. Writes the machine state file only on a change; a write error is logged and the marker
+    /// keeps its old value (the next call tries again).
+    pub(crate) fn set_unreleased(&self, id: &DeviceId, unreleased: bool) {
+        match self.hardware_state.lock().set_unreleased(id, unreleased) {
+            Ok(true) => debug!(%id, unreleased, "unreleased marker changed"),
             Ok(false) => {}
-            Err(e) => warn!(%id, error = %e, "cannot save the device's own lighting"),
+            Err(e) => warn!(%id, unreleased, error = %e, "cannot save the device's unreleased marker"),
         }
     }
 
@@ -663,7 +729,7 @@ impl Shared {
             warn!(%id, "device detected twice; second instance ignored");
             return;
         }
-        this.record_own_lighting(&id, ctrl.as_ref());
+        this.record_open(&id, ctrl.as_ref());
         for (name, len) in zone_sizes {
             let desc = ctrl.description();
             let Some(zone) = desc.zones.iter().position(|z| z.name == name) else {
@@ -1567,7 +1633,7 @@ pub(crate) fn start_with(
 }
 
 impl EngineHandle {
-    fn shared(&self) -> &Arc<Shared> {
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
         &self.guard.shared
     }
 
@@ -1774,9 +1840,10 @@ impl EngineHandle {
         Shared::detect_new(self.shared(), None);
     }
 
-    /// The remembered machine state (own lighting per device), as recorded so far.
-    pub fn hardware_state(&self) -> HardwareState {
-        self.shared().hardware_state.lock().clone()
+    /// A read-only copy of the remembered machine state (own lighting and "unreleased" marker per device), as
+    /// recorded so far.
+    pub fn hardware_state(&self) -> HardwareSnapshot {
+        self.shared().hardware_state.lock().snapshot()
     }
 
     /// A new receiver of every [`EngineEvent`] from now on. Receivers that are dropped are forgotten.

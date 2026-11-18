@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! Logitech G560 speaker: HID++ 2.0 on usage page 0xFF43, zone-only lighting through feature 0x8070.
 //!
 //! Ported from the zone-only path of `LogitechHIDPP20Controller` / `RGBController_LogitechHIDPP20` (the unified

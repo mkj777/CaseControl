@@ -27,6 +27,12 @@ pub struct DetectContext {
     /// per-LED mode); it must validate them before sending anything derived from them.
     #[serde(default)]
     pub own_lighting: BTreeMap<DeviceId, Vec<u8>>,
+    /// Devices CaseControl wrote to and did not hand back (the persisted "unreleased" marker, ADR 0001 #38), e.g.
+    /// after a crash, sleep or re-enumeration. Such a device shows a state CaseControl left, not its own lighting: a
+    /// driver must not report its readback through [`Controller::own_lighting`], and may restore the remembered own
+    /// lighting at open instead (validated, as above), then report [`Controller::shows_own_lighting`].
+    #[serde(default)]
+    pub unreleased: HashSet<DeviceId>,
 }
 
 impl DetectContext {
@@ -43,6 +49,11 @@ impl DetectContext {
     /// The remembered own lighting of device `id` (see [`own_lighting`](Self::own_lighting)), if any.
     pub fn stored_own_lighting(&self, id: &DeviceId) -> Option<&[u8]> {
         self.own_lighting.get(id).map(Vec::as_slice)
+    }
+
+    /// Whether device `id` carries the "unreleased" marker (see [`unreleased`](Self::unreleased)).
+    pub fn is_unreleased(&self, id: &DeviceId) -> bool {
+        self.unreleased.contains(id)
     }
 }
 
@@ -211,6 +222,12 @@ mod tests {
             stored.stored_own_lighting(&DeviceId::hid(0x1462, 0x7D75, None)),
             Some(&[0x52u8, 1][..])
         );
+        assert!(!stored.is_unreleased(&DeviceId::hid(0x1462, 0x7D75, None)));
+        let marked = DetectContext {
+            unreleased: [DeviceId::hid(0x1462, 0x7D75, None)].into(),
+            ..Default::default()
+        };
+        assert!(marked.is_unreleased(&DeviceId::hid(0x1462, 0x7D75, None)));
         assert!(!ctx.is_enabled(family::WOOTING));
         assert!(ctx.is_enabled(family::LOGITECH));
         assert_eq!(b.detect(&ctx).len(), 1);

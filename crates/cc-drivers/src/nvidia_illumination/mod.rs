@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! NVIDIA Illumination V1: GPU lighting through NvAPI's undocumented client illumination zones, ported from OpenRGB's
 //! `NVIDIAIlluminationController` (target: GeForce RTX 5080 Founders Edition, `10DE:2C02` subsystem `10DE:2095`).
 //!

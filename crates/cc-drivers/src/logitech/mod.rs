@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! Logitech HID++ lighting: the G560 speaker (HID++ 2.0, feature 0x8070, wired) and Lightspeed wireless devices
 //! (PRO Wireless) behind the Lightspeed receiver `046D:C539`.
 //!

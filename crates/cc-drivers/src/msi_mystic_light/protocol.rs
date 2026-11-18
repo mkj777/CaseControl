@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! Byte layouts and pure packet builders of the 185-byte Mystic Light protocol.
 //!
 //! Ported from `reference/openrgb/MSIMotherboardController/MSIMotherboardCommon.h` (struct layouts) and
@@ -369,15 +370,10 @@ impl ConfigPacket {
         out
     }
 
-    /// Whether the on-board zone's effect is the per-LED effect, i.e. the device was left in direct mode
-    /// (`GetMode` returning `MSI_MODE_DIRECT_DUMMY`).
-    pub fn is_direct(&self) -> bool {
-        self.0[OFF_ON_BOARD[0] + EFFECT] == mode::DIRECT_EFFECT
-    }
-
     /// Whether any zone record of the packet carries the per-LED effect (0x25), i.e. the packet would put (part of)
-    /// the board into per-LED mode. The enable message sets it on the on-board zone and, in the unsynchronized
-    /// protocol, on the ARGB headers.
+    /// the board into per-LED mode, or the board was left in it. The enable message sets it on the on-board zone
+    /// and, in the unsynchronized protocol, on the ARGB headers. This is the one "per-LED" check of the driver (the
+    /// reference's `GetMode` looks at the on-board zone only).
     pub fn has_direct_effect(&self) -> bool {
         ZONE_OFFSETS
             .iter()
@@ -915,7 +911,7 @@ pub(super) mod tests {
         raw[74] = 0x25;
         raw[1..10].copy_from_slice(&[0x02, 1, 2, 3, 0x29, 4, 5, 6, 0x80]);
         let c = ConfigPacket::from_report(&raw).expect("valid");
-        assert!(c.is_direct());
+        assert!(c.has_direct_effect());
         assert_eq!(c.with_save(false)[SAVE_BYTE], 0);
         assert_eq!(c.with_save(true)[SAVE_BYTE], 1);
         assert_eq!(&c.with_save(false)[..SAVE_BYTE], &raw[..SAVE_BYTE]);

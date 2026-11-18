@@ -56,11 +56,21 @@ pub trait Controller: Send {
 
     /// Driver-opaque bytes describing the lighting the device showed on its own when it was opened, worth
     /// remembering as its "last good own lighting" (ADR 0001 #38); `None` (the default) when the driver has nothing
-    /// to remember, e.g. because the device was found in a state left by software control. Must not do I/O. The
-    /// engine stores the bytes per device id and hands them back in
-    /// [`DetectContext::own_lighting`](crate::DetectContext::own_lighting) on later opens.
+    /// to remember, e.g. because the device was found in a state left by software control (see
+    /// [`DetectContext::unreleased`](crate::DetectContext::unreleased)). Must not do I/O. The engine stores the bytes
+    /// per device id and hands them back in [`DetectContext::own_lighting`](crate::DetectContext::own_lighting) on
+    /// later opens.
     fn own_lighting(&self) -> Option<Vec<u8>> {
         None
+    }
+
+    /// Whether the device shows (after open) or will show (after a successful `release()`) lighting of its own,
+    /// rather than a state CaseControl left on it (ADR 0001 #38). The engine asks right after open and after every
+    /// successful release, and clears the device's "unreleased" marker when this is `true`. A driver returns `false`
+    /// when it was opened on an unreleased device and could not restore its own lighting, so `release()` hands back
+    /// CaseControl's state. Must not do I/O. Default `true`.
+    fn shows_own_lighting(&self) -> bool {
+        true
     }
 
     /// A hardware mode that shows the device dark at the lowest value of its brightness range, which the engine uses
@@ -144,6 +154,7 @@ pub(crate) mod tests {
         assert_eq!(c.keepalive(), Ok(()));
         assert_eq!(c.hardware_mode(), None);
         assert_eq!(c.own_lighting(), None);
+        assert!(c.shows_own_lighting());
         assert_eq!(c.off_mode(), None);
         assert_eq!(c.release(), Ok(()));
     }

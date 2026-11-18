@@ -2,7 +2,7 @@
 
 Target: Windows 11, x86_64. One process. Rust workspace plus a Tauri 2 desktop app with a Vue 3 frontend.
 Design goals in priority order: never damage hardware, never interfere with FanControl or other tools, no
-network, no admin, low idle cost, a backend boundary that admits SMBus/PawnIO later.
+network except the signed auto-update, no admin, low idle cost, a backend boundary that admits SMBus/PawnIO later.
 
 ## Workspace layout
 
@@ -86,6 +86,8 @@ pub trait Controller: Send {
     fn hardware_mode(&self) -> Option<ModeState> { None }
     /// Driver-opaque bytes of the device's own lighting read at open, to remember (ADR 0001 #38). No I/O.
     fn own_lighting(&self) -> Option<Vec<u8>> { None }
+    /// Whether the device shows its own lighting (after open / after release), not a state CaseControl left.
+    fn shows_own_lighting(&self) -> bool { true }
     /// A hardware mode that is dark at the bottom of its brightness range, used for brightness 0 (ADR 0001 #38).
     fn off_mode(&self) -> Option<u32> { None }
 }
@@ -137,7 +139,7 @@ unit-tested against the FakeTransport. Ported from `reference/openrgb/`:
 
 | Module | Reference | Notes |
 |---|---|---|
-| `msi_mystic_light` | `MSIMotherboardController/*` | Detect on `1462:7D75` usage page 0x0001 usage 0x00; class by `get_feature_report(0x52)` length (185/162/112, else 761 path). Direct mode per ARGB header via feature reports. Only PIDs in the upstream tested list; no `ENABLE_UNTESTED` set. Port the `GetFirmwareVersionInvalid` gate verbatim (it separates the tested path from the brick-era one). The save-to-flash byte inside the mode packet is always zero except in `save_to_hardware()`. Last good own lighting (ADR 0001 #38): a 185-byte config read at open that is not per-LED is reported as `own_lighting` (save byte 0); a per-LED readback is replaced by the stored one if it passes `ConfigPacket::from_own_lighting` (185 bytes, report id 0x52, save byte 0, no zone in effect 0x25), and `release()` then restores it even when nothing was sent. `off_mode` is Static (brightness 0 = Static at brightness 0, no per-LED). | LibreHardwareMonitor's MSI HID controller only targets CoreLiquid AIOs (PIDs 0x6A04..0x6A16), so FanControl does not touch this device. |
+| `msi_mystic_light` | `MSIMotherboardController/*` | Detect on `1462:7D75` usage page 0x0001 usage 0x00; class by `get_feature_report(0x52)` length (185/162/112, else 761 path). Direct mode per ARGB header via feature reports. Only PIDs in the upstream tested list; no `ENABLE_UNTESTED` set. Port the `GetFirmwareVersionInvalid` gate verbatim (it separates the tested path from the brick-era one). The save-to-flash byte inside the mode packet is always zero except in `save_to_hardware()`. Last good own lighting (ADR 0001 #38): without the "unreleased" marker, a 185-byte config read at open that is not per-LED (no zone in effect 0x25) is reported as `own_lighting` (save byte 0), and a per-LED one belongs to another program (nothing stored or restored, an untouched release sends nothing). With the marker, the readback is CaseControl's: never stored; the stored state, if it passes `ConfigPacket::from_own_lighting` (185 bytes, report id 0x52, save byte 0, no zone in effect 0x25), is restored at open (so board and UI agree) and by `release()`; without one, `shows_own_lighting()` is false and the marker stays. The off output (Static 0) also darkens headers sized 0. `off_mode` is Static (brightness 0 = Static at brightness 0, no per-LED). | LibreHardwareMonitor's MSI HID controller only targets CoreLiquid AIOs (PIDs 0x6A04..0x6A16), so FanControl does not touch this device. |
 | `wooting` | `WootingKeyboardController/*V3*` | `31E3:1310`, usage page 0xFF55 (V3). Direct per-key RGB, restore keyboard profile on release. |
 | `logitech` | `LogitechController/LogitechHIDPP20Controller`, `LogitechLightspeedController`, `LogitechProtocolCommon` | G560 `046D:0A78` usage page 0xFF43 (zone-only HID++ 2.0, feature 0x8070). PRO Wireless through receiver `046D:C539` (Lightspeed, virtual PID 0x4079); the receiver accepts one connection, pair-index handling per upstream. |
 | `nvidia_illumination` | `NVIDIAIlluminationController/*`, `dependencies/NVFC/nvapi.*` | Load `nvapi64.dll`, `NvAPI_GPU_ClientIllumZonesGetControl/SetControl`. Match `10DE:2C02` subsys `10DE:2095`. RGBW zones treated as RGBW. NvAPI Illumination is undocumented: function IDs and `#[repr(C)]` struct layouts/versions are copied byte-exact from `nvapi.h`. Always `GetControl` before any `SetControl`, keep the initial params, and `release()` writes them back. First hardware test is a round-trip (read, write the same values, read again) before any color change. |
@@ -191,22 +193,35 @@ re-plug of the device while the app runs (hot-plug, profile re-association by `D
   controller read as the device's own lighting; both are driver-opaque bytes, so any driver can use them. The engine
   holds a `cc_config::HardwareState` (`EngineConfig::hardware_state`; the app loads it from
   `%APPDATA%\CaseControl\hardware-state.toml`, in memory only without storage), hands its map to every detection
-  and records each new controller's bytes in it, which rewrites the file atomically only when the value changed.
-  The driver validates stored bytes before it uses them (Mystic Light: see the driver table). Format:
+  and records each new controller's bytes in it. The driver validates stored bytes before it uses them (Mystic
+  Light: see the driver table). `EngineHandle::hardware_state()` returns a read-only `HardwareSnapshot`.
+- "Unreleased" marker (ADR 0001 #38), in the same file: CaseControl wrote to the device and did not hand it back.
+  The worker sets it before its first write after open or a release and clears it after a successful release;
+  `DetectContext::unreleased` hands it to every detection. A driver that finds the marker knows the readback is a
+  state CaseControl left (crash, sleep, re-enumeration) and never reports it as own lighting (Mystic Light restores
+  the stored own lighting at open instead). `Controller::shows_own_lighting()` (default `true`) tells the engine,
+  right after open and after each successful release, whether the device shows its own lighting; only then is the
+  marker cleared. Format:
 
   ```toml
   # CaseControl machine state (ADR 0001 #38). Written by CaseControl; not meant to be edited.
+  unreleased = ["hid:1462:7d75:7D7522120106"]
+
   [own_lighting]
-  "hid:1462:7d75:7D7522120106" = "5201ff0000..."   # lower-case hex, no separators
+  "hid:1462:7d75:7D7522120106" = "5201ff0000..."   # lower-case hex ([0-9a-f]), no separators
   ```
 
-  A file that is not TOML, an `own_lighting` that is not a table and entries that are not non-empty hex strings are
-  ignored with a warning; unknown keys are dropped on the next write.
+  The file is rewritten atomically, only when a value changed, and the in-memory state changes only after the write
+  succeeded. Content that is not TOML, an `own_lighting` that is not a table, an `unreleased` that is not an array
+  and invalid entries are ignored with a warning; unknown keys are dropped on the next write. A file that exists but
+  cannot be read (I/O error, not UTF-8) makes the state read-only for the session: it is never overwritten.
 - Error policy: write errors back off exponentially (50 ms .. 5 s), after 10 consecutive failures the device is marked
   `Faulted` and shown as such; never retried in a tight loop. A faulted device is released once, best effort, when
-  its worker stops: on shutdown, and when detection is about to open it again (detection stops the faulted worker
-  with a release, within 500 ms, before the backends run). A removed device is not released: its handle is gone; the
-  re-opened controller finds the board's state itself (and Mystic Light the stored own lighting if it is per-LED).
+  its worker stops: on shutdown, and when detection is about to open it again. Detection stops the faulted workers
+  of the backends it runs (all stops sent first, then one deadline, `Timing::faulted_release`, 500 ms); a device
+  whose old worker has not ended by then is skipped in that pass and re-opened by a later one, so an old worker never
+  writes after a new controller opened the device. A removed device is not released: its handle is gone; the
+  re-opened controller finds the board's state itself (with the "unreleased" marker telling it the state is ours).
 - Shutdown: `Release` on every device (also faulted ones, best effort), join threads with timeout, then exit.
   Ctrl-C/WM_CLOSE/tray Quit all funnel here.
 - Event bus (`tokio::sync::broadcast` or crossbeam) consumed by the Tauri layer and re-emitted as Tauri events.
@@ -276,7 +291,7 @@ Settings: `autostart`, `start_minimized`, `frame_rate`, `detectors.<family> = tr
 ## Desktop app (`apps/desktop`)
 
 - Tauri 2, features `tray-icon`; plugins: `tauri-plugin-autostart` (HKCU Run), `tauri-plugin-single-instance`,
-  `tracing` to a rolling log file. CSP strict, no remote URLs, `dangerousRemoteDomainIpcAccess` empty.
+  `tauri-plugin-updater` (see Updates), `tracing` to a rolling log file. CSP strict, no remote URLs, `dangerousRemoteDomainIpcAccess` empty.
 - Close hides to tray; tray menu: Show, Apply profile submenu, Release devices, Quit.
 - Command line (parsed by `LaunchArgs::parse`; exact matches, unknown arguments ignored): `--hidden` starts with the
   window hidden (the autostart entry passes it). `--quit` asks a running instance to shut down: the single-instance
@@ -317,6 +332,30 @@ Settings: `autostart`, `start_minimized`, `frame_rate`, `detectors.<family> = tr
   Visual direction: dark and spacious, few large elements, device preview in focus (ADR 0001 #15); components from
   the design system (`docs/design-system.md`, ADR 0001 #30).
 
+## Updates (`apps/desktop/src-tauri/src/updater.rs`, ADR 0001 #39)
+
+The app's only network access. Release builds only; debug builds never check, download or install.
+
+- Endpoint `https://github.com/mkj777/CaseControl/releases/latest/download/latest.json` and the minisign public key
+  are in `tauri.conf.json` (`plugins.updater`), with `requireSignedVersion: true` (the signature must carry the
+  announced version, so a tampered `latest.json` cannot pair a new version number with an older signed installer)
+  and `windows.installMode: "quiet"` (no installer UI). The NSIS installer is per user (ADR 0001 #32).
+- Check: once after the start, on the `cc-updater` thread once the engine is up, then every 6 hours. A newer release
+  is downloaded in the background and its signature verified by the plugin; it is then stored as the pending update
+  in `%LOCALAPPDATA%\CaseControl\updates` (`pending.bin` + `pending.json` holding the version and the raw
+  `latest.json`, both written via rename, the JSON last). The same version is not downloaded twice; a newer one
+  replaces it.
+- Install: on an explicit quit after the devices are released (`shutdown()` for tray Quit, the `quit` command and
+  `--quit`; not on `RunEvent::Exit`, which also fires on logoff/shutdown where Windows may kill the installer) without restarting the app, and in the setup hook on
+  the next start, before the engine opens any device, with a restart (the installer starts the new version with the
+  same arguments, e.g. `--hidden`). Before installing, the stored installer is verified again against the stored
+  manifest (`Updater::restore_update` + `Update::verify`); a stale (not newer) or invalid one is deleted. The pending
+  files are deleted before the installer starts, so a failing installer cannot cause a start/install loop. On
+  success the plugin ends the process (`std::process::exit` after `ShellExecuteW`), after Tauri's exit cleanup.
+- Nothing is shown to the user: every step is logged; failures (offline, GitHub down, bad signature) are retried
+  at the next interval. No setting, no UI in 0.1.0.
+- The decisions live in `Updater<B: UpdateBackend>`; tests use a scripted backend and a temporary store.
+
 ## Testing
 
 - `cc-core`: model invariants (zone ranges cover the buffer, mode caps vs state validation).
@@ -331,11 +370,18 @@ Jobs on PR and push to main: `pnpm install --frozen-lockfile`, `cargo fmt --chec
 `cargo nextest run --workspace`, `cargo deny check`, `pnpm vue-tsc --noEmit`, `pnpm build`, `cargo tauri build` (artifact on main).
 Actions pinned by SHA, `permissions: contents: read`, `Swatinem/rust-cache`. Branch protection on main requires these checks.
 
+Releases (`.github/workflows/release.yml`, see `docs/releasing.md`): a pushed tag `v*.*.*` first checks that the tag
+matches the versions in `tauri.conf.json`, the workspace `Cargo.toml` and `package.json`, then runs `ci.yml` (as a
+reusable workflow), then builds on `windows-latest` with `tauri-apps/tauri-action`, signs the updater artifacts with
+the `TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets and publishes the release (not a draft)
+with the NSIS installer, its `.sig` and `latest.json`; the release notes are the tag message. Only that job has
+`contents: write`.
+
 ## Security posture
 
 No kernel driver, no elevation except the one user-triggered elevated helper run per conflict action (ADR 0001 #31),
-no network, no telemetry, no auto-update.
-`cargo-deny` bans HTTP client crates (`reqwest`, `ureq`, `curl`; the exact list is derived from `cargo tree` after the Tauri
-scaffold exists, since Tauri may pull `hyper` transitively) and enforces a license allowlist (GPL-compatible is fine, project is private).
+no telemetry. The only network access is the signed auto-update from GitHub releases (see Updates, ADR 0001 #39).
+`cargo-deny` bans HTTP client crates (`reqwest`, `ureq`, `curl`, `isahc`, `attohttpc`, `surf`); `reqwest` is allowed
+only as the direct dependency of `tauri-plugin-updater` (`wrappers`), which uses native TLS (SChannel) and enforces a license allowlist (licences compatible with the project's GPL-2.0-or-later).
 All `unsafe` is confined to `cc-hid` (hot-plug and power notification FFI, named mutex), `cc-nvapi`, and the single `sys` module of
 `cc-conflicts` (Toolhelp, service control manager, process termination, ShellExecuteEx); each block carries a `// SAFETY:` comment.
