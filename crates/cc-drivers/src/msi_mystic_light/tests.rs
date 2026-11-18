@@ -926,11 +926,21 @@ impl HidTransport for FailingSends {
     }
     fn send_feature_report(&mut self, data: &[u8]) -> Result<(), HidError> {
         use std::sync::atomic::Ordering;
-        if self
-            .fail
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        // Decrement while > 0 without `fetch_update` (deprecated on newer toolchains, `try_update` not yet on older).
+        let mut n = self.fail.load(Ordering::SeqCst);
+        let consumed = loop {
+            if n == 0 {
+                break false;
+            }
+            match self
+                .fail
+                .compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break true,
+                Err(current) => n = current,
+            }
+        };
+        if consumed {
             return Err(HidError::Io("send failed".into()));
         }
         self.inner.send_feature_report(data)
