@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! MSI Mystic Light motherboards (USB HID), 185-byte class.
 //!
 //! Port of OpenRGB's `MSIMotherboardController` for the board this project targets, the MAG B650 TOMAHAWK WIFI
@@ -25,15 +26,23 @@
 //! with the save byte forced to zero. Nothing is written to flash, so the board's saved (power-on) state is never
 //! touched.
 //!
-//! Last good own lighting (ADR 0001 #38): a configuration read at open that is not per-LED is reported through
-//! [`Controller::own_lighting`](cc_core::Controller::own_lighting) (save byte 0) so the engine can remember it per
-//! device id. If the configuration read at open is a per-LED state (on-board effect 0x25, left by an earlier run or
-//! another program) and the detect context holds a remembered state for the board that passes
-//! [`ConfigPacket::from_own_lighting`](protocol::ConfigPacket::from_own_lighting) (185 bytes, report id 0x52, save
-//! byte 0, no per-LED effect in any zone), that state replaces the readback: `release()` restores it (even when
-//! nothing was sent since open) and `hardware_mode()` reports it; this is logged at info. Without one, `release()`
-//! restores the per-LED state exactly (the board keeps its last per-LED frame until the next power cycle or until
-//! another program takes over) and a warning is logged. The flash configuration is never written.
+//! Last good own lighting (ADR 0001 #38). What happens at open depends on the engine's persisted "unreleased" marker
+//! ([`DetectContext::is_unreleased`](cc_core::DetectContext::is_unreleased): CaseControl wrote to the board and did not
+//! hand it back, e.g. after a crash or sleep):
+//!
+//! - Marker set: the readback is CaseControl's state and is never reported as own lighting. If the detect context
+//!   holds a remembered state for the board that passes
+//!   [`ConfigPacket::from_own_lighting`](protocol::ConfigPacket::from_own_lighting) (185 bytes, report id 0x52, save
+//!   byte 0, no per-LED effect in any zone), it is restored right away (the two reports of a release), so the board
+//!   and `hardware_mode()` agree, and `release()` restores it later. Without one, `release()` restores the readback
+//!   and [`Controller::shows_own_lighting`](cc_core::Controller::shows_own_lighting) is `false`, so the marker stays.
+//! - Marker not set, readback per-LED (any zone in effect 0x25): another program drives the board. Nothing is stored
+//!   or restored; an untouched release sends nothing, a release after CaseControl drove it restores the per-LED
+//!   readback (warning at open).
+//! - Marker not set, readback not per-LED: it is reported through
+//!   [`Controller::own_lighting`](cc_core::Controller::own_lighting) (save byte 0) so the engine remembers it.
+//!
+//! The flash configuration is never written.
 //!
 //! Off: [`Controller::off_mode`](cc_core::Controller::off_mode) is Static, so brightness 0 is Static at brightness 0
 //! (a hardware state) instead of black frames in per-LED mode.
@@ -162,7 +171,12 @@ where
             continue;
         }
         let result = open(&candidate.path).map_err(DeviceError::from).and_then(|dev| {
-            MysticLight185::open_with_stored(dev, &candidate, ctx.stored_own_lighting(&candidate.id))
+            MysticLight185::open_with_stored(
+                dev,
+                &candidate,
+                ctx.stored_own_lighting(&candidate.id),
+                ctx.is_unreleased(&candidate.id),
+            )
         });
         match result {
             Ok(controller) => {

@@ -32,9 +32,11 @@ confidence-threshold = 0.8
 multiple-versions = "allow"
 wildcards = "deny"
 allow-wildcard-paths = true
-# No network access (ADR 0001 #13): HTTP client crates must never enter the Windows build.
+# No network access (ADR 0001 #13): HTTP client crates must never enter the Windows build. The one exception is the
+# Tauri updater plugin (ADR 0001 #39): `wrappers` lets reqwest in only as its direct dependency, so any other crate
+# that pulls in reqwest still fails the check.
 deny = [
-    { crate = "reqwest", reason = "no network access (ADR 0001 #13)" },
+    { crate = "reqwest", wrappers = ["tauri-plugin-updater"], reason = "no network access except the updater (ADR 0001 #13, #39)" },
     { crate = "ureq", reason = "no network access (ADR 0001 #13)" },
     { crate = "curl", reason = "no network access (ADR 0001 #13)" },
     { crate = "isahc", reason = "no network access (ADR 0001 #13)" },

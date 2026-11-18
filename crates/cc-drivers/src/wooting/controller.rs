@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! The [`Controller`] for a Wooting V3 keyboard.
 
 use std::time::Duration;

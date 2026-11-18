@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! Tested board list and per-board configuration of the 185-byte class.
 //!
 //! `DETECTORS` is the reference detector table (`MSIMotherboardControllerDetect.cpp`) without the

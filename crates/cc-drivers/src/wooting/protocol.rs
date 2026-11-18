@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! Wooting V3 protocol: constants and pure packet builders.
 //!
 //! Ported from `reference/openrgb/WootingKeyboardController/` (`WootingKeyboardController.cpp`,

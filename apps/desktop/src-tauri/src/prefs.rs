@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use cc_config::{DeviceOverrides, FRAME_RATE_RANGE, FULL_BRIGHTNESS, Profile, Settings};
+use cc_config::{DeviceOverrides, FRAME_RATE_RANGE, FULL_BRIGHTNESS, HardwareState, Profile, Settings};
 use cc_core::{DeviceId, Rgb, family};
 use cc_engine::EngineConfig;
 use serde::{Deserialize, Serialize};
@@ -174,8 +174,9 @@ pub fn start_brightness(last_profile: Option<&Profile>, settings: &Settings) -> 
 /// The engine configuration for `settings`: frame rate, disabled families, remembered zone sizes, master
 /// brightness, the per-device brightness changes (the last profile's own map is laid underneath when it is
 /// re-applied), the hidden devices (never taken over by brightness changes), the takeover default colour and the
-/// hidden zones it leaves black, hot-plug and resume handling on.
-pub fn engine_config(settings: &Settings) -> EngineConfig {
+/// hidden zones it leaves black, hot-plug and resume handling on. `hardware_state` is the machine state
+/// (`hardware-state.toml`, ADR 0001 #38), which is not part of the settings.
+pub fn engine_config(settings: &Settings, hardware_state: HardwareState) -> EngineConfig {
     EngineConfig {
         frame_rate: settings
             .frame_rate
@@ -194,8 +195,7 @@ pub fn engine_config(settings: &Settings) -> EngineConfig {
         excluded: crate::hidden::hidden_devices(settings),
         default_color: settings.default_color,
         dark_zones: crate::hidden::hidden_zone_map(settings),
-        // Not part of the settings: the caller adds the machine state file (`AppState::init`).
-        hardware_state: cc_config::HardwareState::in_memory(),
+        hardware_state,
     }
 }
 
@@ -254,7 +254,10 @@ mod tests {
         assert_eq!(fx.default_color, Some(orange));
         assert_eq!(s.default_color, orange);
         assert_eq!(SettingsView::of(&s, None).default_color, orange);
-        assert_eq!(engine_config(&s).default_color, orange);
+        assert_eq!(
+            engine_config(&s, HardwareState::in_memory()).default_color,
+            orange
+        );
         let fx = apply_patch(&mut s, &p).expect("valid patch");
         assert_eq!(fx.default_color, None, "unchanged colour is not an effect");
         assert!(
@@ -338,7 +341,7 @@ mod tests {
         record_zone_size(&mut s, &msi(), "JRAINBOW1", 60);
         s.devices
             .insert(DeviceId::hid(0x31E3, 0x1310, None), Default::default());
-        let cfg = engine_config(&s);
+        let cfg = engine_config(&s, HardwareState::in_memory());
         assert_eq!(cfg.frame_rate, 45);
         assert!(cfg.hotplug);
         assert_eq!(
@@ -352,7 +355,7 @@ mod tests {
 
         s.master_brightness = 40;
         record_brightness(&mut s, &msi(), 70);
-        let cfg = engine_config(&s);
+        let cfg = engine_config(&s, HardwareState::in_memory());
         assert_eq!(cfg.master_brightness, 40);
         assert_eq!(cfg.brightness, BTreeMap::from([(msi(), 70)]));
     }

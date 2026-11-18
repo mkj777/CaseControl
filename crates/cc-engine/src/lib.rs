@@ -28,10 +28,15 @@
 //! - Last good own lighting (ADR 0001 #38): every detection hands the drivers what is remembered per device
 //!   (`DetectContext::own_lighting`, from [`EngineConfig::hardware_state`]); what a newly opened controller reports
 //!   through `Controller::own_lighting` is recorded there, which writes `hardware-state.toml` (through `cc-config`)
-//!   only when the value changed. Brightness 0 uses the driver's off mode (`Controller::off_mode`, Mystic Light:
-//!   Static at brightness 0) instead of black in the direct mode where the driver names one.
-//! - Release hardening (ADR 0001 #38): stopping releases faulted devices too (best effort), and detection releases a
-//!   faulted device's controller (stopping its thread) before it opens the device again.
+//!   only when the value changed. A persisted "unreleased" marker per device (`DetectContext::unreleased`) says
+//!   CaseControl wrote to it and did not hand it back: a worker sets it before its first write after a takeover and
+//!   clears it after a successful release, and a new controller that found (or restored) the device's own lighting
+//!   (`Controller::shows_own_lighting`) clears it at open. Brightness 0 uses the driver's off mode
+//!   (`Controller::off_mode`, Mystic Light: Static at brightness 0) instead of black in the direct mode where the
+//!   driver names one. [`EngineHandle::hardware_state`] returns a read-only snapshot.
+//! - Release hardening (ADR 0001 #38): stopping releases faulted devices too (best effort), and detection releases
+//!   the faulted devices of the backends it runs (all stops first, then one deadline) before it opens them again; a
+//!   device whose old worker has not ended by then is skipped in that pass, so two controllers never drive it.
 //! - Resume (sleep, hibernation): on Windows the engine subscribes to suspend/resume broadcasts and then calls
 //!   [`EngineHandle::reassert`]: debounced, it resets and re-sends every driven device's current output, retries
 //!   failed writes with back-off for a few seconds and re-opens devices that faulted or vanished during sleep.
@@ -39,8 +44,8 @@
 //!
 //! What this crate deliberately does not do: no device protocols (that is `cc-drivers`), no file I/O or profile
 //! storage of its own (that is `cc-config`; the engine only takes and returns settings, and records the drivers'
-//! own lighting through `cc_config::HardwareState`, the one file it causes to be written), no Tauri or UI code, no effects engine
-//! (colour frames come from the caller), and it never writes device flash unless [`EngineHandle::save_to_hardware`] is
+//! own lighting and the "unreleased" markers through `cc_config::HardwareState`, the one file it causes to be
+//! written), no Tauri or UI code, no effects engine (colour frames come from the caller), and it never writes device flash unless [`EngineHandle::save_to_hardware`] is
 //! called.
 
 mod engine;

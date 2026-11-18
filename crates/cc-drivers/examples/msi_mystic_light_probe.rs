@@ -76,7 +76,7 @@ fn probe(cand: &msi::Candidate) -> Result<(), cc_core::DeviceError> {
     let original = c.original_config();
     println!(
         "   configuration read from the board (left in per-LED mode: {}):",
-        original.is_direct()
+        original.has_direct_effect()
     );
     for chunk in original.0.chunks(16) {
         println!("     {}", cc_hid::hex(chunk));

@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! Logitech Lightspeed wireless devices (PRO Wireless) behind the Lightspeed receiver `046D:C539`.
 //!
 //! Ported from `DetectLogitechLightspeedReceiver` / `getWirelessDevice` / `logitech_device` in

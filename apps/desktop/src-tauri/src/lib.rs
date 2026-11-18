@@ -8,7 +8,7 @@
 //!
 //! On start it loads settings and profiles (`cc-config`), starts the device engine (`cc-engine`) with every
 //! compiled-in driver (`cc-drivers`) and re-applies the last applied profile. Every exit path (tray Quit, the
-//! `quit` command, a second instance started with `--quit`, `RunEvent::ExitRequested`/`Exit`, which also covers
+//! `quit` command, a second instance started with `--quit`, `RunEvent::ExitRequested`/`Exit` (no update install there), which also covers
 //! Windows session end) releases the devices through [`AppState::shutdown_engine`] exactly once. A `--quit`
 //! process itself never starts the engine (see [`run`]).
 //!
@@ -18,10 +18,15 @@
 //! ([`conflict_actions`]); what needs administrator rights runs in the [`elevated`] helper mode of this same
 //! executable, which `main` enters before anything here starts.
 //!
-//! It deliberately has no network access and no telemetry (ADR 0001 #13), changes other software's autostart only
-//! reversibly and only on a click (ADR 0001 #31), and enables its own autostart only when the user switches it on in
-//! Settings.
+//! Release builds update themselves silently from GitHub releases ([`updater`], ADR 0001 #39): a check after the
+//! start and every 6 hours downloads a signed update in the background; it is installed on the next quit, after the
+//! devices were released, or on the next start, before any device is opened.
+//!
+//! The updater is its only network access (ADR 0001 #13, #39); it has no telemetry, changes other software's
+//! autostart only reversibly and only on a click (ADR 0001 #31), and enables its own autostart only when the user
+//! switches it on in Settings.
 
+pub mod autostart;
 pub mod commands;
 pub mod conflict_actions;
 pub mod conflicts;
@@ -34,6 +39,7 @@ pub mod profiles;
 pub mod startup;
 pub mod state;
 pub mod tray;
+pub mod updater;
 
 use std::ffi::OsStr;
 
@@ -103,14 +109,25 @@ pub fn hide_main_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     }
 }
 
-/// Orderly shutdown and process exit: releases every device to its hardware mode (once), then exits. Tray Quit and
-/// the `quit` command call this; the run-loop exit events call [`AppState::shutdown_engine`] directly.
+/// Orderly shutdown and process exit: releases every device to its hardware mode (once), installs a pending update
+/// (see [`install_update_on_exit`]), then exits. Tray Quit, the `quit` command and `--quit` call this; the run-loop
+/// exit events call [`AppState::shutdown_engine`] and [`install_update_on_exit`] directly.
 pub fn shutdown<R: Runtime>(app: &AppHandle<R>) {
     tracing::info!("shutting down");
     if let Some(state) = app.try_state::<AppState>() {
         state.shutdown_engine();
     }
+    install_update_on_exit(app);
     app.exit(0);
+}
+
+/// Starts the installer of a pending update without restarting the app; call only after the devices were released.
+/// On success the process ends here (after Tauri's exit cleanup, so the tray icon is removed); otherwise it returns
+/// and the caller exits normally. A no-op in debug builds and when nothing is pending.
+pub fn install_update_on_exit<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(updater) = app.try_state::<updater::AppUpdater<R>>() {
+        updater.install_pending(false, || app.cleanup_before_exit());
+    }
 }
 
 /// Scans for conflicts on a background thread after the start (device control is already running). If the start
@@ -183,6 +200,7 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![HIDDEN_FLAG]),
         ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
             commands::show_window,
@@ -229,8 +247,14 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            // A pending update is installed before the engine opens any device; the installer restarts the app with
+            // the same arguments and this process ends here. Otherwise (nothing pending, debug build) start normally.
+            let updater = updater::create(app.handle());
+            updater.install_pending(true, || {});
+            app.manage(updater.clone());
             let state = AppState::init();
             let start_minimized = state.settings().start_minimized;
+            autostart::sync_run_entry(app.handle(), state.settings().autostart);
             if let Ok(engine) = state.engine() {
                 events::spawn_forwarder(app.handle().clone(), engine.subscribe());
             }
@@ -249,6 +273,8 @@ pub fn run() {
                 show_main_window(app.handle())?;
             }
             spawn_startup_check(app.handle().clone());
+            // After the engine is up: check now and every 6 hours on a background thread.
+            updater::spawn_checks(updater);
             Ok(())
         })
         .build(tauri::generate_context!());
@@ -269,6 +295,8 @@ pub fn run() {
     }
     app.run(|app, event| {
         // `Exit` also arrives on Windows session end (WM_ENDSESSION), where the process ends right after.
+        // No update install here: `Exit` also arrives on session end, where Windows may kill a running installer.
+        // A pending update installs on an explicit quit (`shutdown`) or on the next start.
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit)
             && let Some(state) = app.try_state::<AppState>()
         {

@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! The Illumination V1 [`Controller`], generic over the two NvAPI calls it needs so tests can run without the DLL.
 
 use std::sync::{Arc, Mutex};

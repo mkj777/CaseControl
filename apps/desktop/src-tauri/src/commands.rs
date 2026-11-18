@@ -15,7 +15,6 @@ use cc_engine::{
 };
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime};
-use tauri_plugin_autostart::ManagerExt as _;
 
 use crate::conflict_actions::{
     ActionReport, check_catalogue_id, conflict_view, known_devices, run_and_report, run_scan,
@@ -724,7 +723,7 @@ pub async fn get_settings<R: Runtime>(app: AppHandle<R>) -> Result<SettingsView,
 
 /// Applies a partial settings change, saves it, and carries it over to the running app: frame rate, detector switches
 /// and the takeover default colour go to the engine (the colour is used from the next takeover on; devices already
-/// driven keep what they show), autostart to the HKCU Run key.
+/// driven keep what they show), autostart to the HKCU Run key (release builds only, see [`crate::autostart`]).
 #[tauri::command]
 pub async fn set_settings<R: Runtime>(
     app: AppHandle<R>,
@@ -734,14 +733,7 @@ pub async fn set_settings<R: Runtime>(
         let effects = state.update_settings(|s| {
             let effects = apply_patch(s, &patch)?;
             if let Some(on) = effects.autostart {
-                let autolaunch = app.autolaunch();
-                let result = if on {
-                    autolaunch.enable()
-                } else {
-                    autolaunch.disable()
-                };
-                result.map_err(|err| format!("cannot change autostart: {err}"))?;
-                tracing::info!(enabled = on, "autostart changed");
+                crate::autostart::apply(app, on)?;
             }
             Ok(effects)
         })?;

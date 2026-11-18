@@ -57,6 +57,8 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
+# The only network access (ADR 0001 #39). native-tls = SChannel and the Windows certificate store, no rustls/ring.
+tauri-plugin-updater = { version = "2.14", default-features = false, features = ["native-tls", "system-proxy"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

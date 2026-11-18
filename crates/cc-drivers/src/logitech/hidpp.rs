@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! HID++ framing shared by the G560 and Lightspeed paths: request builders, reply matching, bounded reads, and the
 //! feature 0x0005 / 0x8070 queries both devices use.
 //!

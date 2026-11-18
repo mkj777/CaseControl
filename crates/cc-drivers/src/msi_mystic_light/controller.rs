@@ -1,3 +1,4 @@
+// Modified port of OpenRGB code (https://gitlab.com/CalcProgrammer1/OpenRGB), GPL-2.0-or-later; see NOTICE.md.
 //! The 185-byte Mystic Light controller (`MSIMotherboard185Controller` plus `RGBController_MSIMotherboard185`).
 
 use std::thread;
@@ -284,10 +285,10 @@ fn layout_zones(board: &Board, lens: &[usize]) -> (Vec<Zone>, Vec<Led>) {
 /// as `RGBController_MSIMotherboard185` reads the active mode): its effect as one of `desc`'s hardware modes, speed and
 /// brightness clamped to the mode's ranges, and for per-LED colour modes each zone's first colour on all its LEDs.
 /// `None` for the per-LED (direct) effect, "disabled" and effects without a mode, since their colours are unknown;
-/// also `None` for a configuration in per-LED mode (on-board effect 0x25), whose other zone records (Static, as the
-/// enable message sets them) do not describe what the board shows.
+/// also `None` for a configuration with any zone in per-LED mode (effect 0x25), whose other zone records (Static, as
+/// the enable message sets them) do not describe what the board shows.
 fn hardware_state(config: &ConfigPacket, board: &Board, desc: &DeviceDescription) -> Option<ModeState> {
-    if config.is_direct() {
+    if config.has_direct_effect() {
         return None;
     }
     let mixed = board.layout.mixed_mode;
@@ -339,13 +340,14 @@ pub struct MysticLight185 {
     board: Board,
     board_id: u16,
     firmware: Firmware,
-    /// The configuration read at open, or the remembered last good own lighting when the board was found in
-    /// per-LED mode (ADR 0001 #38); `release()` sends it back with the save byte forced to zero.
+    /// The configuration read at open, or the remembered last good own lighting when the board was opened with the
+    /// "unreleased" marker (ADR 0001 #38); `release()` sends it back with the save byte forced to zero.
     original: ConfigPacket,
-    /// The configuration read at open when it is a good own lighting worth remembering (`Controller::own_lighting`).
-    own_lighting: Option<Vec<u8>>,
-    /// `original` came from the remembered state because the board was found in per-LED mode: `release()` restores
-    /// it even if nothing was sent since open.
+    /// `original` is a state CaseControl left on the board (opened with the "unreleased" marker and no usable
+    /// remembered own lighting): it is not reported as own lighting, and the marker stays after a release.
+    left_by_us: bool,
+    /// The board does not show `original` yet (restoring the remembered own lighting at open failed): `release()`
+    /// sends it even if nothing was sent since open.
     restore_pending: bool,
     /// Working configuration (`data` in the reference): the original plus our header sizes and mode changes.
     data: ConfigPacket,
@@ -448,23 +450,30 @@ impl MysticLight185 {
     ///
     /// Same as [`open_with_stored`](Self::open_with_stored) without a remembered own lighting.
     pub fn open(dev: Box<dyn HidTransport>, candidate: &Candidate) -> Result<Self, DeviceError> {
-        Self::open_with_stored(dev, candidate, None)
+        Self::open_with_stored(dev, candidate, None, false)
     }
 
-    /// [`open`](Self::open) with the board's remembered last good own lighting (ADR 0001 #38, the bytes an earlier
-    /// controller reported through [`Controller::own_lighting`](cc_core::Controller::own_lighting)).
+    /// [`open`](Self::open) with what the engine remembers about the board (ADR 0001 #38): `stored`, its last good
+    /// own lighting (the bytes an earlier controller reported through
+    /// [`Controller::own_lighting`](cc_core::Controller::own_lighting)), and `unreleased`, whether CaseControl wrote
+    /// to it and did not hand it back (crash, sleep, re-enumeration).
     ///
-    /// - The configuration read at open is not per-LED: it is what `release()` restores, and it is reported as the
+    /// - `unreleased`: the configuration read at open is CaseControl's, not the board's own lighting, and is never
+    ///   reported as own lighting. If `stored` passes [`ConfigPacket::from_own_lighting`] (185 bytes, report id 0x52,
+    ///   save byte 0, no zone in the per-LED effect), it is restored right away (the same two reports as `release()`)
+    ///   and becomes what `release()` restores and [`hardware_mode`](cc_core::Controller::hardware_mode) reports, so
+    ///   the board and the UI agree; if that write fails, `release()` sends it even when nothing else was sent.
+    ///   Without a usable `stored`, `release()` restores the readback and
+    ///   [`shows_own_lighting`](cc_core::Controller::shows_own_lighting) stays `false`.
+    /// - Not `unreleased` and the readback is per-LED: another program drives the board. Nothing is stored or
+    ///   restored, and the release of an untouched controller sends nothing (warning).
+    /// - Not `unreleased` and the readback is not per-LED: it is what `release()` restores, and it is reported as the
     ///   new own lighting to remember.
-    /// - It is per-LED (left by an earlier run or another program) and `stored` passes
-    ///   [`ConfigPacket::from_own_lighting`] (185 bytes, report id 0x52, save byte 0, no zone in the per-LED effect):
-    ///   `stored` takes its place for `release()` and [`hardware_mode`](cc_core::Controller::hardware_mode), and
-    ///   `release()` restores it even if nothing was sent since open.
-    /// - It is per-LED without a usable `stored`: as before, `release()` restores the per-LED state (warning).
     pub fn open_with_stored(
         mut dev: Box<dyn HidTransport>,
         candidate: &Candidate,
         stored: Option<&[u8]>,
+        unreleased: bool,
     ) -> Result<Self, DeviceError> {
         let len = read_config_len(dev.as_mut())?;
         match protocol::classify(len) {
@@ -493,36 +502,36 @@ impl MysticLight185 {
         }
 
         let read = read_config(dev.as_mut())?;
-        let (original, own_lighting, restore_pending) = if read.is_direct() {
-            match stored.and_then(ConfigPacket::from_own_lighting) {
-                Some(good) => {
-                    tracing::info!(
-                        target: "cc_drivers::msi",
-                        id = %candidate.id,
-                        "board found in per-LED mode; release() will restore the last good own lighting stored for it"
-                    );
-                    (good, None, true)
-                }
-                None => {
-                    if stored.is_some() {
-                        tracing::warn!(
-                            target: "cc_drivers::msi",
-                            id = %candidate.id,
-                            "stored own lighting is not a valid 185-byte configuration; ignoring it"
-                        );
-                    }
-                    tracing::warn!(
-                        target: "cc_drivers::msi",
-                        id = %candidate.id,
-                        "board was left in per-LED mode by another program; release() will restore that state"
-                    );
-                    (read, None, false)
-                }
+        let good = if unreleased {
+            let good = stored.and_then(ConfigPacket::from_own_lighting);
+            if good.is_none() && stored.is_some() {
+                tracing::warn!(
+                    target: "cc_drivers::msi",
+                    id = %candidate.id,
+                    "stored own lighting is not a valid 185-byte configuration; ignoring it"
+                );
             }
+            good
         } else {
-            let own = read.own_lighting();
-            (read, own, false)
+            if read.has_direct_effect() {
+                tracing::warn!(
+                    target: "cc_drivers::msi",
+                    id = %candidate.id,
+                    "board is in per-LED mode, driven by another program; an untouched release leaves it that way"
+                );
+            }
+            None
         };
+        let left_by_us = unreleased && good.is_none();
+        if left_by_us {
+            tracing::warn!(
+                target: "cc_drivers::msi",
+                id = %candidate.id,
+                "board shows a state CaseControl left and no own lighting is stored for it; release() restores that state"
+            );
+        }
+        let restore = good.is_some();
+        let original = good.unwrap_or(read);
 
         let config = listed.copied().unwrap_or(boards::DEFAULT_BOARD);
         let board = Board::new(board_id, config);
@@ -542,8 +551,27 @@ impl MysticLight185 {
             firmware: Some(firmware.display()),
         };
         let mut c = Self::assemble(dev, info, board, board_id, firmware, original);
-        c.own_lighting = own_lighting;
-        c.restore_pending = restore_pending;
+        c.left_by_us = left_by_us;
+        if restore {
+            match c.hand_back() {
+                Ok(()) => tracing::info!(
+                    target: "cc_drivers::msi",
+                    id = %c.desc.info.id,
+                    "board showed a state CaseControl left; restored the last good own lighting stored for it"
+                ),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cc_drivers::msi",
+                        id = %c.desc.info.id,
+                        error = %e,
+                        "restoring the stored own lighting at open failed; release() will try again"
+                    );
+                    c.restore_pending = true;
+                }
+            }
+            // Only the restore was sent: the board is not under software control.
+            c.touched = false;
+        }
         Ok(c)
     }
 
@@ -590,7 +618,7 @@ impl MysticLight185 {
             board_id,
             firmware,
             original,
-            own_lighting: None,
+            left_by_us: false,
             restore_pending: false,
             data,
             per_led: PerLedBuffers::new(),
@@ -603,7 +631,7 @@ impl MysticLight185 {
     }
 
     /// The configuration `release()` restores: the one read from the device at open, or the remembered own lighting
-    /// that replaced a per-LED readback (see [`open_with_stored`](Self::open_with_stored)).
+    /// restored at open (see [`open_with_stored`](Self::open_with_stored)).
     pub fn original_config(&self) -> &ConfigPacket {
         &self.original
     }
@@ -744,6 +772,27 @@ impl MysticLight185 {
         self.send(&next.with_save(save))
     }
 
+    /// The hand-back transition shared by `release()` and the restore at open: leave direct mode, read the current
+    /// configuration and send it back, then send `original` with save_data forced to 0 (the same two reports as a
+    /// hardware-mode update). If reading the current state fails, the original is still sent.
+    fn hand_back(&mut self) -> Result<(), DeviceError> {
+        self.direct = false;
+        self.direct_configured = false;
+        self.sync = protocol::sync_direct_mode(&self.data);
+        match read_config(self.dev.as_mut()) {
+            Ok(current) => {
+                if let Err(e) = self.send(&current.with_save(false)) {
+                    tracing::warn!(target: "cc_drivers::msi", error = %e, "release: resending current state failed");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "cc_drivers::msi", error = %e, "release: reading current state failed");
+            }
+        }
+        let original = self.original.with_save(false);
+        self.send(&original)
+    }
+
     fn check_zone(&self, zone: usize) -> Result<(), DeviceError> {
         if zone < self.desc.zones.len() {
             Ok(())
@@ -831,13 +880,19 @@ impl Controller for MysticLight185 {
         self.direct_configured = false;
         self.select_per_led_protocol()?;
 
-        // DeviceUpdateLEDs -> UpdateLed: for each zone with LEDs, SetMode and SetZoneColor with its first LED.
+        // DeviceUpdateLEDs -> UpdateLed: for each zone with LEDs, SetMode and SetZoneColor with its first LED. The
+        // off output (Static at brightness 0, ADR 0001 #38) also darkens headers sized 0, which may still have LEDs
+        // showing their previous effect.
+        let off = state.mode == u32::from(mode::STATIC) && brightness == protocol::brightness::OFF;
         let layout = self.board.layout;
         for (msi, zone) in self.board.config.zones.iter().zip(&self.desc.zones) {
-            if zone.len == 0 {
+            let color = if zone.len > 0 {
+                self.colors[zone.start]
+            } else if off {
+                Rgb::BLACK
+            } else {
                 continue;
-            }
-            let color = self.colors[zone.start];
+            };
             self.data
                 .apply_mode(&layout, *msi, effect, speed, brightness, random);
             self.data.apply_zone_color(&layout, *msi, color, color);
@@ -894,23 +949,7 @@ impl Controller for MysticLight185 {
         if !self.touched && !self.restore_pending {
             return Ok(());
         }
-        self.direct = false;
-        self.direct_configured = false;
-        self.sync = protocol::sync_direct_mode(&self.data);
-        // Same transition as a hardware-mode update, but the second report is the configuration read at open with
-        // save_data forced to 0. If reading the current state fails, the original is still sent.
-        match read_config(self.dev.as_mut()) {
-            Ok(current) => {
-                if let Err(e) = self.send(&current.with_save(false)) {
-                    tracing::warn!(target: "cc_drivers::msi", error = %e, "release: resending current state failed");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "cc_drivers::msi", error = %e, "release: reading current state failed");
-            }
-        }
-        let original = self.original.with_save(false);
-        self.send(&original)?;
+        self.hand_back()?;
         self.touched = false;
         self.restore_pending = false;
         Ok(())
@@ -921,9 +960,19 @@ impl Controller for MysticLight185 {
         hardware_state(&self.original, &self.board, &self.desc)
     }
 
-    /// The configuration read at open (save byte 0) when the board showed its own lighting then.
+    /// `original` (save byte 0) unless it is a state CaseControl left or has a zone in per-LED mode. When `original`
+    /// is the remembered own lighting restored at open, these are the bytes already stored.
     fn own_lighting(&self) -> Option<Vec<u8>> {
-        self.own_lighting.clone()
+        if self.left_by_us {
+            None
+        } else {
+            self.original.own_lighting()
+        }
+    }
+
+    /// `false` while `original` is a state CaseControl left, or while the restore at open is still pending.
+    fn shows_own_lighting(&self) -> bool {
+        !self.left_by_us && !self.restore_pending
     }
 
     /// Static at brightness 0: a hardware state, so brightness 0 does not switch the board to per-LED mode (whose
