@@ -4,7 +4,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{Access, Catalog, Category, DYNAMIC_LIGHTING_ENTRY, Entry, OPENRGB_ENTRY, Severity};
+use crate::autostart::{AutostartEntry, AutostartItem, AutostartSource, NoAutostart, file_name};
+use crate::catalog::{
+    Access, Catalog, Category, Class, DYNAMIC_LIGHTING_ENTRY, Entry, OPENRGB_ENTRY, Severity,
+};
 use crate::probe::OpenRgbProbe;
 use crate::sources::{
     DynamicLighting, FsPaths, Hive, InstalledApp, OpenRgbPortProbe, PathSource, ProcessInfo, ProcessSource,
@@ -30,6 +33,9 @@ pub enum Evidence {
         name: String,
         /// Full image path if readable.
         path: Option<String>,
+        /// Windows session of the process, `None` when unknown. Actions only end processes of the caller's session.
+        #[serde(default)]
+        session: Option<u32>,
     },
     /// A Win32 service matched `services`.
     Service {
@@ -100,6 +106,8 @@ pub struct Finding {
     pub vendor: String,
     /// Kind of software.
     pub category: Category,
+    /// Suite or vendor tool (decides whether it can appear in the start dialog).
+    pub class: Class,
     /// Severity from the catalog.
     pub severity: Severity,
     /// Whether the catalog names are verified.
@@ -117,6 +125,9 @@ pub struct Finding {
     pub installed: bool,
     /// Everything that matched.
     pub evidence: Vec<Evidence>,
+    /// How it starts with Windows: matched Run / RunOnce values and Startup folder items, and the start type of its
+    /// Win32 services.
+    pub autostart: Vec<AutostartItem>,
 }
 
 /// Result of one scan. A failing source adds a line to `errors`; the other sources still contribute findings.
@@ -136,6 +147,7 @@ pub struct Scanner {
     registry: Box<dyn RegistrySource + Send + Sync>,
     paths: Box<dyn PathSource + Send + Sync>,
     openrgb: Box<dyn OpenRgbPortProbe + Send + Sync>,
+    autostart: Box<dyn AutostartSource + Send + Sync>,
 }
 
 impl fmt::Debug for Scanner {
@@ -149,6 +161,7 @@ impl fmt::Debug for Scanner {
 impl Scanner {
     /// Creates a scanner over the given sources. Install paths are checked on the real file system and the
     /// OpenRGB probe is the real TCP probe; replace them with [`Scanner::with_paths`] / [`Scanner::with_openrgb_probe`].
+    /// No autostart entries are read until [`Scanner::with_autostart`] supplies a source.
     pub fn new(
         catalog: Catalog,
         processes: impl ProcessSource + Send + Sync + 'static,
@@ -162,7 +175,14 @@ impl Scanner {
             registry: Box::new(registry),
             paths: Box::new(FsPaths),
             openrgb: Box::new(OpenRgbProbe),
+            autostart: Box::new(NoAutostart),
         }
+    }
+
+    /// Replaces the autostart source.
+    pub fn with_autostart(mut self, autostart: impl AutostartSource + Send + Sync + 'static) -> Self {
+        self.autostart = Box::new(autostart);
+        self
     }
 
     /// Replaces the install-path resolver.
@@ -191,6 +211,8 @@ impl Scanner {
             collect("installed apps", self.registry.installed_apps(), &mut errors).unwrap_or_default();
         let lighting = collect("dynamic lighting", self.registry.dynamic_lighting(), &mut errors).flatten();
         let openrgb_port = opts.check_openrgb_port && self.openrgb.openrgb_listening();
+        let autostart =
+            collect("autostart", self.autostart.autostart_entries(), &mut errors).unwrap_or_default();
 
         let input = Input {
             processes: &processes,
@@ -199,6 +221,7 @@ impl Scanner {
             lighting: lighting.as_ref(),
             openrgb_port,
             paths: self.paths.as_ref(),
+            autostart: &autostart,
         };
         let mut findings: Vec<Finding> = self
             .catalog
@@ -211,6 +234,7 @@ impl Scanner {
             processes = processes.len(),
             services = services.len(),
             installed = installed.len(),
+            autostart = autostart.len(),
             findings = findings.len(),
             errors = errors.len(),
             "conflict scan finished"
@@ -237,6 +261,7 @@ struct Input<'a> {
     lighting: Option<&'a DynamicLighting>,
     openrgb_port: bool,
     paths: &'a (dyn PathSource + Send + Sync),
+    autostart: &'a [AutostartEntry],
 }
 
 fn push_unique(evidence: &mut Vec<Evidence>, item: Evidence) {
@@ -247,15 +272,17 @@ fn push_unique(evidence: &mut Vec<Evidence>, item: Evidence) {
 
 fn match_entry(entry: &Entry, input: &Input<'_>) -> Option<Finding> {
     let mut evidence = Vec::new();
+    let mut autostart = Vec::new();
 
     for p in input.processes {
-        if entry.processes.iter().any(|pat| glob_match(pat, &p.name)) {
+        if entry.matches_executable(&p.name, p.exe_path.as_deref()) {
             push_unique(
                 &mut evidence,
                 Evidence::Process {
                     pid: p.pid,
                     name: p.name.clone(),
                     path: p.exe_path.clone(),
+                    session: p.session_id,
                 },
             );
         }
@@ -267,14 +294,20 @@ fn match_entry(entry: &Entry, input: &Input<'_>) -> Option<Finding> {
                 .any(|pat| glob_match(pat, &s.name) || glob_match(pat, &s.display_name))
         };
         match s.kind {
-            ServiceKind::Win32 if matches(&entry.services) => push_unique(
-                &mut evidence,
-                Evidence::Service {
-                    name: s.name.clone(),
-                    state: s.state,
-                    kind: s.kind,
-                },
-            ),
+            ServiceKind::Win32 if matches(&entry.services) => {
+                push_unique(
+                    &mut evidence,
+                    Evidence::Service {
+                        name: s.name.clone(),
+                        state: s.state,
+                        kind: s.kind,
+                    },
+                );
+                let item = AutostartItem::service(&s.name, s.start_type);
+                if !autostart.contains(&item) {
+                    autostart.push(item);
+                }
+            }
             ServiceKind::Driver if matches(&entry.drivers) => push_unique(
                 &mut evidence,
                 Evidence::Driver {
@@ -321,8 +354,20 @@ fn match_entry(entry: &Entry, input: &Input<'_>) -> Option<Finding> {
     if input.openrgb_port && entry.id == OPENRGB_ENTRY {
         push_unique(&mut evidence, Evidence::OpenRgbPort);
     }
+    for item in input.autostart {
+        let matched = item
+            .executable
+            .as_deref()
+            .is_some_and(|exe| entry.matches_executable(file_name(exe), Some(exe)));
+        if matched {
+            let item = AutostartItem::from_entry(item);
+            if !autostart.contains(&item) {
+                autostart.push(item);
+            }
+        }
+    }
 
-    if evidence.is_empty() {
+    if evidence.is_empty() && autostart.is_empty() {
         return None;
     }
     Some(Finding {
@@ -330,14 +375,16 @@ fn match_entry(entry: &Entry, input: &Input<'_>) -> Option<Finding> {
         name: entry.name.clone(),
         vendor: entry.vendor.clone(),
         category: entry.category,
+        class: entry.class,
         severity: entry.severity,
         verified: entry.verified,
         access: entry.access.clone(),
         affects: entry.affects.clone(),
         note: entry.note.clone(),
         running: evidence.iter().any(|e| e.is_active(&entry.id)),
-        installed: evidence.iter().any(Evidence::is_install),
+        installed: !autostart.is_empty() || evidence.iter().any(Evidence::is_install),
         evidence,
+        autostart,
     })
 }
 
@@ -387,6 +434,7 @@ fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autostart::AutostartLocation;
     use crate::sources::{ScanError, StartType};
 
     #[test]
@@ -476,6 +524,7 @@ mod tests {
             pid,
             name: name.to_owned(),
             exe_path: None,
+            session_id: Some(1),
         }
     }
 
@@ -737,6 +786,186 @@ mod tests {
         assert!(report.errors[0].starts_with("services:"));
         assert!(find(&report, "fancontrol").running);
         assert!(report.findings.iter().all(|f| f.entry_id != "inpoutx64"));
+    }
+
+    struct FakeAutostart(Vec<AutostartEntry>);
+    impl AutostartSource for FakeAutostart {
+        fn autostart_entries(&self) -> Result<Vec<AutostartEntry>, ScanError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn run_entry(
+        location: AutostartLocation,
+        name: &str,
+        command: &str,
+        approved: Option<bool>,
+    ) -> AutostartEntry {
+        AutostartEntry {
+            location,
+            name: name.to_owned(),
+            command: command.to_owned(),
+            executable: crate::autostart::command_executable(command),
+            approved,
+        }
+    }
+
+    /// The development machine's autostart entries (2026-11-16) plus an OpenRGB Startup folder shortcut.
+    fn autostart() -> FakeAutostart {
+        use AutostartLocation::{CommonStartupFolder, HkcuRun, HklmRun};
+        FakeAutostart(vec![
+            run_entry(
+                HkcuRun,
+                "SignalRgb",
+                r#""C:\Users\max\AppData\Local\VortxEngine\SignalRgbLauncher.exe" --silent"#,
+                Some(false),
+            ),
+            run_entry(
+                HkcuRun,
+                "LGHUB",
+                r#""C:\Program Files\LGHUB\system_tray\lghub_system_tray.exe" --minimized"#,
+                None,
+            ),
+            run_entry(
+                HkcuRun,
+                "Discord",
+                r#""C:\Users\max\AppData\Local\Discord\Update.exe" --processStart Discord.exe"#,
+                Some(false),
+            ),
+            run_entry(
+                HklmRun,
+                "SteelSeriesGG",
+                r#""C:\Program Files\SteelSeries\GG\SteelSeriesGG.exe" -dataPath="C:\ProgramData\SteelSeries\GG""#,
+                Some(false),
+            ),
+            run_entry(
+                CommonStartupFolder,
+                "OpenRGB.lnk",
+                r#""C:\Program Files\OpenRGB\OpenRGB.exe" --startminimized"#,
+                Some(true),
+            ),
+        ])
+    }
+
+    #[test]
+    fn autostart_entries_attach_to_their_findings() {
+        use ServiceKind::Win32;
+        let services = FakeServices(vec![
+            ServiceInfo {
+                start_type: Some(StartType::Auto),
+                ..service("OpenRGB", Win32, ServiceState::Running)
+            },
+            ServiceInfo {
+                start_type: Some(StartType::Auto),
+                ..service("SignalRgb.Service", Win32, ServiceState::Stopped)
+            },
+        ]);
+        let report = Scanner::new(
+            Catalog::embedded(),
+            FakeProcesses(vec![]),
+            services,
+            FakeRegistry {
+                apps: vec![],
+                lighting: None,
+            },
+        )
+        .with_paths(NoPaths)
+        .with_autostart(autostart())
+        .scan(&ScanOptions::default());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+        let signal = find(&report, "signalrgb");
+        assert_eq!(signal.class, Class::Suite);
+        assert!(!signal.running);
+        assert!(signal.installed);
+        let run = signal
+            .autostart
+            .iter()
+            .find(|i| i.location == AutostartLocation::HkcuRun)
+            .expect("run entry");
+        assert_eq!(run.name, "SignalRgb");
+        assert!(!run.enabled, "switched off in StartupApproved");
+        assert!(run.toggleable && !run.needs_admin);
+        let svc = signal
+            .autostart
+            .iter()
+            .find(|i| i.location == AutostartLocation::Service)
+            .expect("service item");
+        assert!(svc.enabled && svc.needs_admin);
+        assert_eq!(svc.start_type, Some(StartType::Auto));
+
+        let ghub = find(&report, "logitech_g_hub");
+        assert_eq!(ghub.class, Class::VendorTool);
+        assert!(matches!(&ghub.autostart[..], [i] if i.name == "LGHUB" && i.enabled));
+
+        let openrgb = find(&report, OPENRGB_ENTRY);
+        assert!(openrgb.running, "service running");
+        let names: Vec<(&str, bool)> = openrgb
+            .autostart
+            .iter()
+            .map(|i| (i.name.as_str(), i.needs_admin))
+            .collect();
+        assert_eq!(names, [("OpenRGB", true), ("OpenRGB.lnk", true)]);
+
+        let gg = find(&report, "steelseries_gg");
+        assert!(matches!(&gg.autostart[..], [i] if !i.enabled && i.needs_admin));
+
+        // Nothing else matched Discord.
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.autostart.iter().all(|i| i.name != "Discord"))
+        );
+    }
+
+    #[test]
+    fn generic_process_names_need_their_path() {
+        let processes = FakeProcesses(vec![
+            process(1, "CMService.exe"),
+            ProcessInfo {
+                exe_path: Some(r"C:\Program Files\Razer\GameManagerService.exe".into()),
+                ..process(2, "GameManagerService.exe")
+            },
+        ]);
+        let report = Scanner::new(
+            Catalog::embedded(),
+            processes,
+            FakeServices(vec![]),
+            FakeRegistry {
+                apps: vec![],
+                lighting: None,
+            },
+        )
+        .with_paths(NoPaths)
+        .with_autostart(FakeAutostart(vec![run_entry(
+            AutostartLocation::HkcuRun,
+            "Other",
+            r#""C:\Tools\RunLed.exe""#,
+            None,
+        )]))
+        .scan(&ScanOptions::default());
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.entry_id != "coolermaster_masterplus")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.entry_id != "gigabyte_rgb_fusion")
+        );
+        let razer = find(&report, "razer_synapse");
+        assert!(matches!(
+            &razer.evidence[..],
+            [Evidence::Process {
+                pid: 2,
+                session: Some(1),
+                ..
+            }]
+        ));
     }
 
     #[test]

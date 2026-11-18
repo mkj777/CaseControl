@@ -1,8 +1,8 @@
 # CaseControl
 
-Private Windows tool that detects RGB-capable PC hardware and sets its colors, shows which other software competes
-for the same devices, and coexists with FanControl. Rust workspace plus a Tauri 2 desktop app (Vue 3). No ads, no
-telemetry, no network, no kernel driver, no admin rights.
+Windows tool that detects RGB-capable PC hardware and sets its colors, shows which other software competes for the
+same devices, and coexists with FanControl. Rust workspace plus a Tauri 2 desktop app (Vue 3). No ads, no
+telemetry, no kernel driver, no admin rights; the only network access is the signed auto-update from GitHub releases.
 
 Start with `docs/architecture.md`, then `docs/decisions/0001-project-decisions.md` and `docs/build-plan.md`.
 Research behind the design is in `docs/research/`. Worker briefs for each build phase are in `docs/briefs/`.
@@ -46,3 +46,10 @@ cargo run -p cc-nvapi --example dump_illum
 - `unsafe` lives only in `cc-hid`, `cc-nvapi` and the `sys` module of `cc-conflicts`, each block with a `// SAFETY:` comment.
 - No test opens a real device, loads NvAPI, terminates a process, stops a service or writes the registry.
 - Nothing reaches `main` without the CI workflow passing.
+
+## Licence and credits
+
+CaseControl is copyright Maximilian Kielholz and licensed under the GNU General Public License, version 2 or (at your
+option) any later version (`GPL-2.0-or-later`); the full text is in `LICENSE`. The device drivers are modified ports
+of [OpenRGB](https://gitlab.com/CalcProgrammer1/OpenRGB) (Adam Honse and contributors, GPL-2.0-or-later); the
+eyedropper icon follows Lucide's "pipette" (ISC). Details are in `NOTICE.md`.

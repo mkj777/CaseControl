@@ -1,64 +1,163 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
-import { appInfo, hideToTray, type AppInfo } from '../ipc'
+// Settings: startup, update rate, device detectors and information about this build. Every change is saved and
+// applied right away. The fallback colour of a takeover lives in the Lighting toolbar, and the OpenRGB port check has
+// no switch here; it keeps its stored value and default (ADR 0001 #37).
+import { computed, onMounted, ref } from 'vue'
+import {
+  appInfo,
+  errorText,
+  getSettings,
+  setSettings,
+  type AppInfo,
+  type SettingsPatch,
+  type SettingsView,
+} from '../ipc'
+import { Field, KeyValueList, Notice, NumberField, PageHeader, Slider, Switch } from '../components/ui'
+import { familyLabel } from '../lib/device'
 
+const settings = ref<SettingsView | null>(null)
 const info = ref<AppInfo | null>(null)
 const error = ref<string | null>(null)
+const saving = ref(false)
+const frameRate = ref(30)
+/** Controls are off while saving, or for the whole session when settings cannot be saved. */
+const locked = computed(() => saving.value || settings.value?.save_error != null)
 
 onMounted(async () => {
   try {
-    info.value = await appInfo()
+    const [s, i] = await Promise.all([getSettings(), appInfo()])
+    settings.value = s
+    frameRate.value = s.frame_rate
+    info.value = i
   } catch (e) {
-    error.value = String(e)
+    error.value = errorText(e)
   }
 })
 
-async function onHide() {
+async function patch(p: SettingsPatch) {
+  saving.value = true
+  error.value = null
   try {
-    await hideToTray()
+    settings.value = await setSettings(p)
+    frameRate.value = settings.value.frame_rate
   } catch (e) {
-    error.value = String(e)
+    error.value = errorText(e)
+    // Reload so the controls show what is actually stored.
+    try {
+      settings.value = await getSettings()
+      frameRate.value = settings.value.frame_rate
+    } catch {
+      // keep the error shown above
+    }
+  } finally {
+    saving.value = false
   }
+}
+
+/** Sends the frame rate once a drag ends or the number is committed (NumberField clamps it to 1 to 60). */
+function onFrameRate(fps: number) {
+  frameRate.value = fps
+  if (settings.value && fps !== settings.value.frame_rate) void patch({ frame_rate: fps })
 }
 </script>
 
 <template>
-  <section>
-    <h1>Settings</h1>
-    <p class="page-description">Startup behavior, tray options, and information about this build.</p>
+  <section class="page">
+    <PageHeader title="Settings" />
 
-    <dl v-if="info" class="info">
-      <dt>Name</dt>
-      <dd>{{ info.name }}</dd>
-      <dt>Version</dt>
-      <dd>{{ info.version }}</dd>
-      <dt>Build profile</dt>
-      <dd>{{ info.profile }}</dd>
-    </dl>
-    <p v-if="error" class="error">{{ error }}</p>
+    <Notice v-if="settings?.save_error" variant="error">{{ settings.save_error }}</Notice>
+    <Notice v-if="error && error !== settings?.save_error" variant="error">{{ error }}</Notice>
 
-    <button type="button" @click="onHide">Hide to tray</button>
+    <template v-if="settings">
+      <div class="group">
+        <h2>Startup</h2>
+        <Switch
+          :model-value="settings.autostart"
+          label="Start with Windows"
+          :disabled="locked"
+          @update:model-value="patch({ autostart: $event })"
+        />
+        <Switch
+          :model-value="settings.start_minimized"
+          label="Start minimized"
+          :disabled="locked"
+          @update:model-value="patch({ start_minimized: $event })"
+        />
+      </div>
+
+      <div class="group">
+        <h2>Updates</h2>
+        <Field
+          v-slot="{ id, describedBy }"
+          label="Frame rate"
+          hint="How often per second a device gets new colours while you edit, 1 to 60."
+          layout="stacked"
+        >
+          <Slider
+            v-model="frameRate"
+            class="rate"
+            :min="1"
+            :max="60"
+            aria-label="Frame rate"
+            :aria-describedby="describedBy"
+            :disabled="locked"
+            @change="onFrameRate"
+          />
+          <NumberField
+            :id="id"
+            :model-value="frameRate"
+            :min="1"
+            :max="60"
+            :aria-describedby="describedBy"
+            :disabled="locked"
+            @update:model-value="onFrameRate"
+          />
+        </Field>
+      </div>
+
+      <div class="group">
+        <h2>Device detectors</h2>
+        <Switch
+          v-for="(on, family) in settings.detectors"
+          :key="family"
+          :model-value="on"
+          :label="familyLabel(String(family))"
+          :disabled="locked"
+          @update:model-value="patch({ detectors: { [family]: $event } })"
+        />
+      </div>
+    </template>
+
+    <div class="group">
+      <h2>About</h2>
+      <KeyValueList v-if="info">
+        <dt>Name</dt>
+        <dd>{{ info.name }}</dd>
+        <dt>Version</dt>
+        <dd>{{ info.version }}</dd>
+        <dt>Build</dt>
+        <dd>{{ info.profile }}</dd>
+      </KeyValueList>
+    </div>
   </section>
 </template>
 
 <style scoped>
-.info {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: var(--space-2) var(--space-6);
-  margin: var(--space-8) 0;
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
 }
 
-.info dt {
-  color: var(--color-text-muted);
+.group + .group {
+  margin-top: var(--space-14);
 }
 
-.info dd {
-  margin: 0;
+.group h2 {
+  margin-bottom: 0;
 }
 
-.error {
-  margin: var(--space-6) 0;
-  color: var(--color-text-muted);
+.rate {
+  width: var(--control-max-width);
 }
 </style>

@@ -1,36 +1,6 @@
-/* Neutral first-pass theme (ADR 0001 #15): dark only, spacious, system fonts, no component library.
-   Colors and spacing live in custom properties so the visual direction can change in one place. */
-:root {
-  --color-bg: #121316;
-  --color-surface: #17181c;
-  --color-surface-raised: #1f2126;
-  --color-border: #2a2c32;
-  --color-text: #e6e7ea;
-  --color-text-muted: #9a9ca3;
-  --color-accent: #8ab4f8;
-
-  --space-1: 4px;
-  --space-2: 8px;
-  --space-3: 12px;
-  --space-4: 16px;
-  --space-6: 24px;
-  --space-8: 40px;
-
-  --radius: 8px;
-  --sidebar-width: 220px;
-
-  --font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-  --font-size: 15px;
-  --font-size-lg: 18px;
-  --font-size-xl: 28px;
-
-  color-scheme: dark;
-  font-family: var(--font-family);
-  font-size: var(--font-size);
-  line-height: 1.5;
-  color: var(--color-text);
-  background: var(--color-bg);
-}
+/* Base element styles and the few global rules (docs/design-system.md). Every value comes from tokens.css, which
+   main.ts imports first. Native elements look right without a class; the primitives in components/ui/ add structure,
+   variants and accessibility wiring on top. */
 
 *,
 *::before,
@@ -38,41 +8,190 @@
   box-sizing: border-box;
 }
 
+:root {
+  font-family: var(--font-sans);
+  font-size: var(--text-md);
+  line-height: var(--leading);
+  color: var(--text);
+  background: var(--bg);
+}
+
 body {
   margin: 0;
+  background: var(--bg);
+  /* A desktop tool: text is selectable only in fields (see the field rule below) and where `.selectable` says so. */
+  user-select: none;
+  cursor: default;
+}
+
+/* Text people copy into a search or a bug report (ADR 0001 #32): error and fault messages, device ids, conflict
+   evidence (paths, commands, service names). Error notices, inline errors and monospace key-value values get it
+   from their primitive; pages add the class to other such text. */
+.selectable {
+  user-select: text;
+  cursor: text;
 }
 
 h1 {
   margin: 0 0 var(--space-3);
-  font-size: var(--font-size-xl);
-  font-weight: 600;
+  font-size: var(--text-xl);
+  font-weight: var(--weight-strong);
+  line-height: var(--leading-tight);
+}
+
+h2 {
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-strong);
+  line-height: var(--leading-tight);
 }
 
 p {
   margin: 0;
 }
 
-.page-description {
-  max-width: 60ch;
-  color: var(--color-text-muted);
+ul,
+ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
 }
 
+a {
+  color: var(--text);
+}
+
+/* ---- Page frame -------------------------------------------------------------------------------------------------- */
+
+/* Text pages (Profiles, Conflicts, Settings) stop at 760 px; device pages are fluid to 1440 px (ADR 0001 #28, #30). */
+.page {
+  max-width: var(--page-max-text);
+}
+
+.page.wide {
+  max-width: var(--page-max-wide);
+}
+
+/* A section starts with an h2; sections are --space-14 apart. */
+.section {
+  margin-top: var(--space-14);
+}
+
+/* ---- The only global utilities ----------------------------------------------------------------------------------- */
+
+.muted {
+  color: var(--text-muted);
+}
+
+.small {
+  font-size: var(--text-sm);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+/* ---- Controls ---------------------------------------------------------------------------------------------------- */
+
+/* A plain button is the secondary button; Button adds the other variants and the small size. State rules sit in
+   :where() so any class on a button (a variant, a menu item, a swatch) overrides them without a specificity fight. */
 button {
-  padding: var(--space-2) var(--space-4);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: var(--control-height);
+  padding: 0 var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
   font: inherit;
-  color: var(--color-text);
-  background: var(--color-surface-raised);
+  white-space: nowrap;
+  color: var(--text);
+  background: var(--surface-raised);
   cursor: pointer;
+  transition:
+    color var(--transition),
+    border-color var(--transition),
+    background-color var(--transition);
 }
 
-button:hover {
-  border-color: var(--color-accent);
+button:where(:hover:not(:disabled)) {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
 }
 
-button:focus-visible,
-a:focus-visible {
-  outline: 2px solid var(--color-accent);
+button:where(:active:not(:disabled)) {
+  background: var(--surface-pressed);
+}
+
+button:where(:disabled) {
+  color: var(--text-disabled);
+  cursor: default;
+}
+
+/* Fields: a fill one step lighter than the surface and a subtle border; focus turns the border white (ADR 0001 #30). */
+input[type='text'],
+input[type='number'],
+select {
+  height: var(--control-height);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--field-border);
+  border-radius: var(--radius-md);
+  font: inherit;
+  color: var(--text);
+  background: var(--field-bg);
+  user-select: text;
+  transition: border-color var(--transition);
+}
+
+:where(input[type='text'], input[type='number'], select):hover:not(:disabled) {
+  border-color: var(--field-border-hover);
+}
+
+:where(input[type='text'], input[type='number'], select):focus {
+  border-color: var(--field-border-focus);
+}
+
+:where(input[type='text'], input[type='number'], select):disabled {
+  border-color: var(--border);
+  color: var(--text-disabled);
+  background: var(--surface);
+}
+
+:where(input, select)[aria-invalid='true'] {
+  border-color: var(--error);
+}
+
+input::placeholder {
+  color: var(--text-faint);
+}
+
+input[type='number'] {
+  font-variant-numeric: tabular-nums;
+}
+
+input[type='range'] {
+  accent-color: var(--accent);
+}
+
+/* Kept for "select several items in a list"; settings use Switch. */
+input[type='checkbox'] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+/* ---- Focus and scrollbars ---------------------------------------------------------------------------------------- */
+
+/* Every interactive element; never removed without a replacement. */
+:focus-visible {
+  outline: 2px solid var(--focus);
   outline-offset: 2px;
+}
+
+* {
+  scrollbar-color: var(--border-strong) transparent;
 }

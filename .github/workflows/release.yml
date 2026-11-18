@@ -1,0 +1,119 @@
+name: release
+
+# Builds, signs and publishes a release when a version tag (v1.2.3) is pushed. See docs/releasing.md.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Fails fast when the tag does not match the version in tauri.conf.json, the workspace Cargo.toml and package.json.
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check tag against app versions
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          want="${TAG#v}"
+          conf=$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)
+          pkg=$(jq -r .version apps/desktop/package.json)
+          cargo=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          echo "tag=$want tauri.conf.json=$conf Cargo.toml=$cargo package.json=$pkg"
+          if [ "$conf" != "$want" ] || [ "$cargo" != "$want" ] || [ "$pkg" != "$want" ]; then
+            echo "::error::tag $TAG does not match the app versions (tauri.conf.json $conf, Cargo.toml $cargo, package.json $pkg)"
+            exit 1
+          fi
+
+  # Same checks as every PR and push to main.
+  checks:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: checks
+    runs-on: windows-latest
+    # The only job that can write: it creates the GitHub release and uploads the assets.
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Release notes = the annotated tag's message (falls back to a one-liner for a lightweight tag).
+      - name: Read tag message
+        id: notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ref=$(gh api "repos/$REPO/git/ref/tags/$TAG")
+          if [ "$(jq -r .object.type <<<"$ref")" = "tag" ]; then
+            body=$(gh api "repos/$REPO/git/tags/$(jq -r .object.sha <<<"$ref")" --jq .message | sed '/-----BEGIN PGP SIGNATURE-----/,$d')
+          else
+            body="CaseControl $TAG"
+          fi
+          delimiter="EOF_$(openssl rand -hex 16)"
+          { echo "body<<$delimiter"; echo "$body"; echo "$delimiter"; } >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: apps/desktop/package.json
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: apps/desktop/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, pinned 2026-11-06
+        with:
+          toolchain: stable
+
+      # No cache here: a release is built from a clean state.
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      # Runs `pnpm tauri build` (which runs `pnpm build` first), signs the updater artifacts with the key from the
+      # secrets, creates the release for this tag (published, not a draft) and uploads the NSIS installer, its .sig
+      # and latest.json (the updater endpoint).
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tauriScript: pnpm tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: CaseControl ${{ github.ref_name }}
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          uploadUpdaterSignatures: true
+          retryAttempts: 1
