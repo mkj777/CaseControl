@@ -40,6 +40,9 @@
     "allow-close-program",
     "allow-get-settings",
     "allow-set-settings",
-    "allow-set-default-color"
+    "allow-set-default-color",
+    "allow-update-status",
+    "allow-check-for-updates",
+    "allow-install-update"
   ]
 }

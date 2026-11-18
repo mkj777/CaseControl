@@ -200,18 +200,18 @@ unless noted.
   a toolbar (the Lighting overview) has no visible title. The h1 stays as a visually hidden heading, so the page
   keeps its accessible name, and the toolbar row is the first thing on the page (no gap above it).
 - **Toolbar row:** a page with page-wide lighting controls (slot `controls`) gets one toolbar row under the title
-  (`--space-6` above it, none with a hidden title): the lighting controls grouped on the left, the view actions
-  grouped on the right in the same row instead of next to the title. Gap `--space-4` inside a group, `--space-6`
-  between the groups. The brightness slider is the flexible part: it is `--toolbar-control-width` (200 px) when
-  there is room and shrinks to `--toolbar-control-min-width` (80 px) before anything wraps; only then do the view
-  actions move to a second row (left aligned). The Lighting page (ADR #37): Take over all, the fallback colour
-  button, the help "?" (IconButton in a Tooltip), All brightness, Release all | Show hidden, Rescan. Its lighting
-  group measures about 585 px at its narrowest and the view group about 255 px, so the whole toolbar is one row
-  from about 1200 px window width and the view actions take a second row below that (the default 1100 px
-  included). With `wrapControls` (Lighting only), below 964 px window width (content under 680 px; a media query,
-  since custom properties cannot be used there) the lighting group takes the first row on its own and its
-  controls wrap, so at the 860 px minimum (576 px content) nothing runs past the edge. A device page: Brightness |
-  Show hidden.
+  (`--space-6` above it, none with a hidden title): the `controls` group on the left, the `actions` group on the
+  right in the same row instead of next to the title. Gap `--space-4` inside a group, `--space-6` between the
+  groups. One group is flexible and holds the brightness slider: it is `--toolbar-control-width` (200 px) when there
+  is room and shrinks to `--toolbar-control-min-width` (80 px) before anything wraps; only then does the right group
+  move to a second row. By default the left group is the flexible one (a device page: Brightness | Show hidden; the
+  view actions on a second row are left aligned). The Lighting page (ADR #41) sets `flexActions`: left, the profile
+  dropdown, the takeover button (Take over all / Release all), Show hidden and Rescan at their own widths; right, All
+  brightness, the fallback colour button and the help "?" (IconButton in a Tooltip), kept at the right edge, also on
+  a second row of their own. The colour popover and the tooltip open with `align="end"`, so they stay inside the
+  page. With `wrapControls` (Lighting only), below 964 px window width (content under 680 px; a media query, since
+  custom properties cannot be used there) the left group takes the first row on its own and its controls wrap, so
+  at the 860 px minimum (576 px content) nothing runs past the edge.
 - **Variants:** list page (title, optional description, actions), detail page (back link, title, status badge).
   There is no metadata line under the title; facts such as kind and vendor go into the page's key-value list.
 - **Rules:** at most two actions, secondary style (Rescan, Scan, the compact Show hidden switch). The primary
@@ -264,12 +264,14 @@ unless noted.
 
 ### Tooltip
 
-- **Anatomy** (`components/ui/Tooltip.vue`, ADR #37): a box below the trigger, `--space-2` gap, left aligned to it:
+- **Anatomy** (`components/ui/Tooltip.vue`, ADR #37): a box below the trigger, `--space-2` gap, left aligned to it
+  (with `align="end"` right aligned, for a trigger at the right end of a row, so it never runs past the page edge):
   `--text-sm` `--text` on `--surface-raised`, 1 px `--border-strong`, `--radius-md`, `--shadow-overlay`, padding
   `--space-2` `--space-3`, up to `--tooltip-max-width` (280 px), `--z-menu`. Text only.
 - **In code:** prop `text`; the default slot is the trigger and gets `describedBy`, the tooltip's id, for its
-  `aria-describedby`. The tooltip has `role="tooltip"` and stays in the DOM while hidden (`visibility`), so screen
-  readers read it with the trigger.
+  `aria-describedby`; `align` (`start` default, `end`). The tooltip has `role="tooltip"` and stays in the DOM
+  while hidden (`display: none`, so a hidden tooltip never widens the page or adds a scrollbar), so screen readers
+  read it with the trigger.
 - **Behaviour:** shows on hover and on keyboard focus (`:focus-visible`, not after a click), stays while the
   pointer is on the trigger or the tooltip (the gap belongs to the tooltip), Escape hides it (WCAG 1.4.13). No
   delay and no animation.
@@ -282,8 +284,9 @@ unless noted.
   colour, 1 px `--led-border` (hover `--text-muted`), like a swatch. While its popover is open it has the selection
   outline (2 px `--selection`, 2 px offset). Below it a popover with a ColorPicker: `--surface`, 1 px
   `--border-strong`, `--radius-md`, `--shadow-overlay`, padding `--space-4`, width `--popover-width` (320 px: the
-  swatches in rows of six and five), `--space-2` below the circle, `--z-menu`.
-- **In code:** props `modelValue`, `label` (the accessible name of the circle and the popover), `disabled`; emits
+  swatches in rows of six and five), `--space-2` below the circle, `--z-menu`, left aligned to the circle (with
+  `align="end"` right aligned, for a circle at the right end of a row).
+- **In code:** props `modelValue`, `label` (the accessible name of the circle and the popover), `disabled`, `align`; emits
   the picker's `update:modelValue` (live while dragging) and `change` (final value of a gesture).
 - **Behaviour:** the circle toggles the popover (`aria-haspopup="dialog"`, `aria-expanded`). On open, focus moves
   to the current swatch (else the first). The popover is non-modal: Escape closes it and returns focus to the
@@ -566,22 +569,25 @@ The preview is the focus of the app (ADR #15), so it gets the most room and the 
   own colours or unknown LEDs. Every control stays usable and takes the device over.
 - **Off** (ADR #35): brightness 0 (a device's Brightness or All brightness) turns lights off;
   the device stays Active.
-- **Take over all / Release all** (Lighting toolbar, secondary buttons; Take over all was "Connect all" before
-  ADR #37): Release all hands every device back, is disabled while no device is Active, and confirms with a toast
-  ("N devices released"). While it runs it reads "Releasing…" and All brightness and Take over all are disabled.
-  Take over all takes every released, visible, non-faulted device over with the same rules as brightness (ADR #36):
-  last setting, else its own mode as read back, else the fallback colour (white unless changed) on every LED, or,
-  without a direct mode, in its first mode that takes a colour; it is disabled when every such device is already
-  Active.
-- **Fallback colour** (Lighting toolbar, ADR #37; the `default_color` setting, called "Default colour" before): a
-  Colour button "Fallback colour" next to Take over all, followed by the help "?" whose Tooltip reads "Take over
-  all gives CaseControl control of every device. A device with nothing else selected shows this colour." It only
+- **Take over all / Release all** (Lighting toolbar, one secondary button, ADR #41; Take over all was "Connect
+  all" before ADR #37): the button reads "Take over all" while a released, visible device can still be taken over,
+  otherwise "Release all"; a running action keeps its label until it ends, and the button keeps the width of its
+  longest label (all labels share one grid cell, only the current one is visible). Take over all takes every
+  released, visible, non-faulted device over with the same rules as brightness (ADR #36): last setting, else its own
+  mode as read back, else the fallback colour (white unless changed) on every LED, or, without a direct mode, in its
+  first mode that takes a colour. Release all hands every device back, is disabled while no device is Active, and
+  confirms with a toast ("N devices released"); while it runs the button reads "Releasing…" and All brightness is
+  disabled.
+- **Fallback colour** (Lighting toolbar, ADR #37, #41; the `default_color` setting, called "Default colour" before): a
+  Colour button "Fallback colour" right of All brightness at the right end of the toolbar, followed by the help "?"
+  whose Tooltip reads "Take over all gives CaseControl control of every device. A device with nothing else selected
+  shows this colour." Both open towards the left (`align="end"`). It only
   feeds later takeovers; changing it does not repaint devices that are already driven. Like a brightness slider it
   goes live while dragging and is saved once with the final value (ColorPicker's `change` event: end of a drag, a
   click, a key step or a hex entry). Its errors are its own Notice, so a colour change clears only those. Disabled
   while a rescan runs, until the settings are loaded, and for the session when settings cannot be saved.
 - **Rescan busy** (Lighting): while a rescan runs the Rescan button reads "Scanning…" and is disabled, the toolbar
-  controls (Take over all, Fallback colour, All brightness, Release all, Show hidden) are disabled (the help "?"
+  controls (the takeover button, Fallback colour, All brightness, Show hidden) are disabled (the help "?"
   stays usable), and the tile grid is dimmed to
   50 % opacity (the disabled look of Switch and ColorPicker) and `inert` (no clicks, focus or context menu). The
   page section carries `aria-busy` while it runs.

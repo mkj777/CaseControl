@@ -34,6 +34,9 @@ const COMMANDS: &[&str] = &[
     "get_settings",
     "set_settings",
     "set_default_color",
+    "update_status",
+    "check_for_updates",
+    "install_update",
 ];
 
 fn main() {

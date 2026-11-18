@@ -3,10 +3,11 @@
 // #37). The default slot is the trigger and receives `describedBy`, the id of the tooltip text, for its
 // `aria-describedby`; the text is always in the DOM, so screen readers read it with the trigger. It opens below the
 // trigger, stays open while the pointer is over the trigger or the tooltip, and Escape closes it (WCAG 1.4.13).
-// Text only, no interactive content.
+// Text only, no interactive content. `align="end"` lines the text up with the trigger's right edge, for a trigger at the
+// right end of a row. While closed the text takes no space (`display: none`), so it never widens the page.
 import { ref, useId } from 'vue'
 
-defineProps<{ text: string }>()
+withDefaults(defineProps<{ text: string; align?: 'start' | 'end' }>(), { align: 'start' })
 
 const id = useId()
 const open = ref(false)
@@ -50,7 +51,7 @@ function onKey(e: KeyboardEvent) {
     @keydown="onKey"
   >
     <slot :describedBy="id" />
-    <span :id="id" role="tooltip" class="tooltip" :class="{ open }">
+    <span :id="id" role="tooltip" class="tooltip" :class="{ open, end: align === 'end' }">
       <span class="box">{{ text }}</span>
     </span>
   </span>
@@ -63,19 +64,24 @@ function onKey(e: KeyboardEvent) {
 }
 
 /* The outer span reaches up to the trigger (its top padding is the gap), so moving the pointer from the trigger
-   onto the text does not close it. Hidden with `visibility` (no pointer events, no layout shift);
-   aria-describedby still reads hidden text. */
+   onto the text does not close it. Hidden with `display: none` (no pointer events, no box that could add to the
+   page's scroll width); aria-describedby still reads hidden text. */
 .tooltip {
   position: absolute;
   top: 100%;
   left: 0;
   z-index: var(--z-menu);
+  display: none;
   padding-top: var(--space-2);
-  visibility: hidden;
+}
+
+.tooltip.end {
+  right: 0;
+  left: auto;
 }
 
 .tooltip.open {
-  visibility: visible;
+  display: block;
 }
 
 .box {

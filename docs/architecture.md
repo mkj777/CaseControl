@@ -169,6 +169,17 @@ re-plug of the device while the app runs (hot-plug, profile re-association by `D
   brightness scales them as usual. A takeover with the default colour drives them at full white, so only brightness
   matters. The device view hides colour picker and LED selection for a device whose LEDs are all brightness-only
   (`DeviceDescription::is_brightness_only`) and draws them as white at the output intensity.
+  Per-LED white levels (ADR 0001 #41): instead of colour controls, the device view shows one level slider (0-100 %)
+  per visible brightness-only LED (labelled with the zone name, plus the LED name in a zone with several LEDs), also
+  for the brightness-only zones of a mixed device. A level is stored as a grey in the direct colours
+  (`Rgb::white_level(p)` = `round(p * 255 / 100)` per channel; read back with `Rgb::level_percent`; the frontend
+  mirrors both in `lib/color.ts`), so it goes through `set_direct` into the `DeviceSetting::Direct` of the active
+  profile like any colour edit and survives restarts. The device brightness (and master brightness) scale these greys
+  as usual. The NVIDIA Illumination driver writes each zone's own brightness from its LED's intensity
+  (`round(intensity * 100 / 255)`: direct colours always use the full mode brightness; only a "Direct" mode state
+  sent with `set_mode` carries its own brightness, for that write only, so a takeover with the readback at 60 % does
+  not cap later levels), so a level of p % reaches that zone as exactly p % at full device brightness; zones are
+  independent in the `SetControl` struct (tested through the mock `IllumApi`).
 - Takeover (ADR 0001 #33, #35, #36, #37): brightness changes (device and master) and Take over all (`connect_all`)
   take over a released, non-hidden, non-faulted device in this order: its stored setting, else the mode its driver
   read back (`DeviceView::hardware`), else the default colour (`Settings::default_color`, "Fallback colour" in the
@@ -327,7 +338,8 @@ Profiles (ADR 0001 #24, #33, #40):
 - Commands: `list_devices`, `set_direct`, `set_zone`, `set_mode`, `resize_zone`, `save_to_hardware`, `release_device`,
   `release_all`, `connect_all`, `set_device_brightness`, `set_master_brightness`, `rescan`, `set_device_hidden`, `set_zone_hidden`, `list_profiles/apply_profile/
   create_profile/duplicate_profile/rename_profile/delete_profile`, `scan_conflicts`, `startup_conflicts`, `resolve_conflicts`, `close_program`,
-  `set_autostart`, `set_dont_ask`, `get_settings/set_settings`, `set_default_color`. Shapes that changed with ADR 0001
+  `set_autostart`, `set_dont_ask`, `get_settings/set_settings`, `set_default_color`, `update_status`,
+  `check_for_updates`, `install_update` (see Updates). Shapes that changed with ADR 0001
   #36: `release_all`
   returns `{ released: number, failed: { id, error }[] }` (the frontend shows "N devices released" when `released`
   is above 0); `get_settings` / `set_settings` carry `default_color` (`"#RRGGBB"`) in the view and the patch;
@@ -340,7 +352,7 @@ Profiles (ADR 0001 #24, #33, #40):
   `device-removed` (`{ id }`), `device-faulted` (`{ id, error }`), `device-state-changed`
   (`{ id, active, state: ModeState | null }`: `active` is whether CaseControl drives the device now, `state` the
   hardware mode it was switched to when that was the change), `devices-changed` (no payload), `profiles-changed`,
-  `conflicts-updated`, `startup-conflicts`.
+  `conflicts-updated`, `startup-conflicts`, `update-status` (`UpdateView`, see Updates).
 - Conflicts at start (ADR 0001 #31): after setup (also with `--hidden`) a background thread scans; device control is
   already running. RGB suites that affect a detected, non-hidden device, are not in `conflicts.dont_ask` and have
   something to close or an autostart item that is on form the start dialog model. If it is not empty the window is
@@ -353,10 +365,20 @@ Profiles (ADR 0001 #24, #33, #40):
 - Frontend: Vue 3 + TS + Vite, pnpm, `@tauri-apps/api`. English UI. Pages: Lighting (the devices overview,
   `/lighting`; called Devices until ADR 0001 #37), Conflicts, Settings. Profiles are picked and managed in a
   dropdown in the Lighting toolbar (ADR 0001 #40); the Profiles page is gone.
+  Lighting toolbar (ADR 0001 #41): on the left (PageHeader slot `controls`) the profile dropdown, one takeover
+  button, Show hidden and Rescan; on the right (slot `actions`) All brightness, then the fallback colour circle with
+  its "?" tooltip. The takeover button reads "Take over all" (runs `connect_all`) while a released, non-hidden device
+  can still be taken over (its `takeover` is not null), otherwise "Release all" (runs `release_all`, toast "N devices
+  released", "Releasing…" while it runs, disabled while no device is Active); a running action keeps its label until
+  it ends, and all labels share one grid cell so the button keeps the width of the longest. The right group is the
+  flexible one (PageHeader `flexActions`): All brightness shrinks to its minimum before anything wraps, then the
+  right group moves to a second row (kept at the right edge); below 964 px window width the left group takes the
+  first row on its own and wraps. The colour popover and the "?" tooltip open right aligned (`align="end"`), and a
+  closed tooltip takes no space, so nothing runs past the page edge.
   Visual direction: dark and spacious, few large elements, device preview in focus (ADR 0001 #15); components from
   the design system (`docs/design-system.md`, ADR 0001 #30).
 
-## Updates (`apps/desktop/src-tauri/src/updater.rs`, ADR 0001 #39)
+## Updates (`apps/desktop/src-tauri/src/updater.rs`, ADR 0001 #39, #41)
 
 The app's only network access. Release builds only; debug builds never check, download or install.
 
@@ -370,14 +392,42 @@ The app's only network access. Release builds only; debug builds never check, do
   `latest.json`, both written via rename, the JSON last). The same version is not downloaded twice; a newer one
   replaces it.
 - Install: on an explicit quit after the devices are released (`shutdown()` for tray Quit, the `quit` command and
-  `--quit`; not on `RunEvent::Exit`, which also fires on logoff/shutdown where Windows may kill the installer) without restarting the app, and in the setup hook on
-  the next start, before the engine opens any device, with a restart (the installer starts the new version with the
-  same arguments, e.g. `--hidden`). Before installing, the stored installer is verified again against the stored
-  manifest (`Updater::restore_update` + `Update::verify`); a stale (not newer) or invalid one is deleted. The pending
-  files are deleted before the installer starts, so a failing installer cannot cause a start/install loop. On
-  success the plugin ends the process (`std::process::exit` after `ShellExecuteW`), after Tauri's exit cleanup.
-- Nothing is shown to the user: every step is logged; failures (offline, GitHub down, bad signature) are retried
-  at the next interval. No setting, no UI in 0.1.0.
+  `--quit`; not on `RunEvent::Exit`, which also fires on logoff/shutdown where Windows may kill the installer) without
+  restarting the app (`Restart::No`), and in the setup hook on the next start, before the engine opens any device,
+  with a restart with the same arguments (`Restart::SameArgs`, e.g. `--hidden`). Before installing, the stored
+  installer is verified again against the stored manifest (`Updater::restore_update` + `Update::verify`); a stale
+  (not newer) or invalid one is deleted. The pending files stay until the installer really launched (on success the
+  plugin ends the process with `std::process::exit` after `ShellExecuteW`, after Tauri's exit cleanup); before the
+  start they are marked (`pending.attempted`), so an update whose installer ran without installing it is removed the
+  next time instead of started again (no start/install loop), and an installer that cannot be started removes them
+  at once.
+- Every step is logged; failures (offline, GitHub down, bad signature) are retried at the next interval. No dialog.
+- Settings, About group (ADR 0001 #41): next to Name, Version and Build an "Updates" row with the status line, then
+  "Check for updates" and "Update now" (no heading of their own; the "Updates" heading above it is the frame rate
+  group, as before). The status is an `UpdateView { status, pending, seq }` (`status`: `disabled {reason} | idle |
+  checking | up_to_date | downloading {version} | ready {version} | installing {version} | failed {error}`, tagged
+  by `state`; `pending`: the downloaded version waiting to be installed; `seq`: grows with every status change, the
+  page keeps the view with the highest one, so a command reply cannot roll back a newer event). `ready` is never
+  stored: `Updater::view` derives it from the pending store whenever nothing runs (stored idle or up to date), so it
+  cannot outlive the update. `update_status` reads it on mount; every change is emitted as `update-status`. The
+  disabled reason ("Updates are only available in installed builds") comes from the backend and is the status line
+  and the check button's tooltip.
+- "Check for updates" (`check_for_updates`) runs `Updater::check_once` now: the same check, download, signature
+  check and `PendingStore` as the background thread. One running flag covers the background check, the button and
+  Update now, so a check already running is not started twice (`CheckOutcome::AlreadyRunning`; the command then
+  resolves at once with the current status).
+- "Update now" (`install_update`, enabled only while `pending` is set and nothing runs) runs
+  `install_update_now` on the main thread, like tray Quit and the `quit` command. It claims the exit (one flag for
+  every explicit exit path: a tray Quit or `--quit` meanwhile is ignored, and Update now is refused while another
+  exit runs), then `Updater::install_now` verifies the pending update and only then writes a pending profile change,
+  releases every device through `AppState::shutdown_engine`, runs Tauri's exit cleanup and starts the quiet NSIS
+  installer with `Restart::WithArgs(update_now_args)`: the current arguments without `--hidden` and `--quit`, so an
+  autostarted (hidden) instance comes back with its window. The plugin's own restart can only pass this process's
+  arguments, so it is off and the NSIS restart flags (`/R /ARGS ...`, escaped like the plugin does) are passed as
+  installer arguments. If the installer cannot be started after the release, CaseControl starts itself again with
+  the same filtered arguments (the single-instance lock is already released by the exit cleanup) and exits, so it
+  comes back with its devices. A stale or invalid pending update, a running check or a missing update change
+  nothing (the exit claim is given back) and the command rejects with the reason; debug builds reject too.
 - The decisions live in `Updater<B: UpdateBackend>`; tests use a scripted backend and a temporary store.
 
 ## Testing

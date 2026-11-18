@@ -22,6 +22,9 @@ pub const CONFLICTS_UPDATED: &str = "conflicts-updated";
 /// The start-up check found programs to ask about (sent once per start, after the window was shown); payload:
 /// `StartupConflicts` (non-empty). The frontend can also call `startup_conflicts`.
 pub const STARTUP_CONFLICTS: &str = "startup-conflicts";
+/// The updater's status changed (checking, downloading, ready, installing, failed); payload: `UpdateView`. The
+/// frontend reads the current one with `update_status` (ADR 0001 #41).
+pub const UPDATE_STATUS: &str = "update-status";
 
 /// The Tauri event name and payload for an engine event.
 pub fn engine_event(ev: &EngineEvent) -> (&'static str, Value) {

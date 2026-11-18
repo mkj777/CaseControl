@@ -37,6 +37,25 @@ impl Rgb {
         let rg = if self.r > self.g { self.r } else { self.g };
         if rg > self.b { rg } else { self.b }
     }
+
+    /// The grey that stores a brightness-only LED's level of `percent` (0-100, higher counts as 100) as a colour:
+    /// `round(percent * 255 / 100)` on every channel (ADR 0001 #41). Its [`intensity`](Self::intensity) maps back to
+    /// the same percent ([`level_percent`](Self::level_percent)), and a driver that scales its brightness by the
+    /// intensity (NVIDIA Illumination: `round(intensity * brightness / 255)`) writes exactly `percent` at full
+    /// brightness.
+    pub const fn white_level(percent: u8) -> Self {
+        let p = if percent > 100 { 100 } else { percent as u16 };
+        // Fits a u8: at most (100 * 255 + 50) / 100 = 255.
+        let v = ((p * 255 + 50) / 100) as u8;
+        Self::new(v, v, v)
+    }
+
+    /// The level in percent (0-100) a brightness-only LED shows for this colour: its
+    /// [`intensity`](Self::intensity) as `round(intensity * 100 / 255)`. Inverse of [`white_level`](Self::white_level).
+    pub const fn level_percent(self) -> u8 {
+        // Fits a u8: at most (255 * 100 + 127) / 255 = 100.
+        ((self.intensity() as u16 * 100 + 127) / 255) as u8
+    }
 }
 
 impl From<[u8; 3]> for Rgb {
@@ -124,6 +143,23 @@ mod tests {
         assert_eq!(Rgb::new(255, 0, 0).intensity(), 255);
         assert_eq!(Rgb::new(1, 9, 3).intensity(), 9);
         assert_eq!(Rgb::new(1, 2, 30).intensity(), 30);
+    }
+
+    #[test]
+    fn white_level_round_trips_every_percent() {
+        assert_eq!(Rgb::white_level(0), Rgb::BLACK);
+        assert_eq!(Rgb::white_level(100), Rgb::WHITE);
+        // 50 * 2.55 = 127.5 -> 128; 1 * 2.55 = 2.55 -> 3; 33 * 2.55 = 84.15 -> 84.
+        assert_eq!(Rgb::white_level(50), Rgb::new(128, 128, 128));
+        assert_eq!(Rgb::white_level(1), Rgb::new(3, 3, 3));
+        assert_eq!(Rgb::white_level(33), Rgb::new(84, 84, 84));
+        assert_eq!(Rgb::white_level(255), Rgb::WHITE, "above 100 counts as 100");
+        for p in 0..=100 {
+            assert_eq!(Rgb::white_level(p).level_percent(), p, "{p} %");
+        }
+        // A colour counts as its highest channel.
+        assert_eq!(Rgb::new(255, 0, 0).level_percent(), 100);
+        assert_eq!(Rgb::new(0, 0, 128).level_percent(), 50);
     }
 
     fn parse(s: &str) -> Rgb {

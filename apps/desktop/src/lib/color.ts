@@ -29,6 +29,22 @@ export const SWATCHES: readonly { name: string; hex: string }[] = [
   { name: 'Off', hex: BLACK },
 ]
 
+/** The grey that stores a brightness-only LED's level of `percent` (0-100) as a colour; mirrors `Rgb::white_level`
+ * in `cc-core` (`round(percent * 255 / 100)` per channel), so the driver writes exactly `percent` (ADR 0001 #41). */
+export function whiteLevel(percent: number): string {
+  const p = Math.min(100, Math.max(0, Math.round(percent)))
+  const v = Math.floor((p * 255 + 50) / 100)
+  return toHex({ r: v, g: v, b: v })
+}
+
+/** The level in percent a brightness-only LED shows for `hex`: its highest channel as `round(max * 100 / 255)`;
+ * mirrors `Rgb::level_percent` in `cc-core`. */
+export function levelOf(hex: string): number {
+  const rgb = parseHex(hex)
+  if (!rgb) return 0
+  return Math.floor((Math.max(rgb.r, rgb.g, rgb.b) * 100 + 127) / 255)
+}
+
 /** Parses `#RRGGBB`, `#RGB`, `RRGGBB` or `RGB` (case-insensitive); `null` if invalid. */
 export function parseHex(input: string): RgbTriple | null {
   let s = input.trim()
