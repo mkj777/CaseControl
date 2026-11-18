@@ -26,10 +26,8 @@ use crate::hidden::{
     HiddenEntry, hidden_device_error, hidden_devices, hidden_view, hidden_zone_map, hidden_zones,
     is_device_hidden, zone_write,
 };
-use crate::prefs::{
-    SettingsPatch, SettingsView, apply_patch, clear_brightness_overrides, record_brightness, record_zone_size,
-};
-use crate::profiles::{clears_last, last_after_rename, same_name};
+use crate::prefs::{SettingsPatch, SettingsView, apply_patch, record_zone_size};
+use crate::profiles::{ProfileList, duplicate_name, last_after_rename, next_profile_name, plan_delete};
 use crate::startup::{
     CloseTarget, ResolveRequest, StartupConflicts, plan_autostart, plan_close, plan_resolve,
 };
@@ -157,32 +155,20 @@ pub fn profiles_changed<R: Runtime>(app: &AppHandle<R>, state: &AppState) {
     }
 }
 
-/// Applies profile `name` with its device brightness and records it as `last_profile`; device brightness changes made
-/// since the previous apply are dropped (ADR 0001 #33).
+/// Switches to profile `name` (ADR 0001 #40): saves a pending change of the active profile, applies `name` with its
+/// device brightness (connected devices it has nothing for fall back to their own mode, else the fallback colour) and
+/// makes it active.
 pub fn apply_profile_now<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
     name: &str,
 ) -> Result<ApplyReport, String> {
-    let engine = state.engine()?;
-    let profile = state.storage()?.profiles.load(name).map_err(err_string)?;
-    engine.replace_brightness(profile.brightness.clone());
-    let report = state.apply_visible(engine, &profile);
-    tracing::info!(
-        profile = %profile.name,
-        applied = report.applied.len(),
-        missing = report.missing.len(),
-        failed = report.failed.len(),
-        "profile applied"
-    );
-    let saved = state.update_settings(|s| {
-        s.last_profile = Some(profile.name.clone());
-        clear_brightness_overrides(s);
-        Ok(())
-    });
+    let lock = state.profile_lock();
+    state.flush_profile_locked(&lock);
+    let result = state.switch_profile_locked(&lock, name);
+    drop(lock);
     profiles_changed(app, state);
-    saved.map_err(|err| format!("The profile was applied, but it could not be remembered: {err}"))?;
-    Ok(report)
+    result
 }
 
 /// Releases every device that is not faulted; the report counts the devices that were driven and are released now.
@@ -245,7 +231,9 @@ pub async fn set_direct<R: Runtime>(
         if !hidden.is_empty() {
             mask_hidden_zones(&describe(engine, &id)?.description, &hidden, &mut colors);
         }
-        engine.set_direct(&id, colors).map_err(err_string)
+        engine.set_direct(&id, colors).map_err(err_string)?;
+        state.profile_changed();
+        Ok(())
     })
     .await
 }
@@ -263,13 +251,16 @@ pub async fn set_zone<R: Runtime>(
         let engine = state.engine()?;
         let hidden = visible_device(state, &id)?;
         if hidden.is_empty() {
-            return engine.set_zone(&id, zone, colors).map_err(err_string);
+            engine.set_zone(&id, zone, colors).map_err(err_string)?;
+        } else {
+            // The engine's buffer may still hold colours of a hidden zone (e.g. from before it was hidden), so send
+            // the whole masked buffer instead of patching one zone into it.
+            let view = describe(engine, &id)?;
+            let buffer = zone_write(&view.description, &hidden, &view.colors, zone, &colors)?;
+            engine.set_direct(&id, buffer).map_err(err_string)?;
         }
-        // The engine's buffer may still hold colours of a hidden zone (e.g. from before it was hidden), so send the
-        // whole masked buffer instead of patching one zone into it.
-        let view = describe(engine, &id)?;
-        let buffer = zone_write(&view.description, &hidden, &view.colors, zone, &colors)?;
-        engine.set_direct(&id, buffer).map_err(err_string)
+        state.profile_changed();
+        Ok(())
     })
     .await
 }
@@ -280,7 +271,9 @@ pub async fn set_mode<R: Runtime>(app: AppHandle<R>, id: DeviceId, state: ModeSt
     blocking(app, move |_, st| {
         let engine = st.engine()?;
         visible_device(st, &id)?;
-        engine.set_mode(&id, state).map_err(err_string)
+        engine.set_mode(&id, state).map_err(err_string)?;
+        st.profile_changed();
+        Ok(())
     })
     .await
 }
@@ -347,35 +340,28 @@ pub async fn release_all<R: Runtime>(app: AppHandle<R>) -> Result<ReleaseReport,
     blocking(app, |_, state| release_all_now(state)).await
 }
 
-/// Sets one device's brightness in percent (ADR 0001 #33). Refused for a hidden device. While a slider is dragged
-/// the page sends `persist = false`; the final value comes with `persist = true` and is saved in the settings until
-/// the next profile apply or save.
+/// Sets one device's brightness in percent (ADR 0001 #33). Refused for a hidden device. The value is saved to the
+/// active profile (coalesced while a slider is dragged; ADR 0001 #40).
 #[tauri::command]
 pub async fn set_device_brightness<R: Runtime>(
     app: AppHandle<R>,
     id: DeviceId,
     percent: u8,
-    persist: bool,
 ) -> Result<(), String> {
     blocking(app, move |_, state| {
         let engine = state.engine()?;
         visible_device(state, &id)?;
         engine.set_device_brightness(&id, percent).map_err(err_string)?;
-        if persist {
-            state
-                .update_settings(|s| {
-                    record_brightness(s, &id, percent);
-                    Ok(())
-                })
-                .map_err(|err| format!("The brightness was changed, but it could not be saved: {err}"))?;
-        }
+        state.profile_changed();
         Ok(())
     })
     .await
 }
 
-/// Sets the master brightness in percent, multiplied into every device (ADR 0001 #33). `persist` as for
-/// [`set_device_brightness`]. Returns the master brightness.
+/// Sets the master brightness in percent, multiplied into every device (ADR 0001 #33). While a slider is dragged the
+/// page sends `persist = false`; the final value comes with `persist = true` and is saved in the settings (master
+/// brightness is not part of a profile). Devices it takes over are saved to the active profile with what they show
+/// (ADR 0001 #40). Returns the master brightness.
 #[tauri::command]
 pub async fn set_master_brightness<R: Runtime>(
     app: AppHandle<R>,
@@ -386,6 +372,7 @@ pub async fn set_master_brightness<R: Runtime>(
         let engine = state.engine()?;
         let percent = percent.min(cc_config::FULL_BRIGHTNESS);
         engine.set_master_brightness(percent);
+        state.profile_changed();
         if persist {
             state
                 .update_settings(|s| {
@@ -401,12 +388,13 @@ pub async fn set_master_brightness<R: Runtime>(
 
 /// Connect all, the counterpart of Release all: takes control of every released device that is neither hidden nor
 /// faulted (its last setting, else the mode it shows on its own, else the default colour from the settings; ADR 0001
-/// #36). Returns the master brightness.
+/// #36). What the devices show then is saved to the active profile (ADR 0001 #40). Returns the master brightness.
 #[tauri::command]
 pub async fn connect_all<R: Runtime>(app: AppHandle<R>) -> Result<LightingView, String> {
     blocking(app, |_, state| {
         let engine = state.engine()?;
         engine.connect_all();
+        state.profile_changed();
         tracing::info!("connect all");
         Ok(engine.lighting())
     })
@@ -524,68 +512,84 @@ pub async fn rescan<R: Runtime>(app: AppHandle<R>) -> Result<DeviceList, String>
 
 /// Profile names and the active one.
 #[tauri::command]
-pub async fn list_profiles<R: Runtime>(app: AppHandle<R>) -> Result<crate::profiles::ProfileList, String> {
+pub async fn list_profiles<R: Runtime>(app: AppHandle<R>) -> Result<ProfileList, String> {
     blocking(app, |_, state| state.profile_list()).await
 }
 
-/// Saves what the devices show now, with their brightness, as profile `name` (replacing a profile of the same
-/// name). Saving the active profile makes the device brightness changes part of it (ADR 0001 #33).
-#[tauri::command]
-pub async fn save_profile<R: Runtime>(
-    app: AppHandle<R>,
-    name: String,
-) -> Result<crate::profiles::ProfileList, String> {
-    blocking(app, move |app, state| {
-        let engine = state.engine()?;
-        let profile = Profile {
-            name: name.trim().to_owned(),
-            devices: engine.current_settings(),
-            brightness: engine.brightness(),
-        };
-        state.storage()?.profiles.save(&profile).map_err(err_string)?;
-        tracing::info!(profile = %profile.name, devices = profile.devices.len(), "profile saved");
-        let active = state
-            .settings()
-            .last_profile
-            .as_deref()
-            .is_some_and(|last| same_name(last, &profile.name));
-        if active {
-            state
-                .update_settings(|s| {
-                    clear_brightness_overrides(s);
-                    Ok(())
-                })
-                .map_err(|err| {
-                    format!("The profile was saved, but the settings could not be updated: {err}")
-                })?;
-        }
-        profiles_changed(app, state);
-        state.profile_list()
-    })
-    .await
-}
-
-/// Applies profile `name` and remembers it for the next start.
+/// Switches to profile `name` (see [`apply_profile_now`]).
 #[tauri::command]
 pub async fn apply_profile<R: Runtime>(app: AppHandle<R>, name: String) -> Result<ApplyReport, String> {
     blocking(app, move |app, state| apply_profile_now(app, state, &name)).await
 }
 
-/// Renames profile `from` to `to`; `last_profile` follows.
+/// Saves `profile` as a new profile and switches to it, under the profile lock.
+fn create_and_switch<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    make: impl FnOnce(&[String]) -> Result<Profile, String>,
+) -> Result<ProfileList, String> {
+    let lock = state.profile_lock();
+    state.flush_profile_locked(&lock);
+    let storage = state.storage()?;
+    let names = storage.profiles.list().map_err(err_string)?;
+    let profile = make(&names)?;
+    storage.profiles.save(&profile).map_err(err_string)?;
+    tracing::info!(profile = %profile.name, devices = profile.devices.len(), "profile created");
+    let switched = state.switch_profile_locked(&lock, &profile.name);
+    drop(lock);
+    profiles_changed(app, state);
+    switched?;
+    state.profile_list()
+}
+
+/// Creates an empty profile "Profile N" (lowest free N) and switches to it: connected devices fall back to their own
+/// mode, else the fallback colour, at full device brightness (ADR 0001 #40).
+#[tauri::command]
+pub async fn create_profile<R: Runtime>(app: AppHandle<R>) -> Result<ProfileList, String> {
+    blocking(app, |app, state| {
+        create_and_switch(app, state, |names| {
+            Ok(Profile {
+                name: next_profile_name(names),
+                devices: BTreeMap::new(),
+                brightness: BTreeMap::new(),
+            })
+        })
+    })
+    .await
+}
+
+/// Copies profile `name` as `"<name> copy"` (then `"<name> copy 2"`, ...) and switches to the copy (ADR 0001 #40).
+#[tauri::command]
+pub async fn duplicate_profile<R: Runtime>(app: AppHandle<R>, name: String) -> Result<ProfileList, String> {
+    blocking(app, move |app, state| {
+        create_and_switch(app, state, |names| {
+            let source = state.storage()?.profiles.load(&name).map_err(err_string)?;
+            Ok(Profile {
+                name: duplicate_name(&source.name, names),
+                ..source
+            })
+        })
+    })
+    .await
+}
+
+/// Renames profile `from` to `to`; the active profile follows.
 #[tauri::command]
 pub async fn rename_profile<R: Runtime>(
     app: AppHandle<R>,
     from: String,
     to: String,
-) -> Result<crate::profiles::ProfileList, String> {
+) -> Result<ProfileList, String> {
     blocking(app, move |app, state| {
+        let lock = state.profile_lock();
+        state.flush_profile_locked(&lock);
         state.storage()?.profiles.rename(&from, &to).map_err(err_string)?;
-        let saved = state.update_settings(|s| {
-            if let Some(next) = last_after_rename(s.last_profile.as_deref(), &from, &to) {
-                s.last_profile = Some(next);
-            }
-            Ok(())
-        });
+        let next = last_after_rename(state.settings().last_profile.as_deref(), &from, &to);
+        let saved = match next {
+            Some(next) => state.set_active_profile(&next),
+            None => Ok(()),
+        };
+        drop(lock);
         profiles_changed(app, state);
         saved?;
         state.profile_list()
@@ -593,22 +597,26 @@ pub async fn rename_profile<R: Runtime>(
     .await
 }
 
-/// Deletes profile `name`; clears `last_profile` if it was that one.
+/// Deletes profile `name`. Refused for the last profile (there is always one, ADR 0001 #40). Deleting the active
+/// profile switches to the first remaining one.
 #[tauri::command]
-pub async fn delete_profile<R: Runtime>(
-    app: AppHandle<R>,
-    name: String,
-) -> Result<crate::profiles::ProfileList, String> {
+pub async fn delete_profile<R: Runtime>(app: AppHandle<R>, name: String) -> Result<ProfileList, String> {
     blocking(app, move |app, state| {
-        state.storage()?.profiles.delete(&name).map_err(err_string)?;
-        let saved = state.update_settings(|s| {
-            if clears_last(s.last_profile.as_deref(), &name) {
-                s.last_profile = None;
-            }
-            Ok(())
-        });
+        let lock = state.profile_lock();
+        state.flush_profile_locked(&lock);
+        let storage = state.storage()?;
+        let names = storage.profiles.list().map_err(err_string)?;
+        let active = state.settings().last_profile.clone();
+        let next = plan_delete(&names, active.as_deref(), &name).map_err(|refused| refused.to_string())?;
+        storage.profiles.delete(&name).map_err(err_string)?;
+        tracing::info!(profile = %name.trim(), "profile deleted");
+        let switched = match next {
+            Some(next) => state.switch_profile_locked(&lock, &next).map(|_| ()),
+            None => Ok(()),
+        };
+        drop(lock);
         profiles_changed(app, state);
-        saved?;
+        switched?;
         state.profile_list()
     })
     .await

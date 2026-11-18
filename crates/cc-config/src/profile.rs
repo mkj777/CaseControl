@@ -22,7 +22,9 @@ pub enum DeviceSetting {
     },
 }
 
-/// A named set of device settings. Devices not listed are left as they are.
+/// A named set of device settings. When a profile is applied, connected devices it does not list fall back to the
+/// mode they show on their own, else the fallback colour (ADR 0001 #36, #40); devices that are not connected keep
+/// their entries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     /// Display name; also the basis for the file name.

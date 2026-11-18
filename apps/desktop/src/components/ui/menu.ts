@@ -5,6 +5,13 @@ export interface MenuItem {
   label: string
   action: () => void
   disabled?: boolean
+  /** Set for a choice among items (the profile list): the item is a `menuitemradio` and shows a check mark when
+   * `true`. Leave it out for plain actions. */
+  checked?: boolean
+  /** Draw a separator line above this item. */
+  separator?: boolean
+  /** Native tooltip, e.g. why the item is disabled. */
+  hint?: string
 }
 
 /**

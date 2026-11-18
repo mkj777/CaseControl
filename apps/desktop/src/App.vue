@@ -20,7 +20,6 @@ import { dismissToast, toastState } from './stores/toast'
 
 const nav = [
   { to: '/lighting', label: 'Lighting' },
-  { to: '/profiles', label: 'Profiles' },
   { to: '/conflicts', label: 'Conflicts' },
   { to: '/settings', label: 'Settings' },
 ]

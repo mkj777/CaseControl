@@ -114,13 +114,11 @@ pub struct DeviceOverrides {
     /// not empty.
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub hidden_zones: BTreeSet<String>,
-    /// Device brightness in percent set since the last profile apply or save (ADR 0001 #33).
+    /// Device brightness in percent set since the last profile apply or save, from versions before ADR 0001 #40.
     ///
-    /// The rule: a profile carries the device brightness it was saved with. Changing a device's brightness writes it
-    /// here; applying a profile clears every entry (the profile's values are then current), and saving the profile
-    /// that is `last_profile` clears them too (they are now in that profile). On start the device brightness is
-    /// `last_profile`'s value overlaid with these entries (100 where neither has one). Clamped to 0..=100 on load;
-    /// written only when set.
+    /// Since every brightness change is saved to the active profile at once (ADR 0001 #40), the app no longer
+    /// writes this. An entry left by an older version is laid over `last_profile`'s value on the next start, saved
+    /// into that profile and then cleared. Clamped to 0..=100 on load; written only when set.
     #[serde(
         deserialize_with = "clamped_percent_opt",
         skip_serializing_if = "Option::is_none"

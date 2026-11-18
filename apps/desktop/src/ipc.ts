@@ -405,9 +405,9 @@ export const resizeZone = (id: DeviceId, zone: number, len: number) =>
 export const saveToHardware = (id: DeviceId) => invoke<void>('save_to_hardware', { id })
 export const releaseDevice = (id: DeviceId) => invoke<void>('release_device', { id })
 export const releaseAll = () => invoke<ReleaseReport>('release_all')
-/** `persist = false` while a slider is dragged, `true` for the final value (saved in the settings). */
-export const setDeviceBrightness = (id: DeviceId, percent: number, persist: boolean) =>
-  invoke<void>('set_device_brightness', { id, percent, persist })
+/** Every value is saved to the active profile (coalesced by the backend; ADR 0001 #40). */
+export const setDeviceBrightness = (id: DeviceId, percent: number) =>
+  invoke<void>('set_device_brightness', { id, percent })
 export const setMasterBrightness = (percent: number, persist: boolean) =>
   invoke<LightingView>('set_master_brightness', { percent, persist })
 /** Take over all (`connect_all`), the counterpart of Release all: takes control of every released device that is
@@ -420,10 +420,16 @@ export const setDeviceHidden = (id: DeviceId, hidden: boolean) =>
 export const setZoneHidden = (id: DeviceId, zoneName: string, hidden: boolean) =>
   invoke<DeviceList>('set_zone_hidden', { id, zoneName, hidden })
 
+// Profiles (ADR 0001 #40): there is always exactly one active profile, and every device change is saved into it.
 export const listProfiles = () => invoke<ProfileList>('list_profiles')
-export const saveProfile = (name: string) => invoke<ProfileList>('save_profile', { name })
+/** Switches to profile `name`: applies it and makes it active. */
 export const applyProfile = (name: string) => invoke<ApplyReport>('apply_profile', { name })
+/** Creates an empty "Profile N" and switches to it. */
+export const createProfile = () => invoke<ProfileList>('create_profile')
+/** Copies profile `name` as "<name> copy" and switches to the copy. */
+export const duplicateProfile = (name: string) => invoke<ProfileList>('duplicate_profile', { name })
 export const renameProfile = (from: string, to: string) => invoke<ProfileList>('rename_profile', { from, to })
+/** Refused for the last profile; deleting the active one switches to the first remaining. */
 export const deleteProfile = (name: string) => invoke<ProfileList>('delete_profile', { name })
 
 export const scanConflicts = () => invoke<ConflictScan>('scan_conflicts')

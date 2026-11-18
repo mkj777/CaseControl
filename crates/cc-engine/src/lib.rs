@@ -23,6 +23,9 @@
 //!   [`EngineHandle::set_default_color`]) on every LED in direct mode, or in the first mode that takes a colour for a
 //!   device without a direct mode. Only a device with none of these keeps its own lighting. `DeviceView::takeover`
 //!   says what a takeover would use, so the UI does not repeat that choice.
+//! - Profiles (ADR 0001 #40): [`EngineHandle::apply_replacing`] applies a whole profile; connected devices it has
+//!   no entry for forget their setting and, if driven, fall back to their own mode, else the default colour.
+//!   [`EngineHandle::current_settings`] returns what the engine drives each device with, for saving.
 //! - Dark zones (the app's hidden zones, ADR 0001 #26): every direct output has them black, whatever path drives the
 //!   device ([`EngineHandle::set_dark_zones`], [`mask_hidden_zones`]).
 //! - Last good own lighting (ADR 0001 #38): every detection hands the drivers what is remembered per device

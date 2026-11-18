@@ -1,6 +1,7 @@
-//! The one managed [`AppState`]: storage locations, settings, the engine handle, the last conflict scan and the
-//! shutdown latch.
+//! The one managed [`AppState`]: storage locations, settings, the engine handle, the active profile's autosave, the
+//! last conflict scan and the shutdown latch.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -9,8 +10,9 @@ use cc_conflicts::ScanReport;
 use cc_engine::{ApplyReport, EngineHandle};
 use parking_lot::{Mutex, MutexGuard};
 
-use crate::prefs::{engine_config, start_brightness};
-use crate::profiles::{ProfileList, profile_list};
+use crate::autosave::{AUTOSAVE_INTERVAL, Autosave};
+use crate::prefs::{clear_brightness_overrides, engine_config, start_brightness};
+use crate::profiles::{ProfileList, StartPlan, merge_snapshot, profile_list, start_plan};
 
 /// Time the engine gets to release every device on exit.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -34,6 +36,11 @@ pub struct AppState {
     engine: Result<EngineHandle, String>,
     last_scan: Mutex<Option<ScanReport>>,
     shut_down: AtomicBool,
+    /// Marks changes of the active profile and times their writes (ADR 0001 #40).
+    autosave: Autosave,
+    /// Held by every profile operation (switch, create, duplicate, rename, delete) and every autosave write, so a
+    /// write always goes to the profile that was active when the change was made.
+    profile_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -94,37 +101,216 @@ impl AppState {
             engine,
             last_scan: Mutex::new(None),
             shut_down: AtomicBool::new(false),
+            autosave: Autosave::new(AUTOSAVE_INTERVAL),
+            profile_lock: Mutex::new(()),
         }
     }
 
-    /// Re-applies the last applied profile if it still exists (ADR 0001 #24), with its device brightness overlaid by
-    /// the changes made since (ADR 0001 #33). Without one, devices stay in their hardware mode. With master brightness
-    /// 0 saved, the engine outputs every device dark, so the profile is applied underneath without a coloured frame.
-    pub fn apply_last_profile(&self) {
-        let Some(name) = self.settings.lock().last_profile.clone() else {
+    /// Makes sure exactly one profile is active and applies it (ADR 0001 #24, #40). Without any profile, "Profile 1"
+    /// is created from what the devices show now (what saving a profile used to write; often empty) and becomes
+    /// active. With profiles but no valid `last_profile`, the first in list order becomes active. The active profile
+    /// is applied with its device brightness; brightness changes an older version kept in the settings are laid over
+    /// it, saved into it and cleared. With master brightness 0 saved, the engine outputs every device dark, so the
+    /// profile is applied underneath without a coloured frame.
+    pub fn start_profiles(&self) {
+        let Ok(storage) = &self.storage else {
             return;
         };
-        let (Ok(engine), Ok(storage)) = (&self.engine, &self.storage) else {
-            return;
+        let names = match storage.profiles.list() {
+            Ok(names) => names,
+            Err(err) => {
+                tracing::error!(%err, "cannot list profiles; no profile applied");
+                return;
+            }
         };
-        match storage.profiles.load(&name) {
-            Ok(profile) => {
-                let brightness = start_brightness(Some(&profile), &self.settings());
-                engine.replace_brightness(brightness);
+        let last = self.settings().last_profile.clone();
+        let _lock = self.profile_lock();
+        match start_plan(&names, last.as_deref()) {
+            StartPlan::Create(name) => {
+                let (devices, brightness) = match &self.engine {
+                    Ok(engine) => (engine.current_settings(), engine.brightness()),
+                    Err(_) => (BTreeMap::new(), start_brightness(None, &self.settings())),
+                };
+                let profile = Profile {
+                    name,
+                    devices,
+                    brightness,
+                };
+                if let Err(err) = storage.profiles.save(&profile) {
+                    tracing::error!(%err, profile = %profile.name, "cannot create the first profile");
+                    return;
+                }
+                tracing::info!(profile = %profile.name, devices = profile.devices.len(), "first profile created");
+                if let Err(err) = self.set_active_profile(&profile.name) {
+                    tracing::warn!(%err, "the first profile is active, but this could not be saved");
+                }
+                self.clear_legacy_brightness();
+            }
+            StartPlan::Apply { name, remember } => {
+                let profile = match storage.profiles.load(&name) {
+                    Ok(profile) => profile,
+                    Err(err) => {
+                        tracing::warn!(profile = %name, %err, "active profile not applied");
+                        return;
+                    }
+                };
+                if remember {
+                    tracing::info!(profile = %profile.name, "no valid last profile; activating the first one");
+                    if let Err(err) = self.set_active_profile(&profile.name) {
+                        tracing::warn!(%err, "the profile is active, but this could not be saved");
+                    }
+                }
+                let Ok(engine) = &self.engine else {
+                    return;
+                };
+                let settings = self.settings().clone();
+                let legacy = settings.devices.values().any(|ov| ov.brightness.is_some());
+                engine.replace_brightness(start_brightness(Some(&profile), &settings));
                 let report = self.apply_visible(engine, &profile);
                 tracing::info!(
                     profile = %profile.name,
                     applied = report.applied.len(),
                     missing = report.missing.len(),
                     failed = report.failed.len(),
-                    "last profile applied on start"
+                    "active profile applied on start"
                 );
+                if legacy {
+                    match self.write_profile_snapshot(&profile.name) {
+                        Ok(()) => self.clear_legacy_brightness(),
+                        Err(err) => {
+                            tracing::warn!(%err, "cannot save the kept device brightness into the profile")
+                        }
+                    }
+                }
             }
-            Err(err) => tracing::warn!(profile = %name, %err, "last profile not applied"),
         }
     }
 
-    /// Applies `profile` without its hidden devices and with its hidden zones black (ADR 0001 #26).
+    /// Clears device brightness an older version kept in the settings (it is part of the active profile now).
+    fn clear_legacy_brightness(&self) {
+        if !self.settings().devices.values().any(|ov| ov.brightness.is_some()) {
+            return;
+        }
+        let cleared = self.update_settings(|s| {
+            clear_brightness_overrides(s);
+            Ok(())
+        });
+        if let Err(err) = cleared {
+            tracing::warn!(%err, "cannot clear the kept device brightness");
+        }
+    }
+
+    /// Makes `name` the active profile (`last_profile`). It is always set in memory, so autosave writes go to it; the
+    /// error says that it could not be saved for the next start.
+    pub fn set_active_profile(&self, name: &str) -> Result<(), String> {
+        let name = name.trim().to_owned();
+        let saved = self.update_settings(|s| {
+            s.last_profile = Some(name.clone());
+            Ok(())
+        });
+        if saved.is_err() {
+            self.settings.lock().last_profile = Some(name);
+        }
+        saved
+    }
+
+    /// Takes the profile lock; hold it across a profile operation and pass it to the `*_locked` methods.
+    pub fn profile_lock(&self) -> MutexGuard<'_, ()> {
+        self.profile_lock.lock()
+    }
+
+    /// Records that what a device shows changed; the active profile is saved shortly (ADR 0001 #40).
+    pub fn profile_changed(&self) {
+        self.autosave.mark();
+    }
+
+    /// Writes a pending change of the active profile now. The caller holds the profile lock.
+    pub fn flush_profile_locked(&self, _lock: &MutexGuard<'_, ()>) {
+        self.autosave.flush(|| {
+            let active = self.settings().last_profile.clone();
+            if let Some(name) = active
+                && let Err(err) = self.write_profile_snapshot(&name)
+            {
+                tracing::error!(profile = %name, %err, "cannot save the active profile");
+            }
+        });
+    }
+
+    /// Writes a pending change of the active profile now.
+    pub fn flush_profile(&self) {
+        let lock = self.profile_lock();
+        self.flush_profile_locked(&lock);
+    }
+
+    /// The autosave writer: writes the active profile whenever a change is due, until shutdown. Runs on its own
+    /// thread.
+    pub fn run_autosave(&self) {
+        while self.autosave.wait_due() {
+            self.flush_profile();
+        }
+        tracing::debug!("autosave stopped");
+    }
+
+    /// Saves what the devices show and their brightness into profile `name` (merged, see [`merge_snapshot`]);
+    /// recreates the profile if its file is gone. Writes nothing when nothing changed.
+    fn write_profile_snapshot(&self, name: &str) -> Result<(), String> {
+        let storage = self.storage()?;
+        let engine = self.engine()?;
+        let mut profile = match storage.profiles.load(name) {
+            Ok(profile) => profile,
+            Err(err) => {
+                tracing::warn!(profile = %name, %err, "active profile not found; writing it anew");
+                Profile {
+                    name: name.to_owned(),
+                    devices: BTreeMap::new(),
+                    brightness: BTreeMap::new(),
+                }
+            }
+        };
+        let before = profile.clone();
+        merge_snapshot(&mut profile, engine.current_settings(), engine.brightness());
+        if profile == before {
+            return Ok(());
+        }
+        storage.profiles.save(&profile).map_err(|err| err.to_string())?;
+        tracing::debug!(profile = %profile.name, "active profile saved");
+        Ok(())
+    }
+
+    /// Applies profile `name` with its device brightness and makes it active (ADR 0001 #40). The caller holds the
+    /// profile lock and has flushed the previous profile's pending change. Without an engine only the active profile
+    /// changes.
+    pub fn switch_profile_locked(
+        &self,
+        _lock: &MutexGuard<'_, ()>,
+        name: &str,
+    ) -> Result<ApplyReport, String> {
+        let profile = self
+            .storage()?
+            .profiles
+            .load(name)
+            .map_err(|err| err.to_string())?;
+        let report = match &self.engine {
+            Ok(engine) => {
+                engine.replace_brightness(profile.brightness.clone());
+                self.apply_visible(engine, &profile)
+            }
+            Err(_) => ApplyReport::default(),
+        };
+        tracing::info!(
+            profile = %profile.name,
+            applied = report.applied.len(),
+            missing = report.missing.len(),
+            failed = report.failed.len(),
+            "profile applied"
+        );
+        self.set_active_profile(&profile.name)
+            .map_err(|err| format!("The profile was applied, but it could not be remembered: {err}"))?;
+        Ok(report)
+    }
+
+    /// Applies `profile` without its hidden devices and with its hidden zones black (ADR 0001 #26). Connected
+    /// devices it has no entry for fall back to their own mode, else the fallback colour (ADR 0001 #40).
     pub fn apply_visible(&self, engine: &EngineHandle, profile: &Profile) -> ApplyReport {
         let (devices, skipped) = crate::hidden::visible_profile(&self.settings(), &profile.devices, |id| {
             engine.device(id).map(|v| v.description)
@@ -132,7 +318,7 @@ impl AppState {
         if !skipped.is_empty() {
             tracing::info!(profile = %profile.name, hidden = skipped.len(), "hidden devices skipped");
         }
-        engine.apply(&devices)
+        engine.apply_replacing(&devices)
     }
 
     /// The running engine, or why there is none.
@@ -199,11 +385,14 @@ impl AppState {
         }
     }
 
-    /// Releases every device and stops the engine, exactly once; later calls return immediately.
+    /// Writes a pending change of the active profile, then releases every device and stops the engine, exactly
+    /// once; later calls return immediately.
     pub fn shutdown_engine(&self) {
         if self.shut_down.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.autosave.stop();
+        self.flush_profile();
         if let Ok(engine) = &self.engine {
             tracing::info!("releasing devices and stopping the engine");
             engine.shutdown(SHUTDOWN_TIMEOUT);

@@ -3,8 +3,9 @@
 // menu is suppressed app-wide. Opens clamped inside the window with focus on the first item; arrow keys, Home and
 // End move, Enter activates; Escape, a click elsewhere, scroll, resize or leaving the window close it. Focus returns
 // to the element that opened it. One level, no submenus. Use `menuPoint(event)` for `at` so Shift+F10 and the
-// Menu key open it at the focused element.
-import { nextTick, onBeforeUnmount, ref, watch } from 'vue'
+// Menu key open it at the focused element. Items may carry a check mark (`checked`, for a choice such as the active
+// profile), a separator above them (`separator`) and a native tooltip (`hint`).
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import type { MenuItem } from './menu'
 
 const props = withDefaults(
@@ -20,6 +21,8 @@ const props = withDefaults(
 const emit = defineEmits<{ close: [] }>()
 
 const menu = ref<HTMLElement | null>(null)
+/** Some item is a choice: every item gets the check column so the labels line up. */
+const hasChecks = computed(() => props.items.some((i) => i.checked !== undefined))
 const pos = ref({ x: 0, y: 0 })
 let opener: HTMLElement | null = null
 
@@ -103,6 +106,9 @@ function restoreFocus() {
 
 onBeforeUnmount(() => listen(false))
 
+/** Segoe Fluent Icons "CheckMark". */
+const CHECK = ''
+
 function run(item: MenuItem) {
   close()
   item.action()
@@ -120,18 +126,22 @@ function run(item: MenuItem) {
       :style="{ left: `${pos.x}px`, top: `${pos.y}px` }"
       @contextmenu.prevent
     >
-      <button
-        v-for="item in items"
-        :key="item.label"
-        type="button"
-        role="menuitem"
-        class="item"
-        tabindex="-1"
-        :disabled="item.disabled"
-        @click="run(item)"
-      >
-        {{ item.label }}
-      </button>
+      <template v-for="(item, i) in items" :key="i">
+        <div v-if="item.separator" role="separator" class="separator" />
+        <button
+          type="button"
+          :role="item.checked === undefined ? 'menuitem' : 'menuitemradio'"
+          :aria-checked="item.checked === undefined ? undefined : item.checked"
+          class="item"
+          tabindex="-1"
+          :title="item.hint"
+          :disabled="item.disabled"
+          @click="run(item)"
+        >
+          <span v-if="hasChecks" class="check" aria-hidden="true">{{ item.checked ? CHECK : '' }}</span>
+          <span class="label">{{ item.label }}</span>
+        </button>
+      </template>
     </div>
   </Teleport>
 </template>
@@ -173,5 +183,23 @@ function run(item: MenuItem) {
 
 .item:disabled {
   color: var(--text-disabled);
+}
+
+.check {
+  flex: none;
+  width: var(--space-6);
+  font-family: var(--font-icon);
+  font-size: 12px;
+}
+
+.label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.separator {
+  margin: var(--space-1) 0;
+  border-top: 1px solid var(--border);
 }
 </style>
