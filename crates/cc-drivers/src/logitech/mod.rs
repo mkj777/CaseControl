@@ -18,7 +18,8 @@
 //!
 //! What this module deliberately does not do: no DPI, buttons, onboard profiles or pairing changes; no feature
 //! 0x8071 / 0x8081 / per-key paths (not needed by the two v1 devices); no threads, no power management, no
-//! keepalive (neither device needs one on 0x8070). Writes to flash happen only in `save_to_hardware()` (G560).
+//! keepalive (neither device needs one on 0x8070). Writes to flash happen only in `save_to_hardware()`, `persist_look()` and
+//! `restore_saved_state()` (G560).
 
 pub mod g560;
 pub mod hidpp;
@@ -369,7 +370,13 @@ fn detect_g560(devices: &[HidDeviceInfo], ctx: &DetectContext, open: &mut Opener
                         last_error = DeviceError::Protocol(e.to_string());
                         continue;
                     }
-                    out.push(Found::G560(G560Controller::new(link, p, desc)));
+                    out.push(Found::G560(G560Controller::new(
+                        link,
+                        p,
+                        desc,
+                        ctx.is_unreleased(&id),
+                        ctx.stored_own_lighting(&id),
+                    )));
                     found = true;
                     break;
                 }

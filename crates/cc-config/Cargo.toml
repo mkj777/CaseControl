@@ -17,6 +17,11 @@ directories = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# Read-only access to HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid (machine binding, ADR 0001 #42). Same version
+# as cc-conflicts and cc-system use; safe API, so the crate keeps `unsafe_code = "deny"`.
+windows-registry = "0.6"
+
 [dev-dependencies]
 tempfile = "3"
 

@@ -24,18 +24,29 @@
 //! which also clears the driver's "already sent" caches and makes it re-send its init) and then send the current
 //! output again. Reset and send are retried together with the usual back-off; if the device still does not take
 //! them when [`Timing::resume_retry`] has passed, the worker faults it so the engine re-opens it through detection.
+//!
+//! Save to the device (ADR 0001 #42): [`Command::Persist`] (also a manual save) stores the driver's backup of the
+//! original saved state in the machine state before the device's first save (no backup, or a failed durable store:
+//! nothing is written), enforces the daily cap, passes the last fingerprint and records the new one, the day's write
+//! count and the new own lighting. [`Command::Restore`] writes the stored backup back (at most [`RESTORE_CAP`]
+//! attempts a day) and drops it on success. Both count as writes to the device, except refusals before anything
+//! reached its memory (`DeviceError::Refused`, `InvalidArgument`). Whenever a write may have reached the memory
+//! without being recorded (a failed save, every restore), the stored fingerprint is dropped, so the next save writes
+//! again. Both are refused when the engine forbids device-memory writes or the records cannot be stored durably, and
+//! skipped when the worker takes them up after their deadline. Afterwards the device's own lighting
+//! (`slot.hardware`) is read again.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cc_core::{Controller, DeviceError, DeviceId, ModeState};
+use cc_core::{Controller, DeviceError, DeviceId, ModeState, PersistLook, PersistOutcome};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use parking_lot::Mutex;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
-use crate::engine::Shared;
+use crate::engine::{DAILY_SAVE_CAP, RESTORE_CAP, Shared};
 use crate::lighting::{Out, Output};
-use crate::view::DeviceStatus;
+use crate::view::{DeviceStatus, PersistResult, SkipReason};
 
 /// An output (colour frame or brightness step of a mode) and the sequence number it was issued with.
 pub(crate) type Frame = (u64, Output);
@@ -65,13 +76,31 @@ pub(crate) enum Command {
         len: usize,
         reply: Reply,
     },
-    /// Persist the current mode to flash.
-    Save(Reply),
     /// Hand the device back to its hardware mode.
     Release { seq: u64, reply: Reply },
     /// Leave the thread, releasing first if `release` and the device was not handed back since it was opened or last
-    /// written to. A faulted device is released too (best effort; ADR 0001 #38).
-    Stop { release: bool, reply: Option<Reply> },
+    /// written to. A faulted device is released too (best effort; ADR 0001 #38). With `flush` (a shutdown that keeps
+    /// the colours, ADR 0001 #42) a pending or paced output is sent once first, so the device keeps the latest one.
+    Stop {
+        release: bool,
+        flush: bool,
+        reply: Option<Reply>,
+    },
+    /// Save `look` to the device's memory (ADR 0001 #42); `day` counts the write (days since 1970, UTC). Skipped
+    /// when taken up after `deadline`.
+    Persist {
+        look: PersistLook,
+        day: u32,
+        deadline: Option<Instant>,
+        reply: Sender<PersistResult>,
+    },
+    /// Write the stored backup of the device's original saved state back to it, then drop the backup. Skipped when
+    /// taken up after `deadline`.
+    Restore {
+        day: u32,
+        deadline: Option<Instant>,
+        reply: Option<Sender<PersistResult>>,
+    },
     /// The system resumed: reset the device (`release()`) and send `output` (the current output, issued with
     /// `seq`) again, retrying both with back-off for up to [`Timing::resume_retry`].
     Reassert { seq: u64, output: Output },
@@ -433,7 +462,7 @@ impl Worker {
                 self.retry_at = None;
             }
             Err(e) if e.is_fatal() => self.fault(e.to_string()),
-            Err(DeviceError::InvalidArgument(_) | DeviceError::Unsupported) => {}
+            Err(DeviceError::InvalidArgument(_) | DeviceError::Unsupported | DeviceError::Refused(_)) => {}
             Err(e) => {
                 self.failures += 1;
                 let timing = self.shared.timing;
@@ -514,16 +543,34 @@ impl Worker {
                 }
                 let _ = reply.send(r);
             }
-            Command::Save(reply) => {
-                self.needs_release = true;
-                if self.local != Local::Faulted {
-                    self.mark_written();
-                }
-                let r = self.guarded(|w| w.ctrl.save_to_hardware());
+            Command::Reassert { seq, output } => self.reassert(seq, output),
+            Command::Persist {
+                look,
+                day,
+                deadline,
+                reply,
+            } => {
+                let r = self.persist(&look, day, deadline);
                 let _ = reply.send(r);
             }
-            Command::Reassert { seq, output } => self.reassert(seq, output),
-            Command::Stop { release, reply } => {
+            Command::Restore { day, deadline, reply } => {
+                let r = self.restore(day, deadline);
+                match &r {
+                    PersistResult::Written | PersistResult::Unchanged => {}
+                    other => debug!(id = %self.id, result = ?other, "restore of the device's memory"),
+                }
+                if let Some(reply) = reply {
+                    let _ = reply.send(r);
+                }
+            }
+            Command::Stop {
+                release,
+                flush,
+                reply,
+            } => {
+                if flush {
+                    self.flush();
+                }
                 let r = if release && self.needs_release {
                     let r = self.ctrl.release();
                     match &r {
@@ -544,6 +591,219 @@ impl Worker {
             }
         }
         true
+    }
+
+    /// Sends a pending or paced output once, now (pacing and back-off ignored), before the thread stops without a
+    /// release.
+    fn flush(&mut self) {
+        if self.local == Local::Faulted {
+            return;
+        }
+        self.take_frame();
+        if let Some(frame) = self.dirty.take() {
+            debug!(id = %self.id, "flushing the latest output before stopping");
+            self.send_frame(frame, Instant::now());
+        }
+    }
+
+    /// Why a device-memory write must not start now, if it must not: taken up after its `deadline`, writes switched
+    /// off for the engine, the device faulted, or records that cannot be stored durably.
+    fn memory_write_blocked(&self, deadline: Option<Instant>) -> Option<SkipReason> {
+        if deadline.is_some_and(|d| Instant::now() > d) {
+            debug!(id = %self.id, "device memory request taken up after its deadline; skipped");
+            Some(SkipReason::TimeBudget)
+        } else if !self.shared.device_memory_writes() {
+            Some(SkipReason::WritesDisabled)
+        } else if self.local == Local::Faulted {
+            Some(SkipReason::Faulted)
+        } else if !self.shared.hw().device_memory_writable() {
+            Some(SkipReason::StateUnavailable)
+        } else {
+            None
+        }
+    }
+
+    /// Reads the device's own lighting again after a write to its memory changed it.
+    fn refresh_hardware(&self) {
+        self.shared
+            .set_hardware(&self.id, self.generation, self.ctrl.hardware_mode());
+    }
+
+    /// Saves `look` to the device's memory (ADR 0001 #42). Refused without a stored backup of the device's original
+    /// saved state: the first save stores the driver's backup first (a failed durable write blocks the device write),
+    /// and a driver that cannot tell the original completely is never written; neither is a device whose stored backup
+    /// cannot be parsed (it may be the original, so it is never replaced). At most [`DAILY_SAVE_CAP`] writes a
+    /// day; refusals before anything reached the memory do not count.
+    fn persist(&mut self, look: &PersistLook, day: u32, deadline: Option<Instant>) -> PersistResult {
+        if let Some(reason) = self.memory_write_blocked(deadline) {
+            return PersistResult::Skipped { reason };
+        }
+        let last = {
+            let mut hw = self.shared.hw();
+            if hw.saved_backup(&self.id).is_none() {
+                if hw.saved_backup_unreadable(&self.id) {
+                    warn!(id = %self.id, "the stored backup of the device's saved state cannot be read; not saving");
+                    return PersistResult::Failed {
+                        error:
+                            "the stored backup of the device's original saved state is unreadable; not saving"
+                                .into(),
+                    };
+                }
+                let Some(backup) = self.ctrl.saved_state_backup() else {
+                    return PersistResult::Skipped {
+                        reason: SkipReason::OriginalUnknown,
+                    };
+                };
+                if let Err(e) = hw.record_saved_backup(&self.id, &backup) {
+                    warn!(id = %self.id, error = %e, "cannot store the backup of the device's saved state; not saving");
+                    return PersistResult::Failed {
+                        error: format!("cannot store the backup: {e}"),
+                    };
+                }
+                info!(id = %self.id, bytes = backup.len(), "backup of the device's original saved state stored");
+            }
+            if hw.saved_writes(&self.id, day) >= DAILY_SAVE_CAP {
+                return PersistResult::Skipped {
+                    reason: SkipReason::DailyCap,
+                };
+            }
+            hw.saved_fingerprint(&self.id).map(<[u8]>::to_vec)
+        };
+        self.needs_release = true;
+        self.mark_written();
+        let r = self.ctrl.persist_look(look, last.as_deref());
+        self.refresh_hardware();
+        match r {
+            Ok(PersistOutcome::Unchanged) => PersistResult::Unchanged,
+            Ok(PersistOutcome::Written { fingerprint }) => {
+                let count = self.count_write(Some(&fingerprint), day);
+                info!(id = %self.id, writes_today = count, "lighting saved to the device's memory");
+                self.shared.record_own_lighting(&self.id, self.ctrl.as_ref());
+                PersistResult::Written
+            }
+            Err(DeviceError::Unsupported) => PersistResult::Skipped {
+                reason: SkipReason::NotCapable,
+            },
+            Err(e @ (DeviceError::Refused(_) | DeviceError::InvalidArgument(_))) => {
+                // Refused before anything reached the device's memory: not counted, the fingerprint still holds.
+                warn!(id = %self.id, error = %e, "saving to the device refused");
+                PersistResult::Failed { error: e.to_string() }
+            }
+            Err(e) => {
+                warn!(id = %self.id, error = %e, "saving to the device failed");
+                // The write may have reached the device's memory before it failed: counted, fingerprint dropped.
+                self.count_write(None, day);
+                // Only a fatal error takes the device out of service.
+                if e.is_fatal() {
+                    self.record(&Err(e.clone()));
+                }
+                PersistResult::Failed { error: e.to_string() }
+            }
+        }
+    }
+
+    /// Writes the stored backup of the device's original saved state back to it and drops the backup (and the
+    /// pending restore) on success. At most [`RESTORE_CAP`] attempts that may reach the memory a day; after that the
+    /// pending restore stays and nothing is written until the next day. Every restore drops the stored fingerprint.
+    fn restore(&mut self, day: u32, deadline: Option<Instant>) -> PersistResult {
+        if let Some(reason) = self.memory_write_blocked(deadline) {
+            return PersistResult::Skipped { reason };
+        }
+        let backup = {
+            let mut hw = self.shared.hw();
+            let Some(backup) = hw.saved_backup(&self.id).map(<[u8]>::to_vec) else {
+                if let Err(e) = hw.set_pending_restore(&self.id, false) {
+                    warn!(id = %self.id, error = %e, "cannot clear the pending restore");
+                }
+                return PersistResult::Skipped {
+                    reason: SkipReason::NoBackup,
+                };
+            };
+            if hw.restore_attempts(&self.id, day) >= RESTORE_CAP {
+                info!(id = %self.id, "restore attempts of the day used up; the restore stays pending until tomorrow");
+                return PersistResult::Skipped {
+                    reason: SkipReason::DailyCap,
+                };
+            }
+            // From here on the memory may change: the fingerprint no longer says what it holds.
+            if let Err(e) = hw.clear_saved_fingerprint(&self.id) {
+                warn!(id = %self.id, error = %e, "cannot drop the saved fingerprint; not restoring");
+                return PersistResult::Failed {
+                    error: format!("cannot update the records: {e}"),
+                };
+            }
+            backup
+        };
+        self.needs_release = true;
+        self.mark_written();
+        let r = self.ctrl.restore_saved_state(&backup);
+        self.refresh_hardware();
+        match r {
+            Ok(outcome) => {
+                let written = matches!(outcome, PersistOutcome::Written { .. });
+                if written {
+                    let count = self.count_write(None, day);
+                    self.count_restore_attempt(day);
+                    info!(id = %self.id, writes_today = count, "original saved state written back to the device");
+                } else {
+                    info!(id = %self.id, "the device already holds its original saved state");
+                }
+                if let Err(e) = self.shared.hw().remove_saved_backup(&self.id) {
+                    warn!(id = %self.id, error = %e, "cannot drop the backup after writing it back");
+                }
+                self.shared.record_own_lighting(&self.id, self.ctrl.as_ref());
+                // The device shows the restored state now: the next output must go out again.
+                self.shown_mode = None;
+                if written {
+                    PersistResult::Written
+                } else {
+                    PersistResult::Unchanged
+                }
+            }
+            Err(DeviceError::Unsupported) => PersistResult::Skipped {
+                reason: SkipReason::NotCapable,
+            },
+            Err(e @ (DeviceError::Refused(_) | DeviceError::InvalidArgument(_))) => {
+                warn!(id = %self.id, error = %e, "writing the original saved state back refused; the backup is kept");
+                PersistResult::Failed { error: e.to_string() }
+            }
+            Err(e) => {
+                warn!(id = %self.id, error = %e, "writing the original saved state back failed; the backup is kept");
+                self.count_write(None, day);
+                self.count_restore_attempt(day);
+                // Only a fatal error takes the device out of service.
+                if e.is_fatal() {
+                    self.record(&Err(e.clone()));
+                }
+                PersistResult::Failed { error: e.to_string() }
+            }
+        }
+    }
+
+    /// Counts one write to the device's memory on `day` and records `fingerprint` (without one, the stored fingerprint
+    /// is dropped); returns the day's count.
+    fn count_write(&self, fingerprint: Option<&[u8]>, day: u32) -> u32 {
+        let mut hw = self.shared.hw();
+        match hw.record_saved_write(&self.id, fingerprint, day) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(id = %self.id, error = %e, "cannot record the write to the device's memory");
+                // The stored fingerprint (if any) is of an earlier look: drop it, on disk if possible and in memory
+                // anyway, so a later save of that look is not taken as unchanged.
+                if let Err(e) = hw.clear_saved_fingerprint(&self.id) {
+                    warn!(id = %self.id, error = %e, "cannot drop the saved fingerprint; forgetting it for this session");
+                    hw.forget_saved_fingerprint(&self.id);
+                }
+                0
+            }
+        }
+    }
+
+    /// Counts one restore attempt on `day`.
+    fn count_restore_attempt(&self, day: u32) {
+        if let Err(e) = self.shared.hw().record_restore_attempt(&self.id, day) {
+            warn!(id = %self.id, error = %e, "cannot record the restore attempt");
+        }
     }
 
     /// Runs a sequenced call (mode or release): skipped with `Ok(false)` if something issued later was already

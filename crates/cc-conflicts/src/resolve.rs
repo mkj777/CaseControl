@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::{ActionError, is_valid_service_name};
 use crate::autostart::{AutostartItem, AutostartLocation};
+use crate::boot_task::{BOOT_TASK_ENTRY, HelperContext};
 use crate::scan::{Evidence, Finding, ScanReport};
 use crate::sources::{ServiceKind, ServiceState, StartType};
 
@@ -21,9 +22,10 @@ pub const ELEVATED_PROTOCOL_VERSION: u32 = 1;
 /// Upper bound on actions in one elevated request; a longer request is refused as a whole.
 pub const MAX_ELEVATED_ACTIONS: usize = 64;
 
-/// One change to the system. The only things CaseControl ever does to other software.
+/// One change to the system. The only things CaseControl ever does to other software, plus CaseControl's own
+/// start-up task (ADR 0001 #42). Unknown kinds and unknown fields are refused when parsing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     /// Terminate process `pid` if its executable is still `name`.
     TerminateProcess {
@@ -53,6 +55,13 @@ pub enum Action {
         /// On (`0x02`) or off (`0x03` + timestamp).
         enabled: bool,
     },
+    /// Register CaseControl's start-up task for the signed-in user (elevated helper only, entry
+    /// [`BOOT_TASK_ENTRY`]). Carries no values: the helper derives the user, executable and arguments itself
+    /// (see [`crate::boot_task`]).
+    RegisterBootTask {},
+    /// Remove the signed-in user's start-up task if it is CaseControl's (elevated helper only, entry
+    /// [`BOOT_TASK_ENTRY`]).
+    RemoveBootTask {},
 }
 
 impl Action {
@@ -62,7 +71,13 @@ impl Action {
             Action::TerminateProcess { .. } => false,
             Action::StopService { .. } | Action::SetServiceStartType { .. } => true,
             Action::SetStartupApproved { location, .. } => location.needs_admin(),
+            Action::RegisterBootTask {} | Action::RemoveBootTask {} => true,
         }
+    }
+
+    /// Whether this is one of the start-up task actions, which belong to [`BOOT_TASK_ENTRY`] only.
+    pub fn is_boot_task(&self) -> bool {
+        matches!(self, Action::RegisterBootTask {} | Action::RemoveBootTask {})
     }
 
     /// Execution order inside a batch: autostart changes first (so nothing restarts what is closed), then services,
@@ -73,6 +88,7 @@ impl Action {
             Action::SetStartupApproved { .. } => 1,
             Action::StopService { .. } => 2,
             Action::TerminateProcess { .. } => 3,
+            Action::RegisterBootTask {} | Action::RemoveBootTask {} => 4,
         }
     }
 }
@@ -156,6 +172,18 @@ pub trait SystemOps {
         name: &str,
         enabled: bool,
     ) -> Result<(), String>;
+    /// Registers the start-up task (elevated helper only; see [`crate::boot_task::register_boot_task`]). The
+    /// default refuses.
+    fn register_boot_task(&self, ctx: &HelperContext) -> Result<(), String> {
+        let _ = ctx;
+        Err("the start-up task is not supported here".to_owned())
+    }
+    /// Removes the start-up task if it is ours (elevated helper only; see
+    /// [`crate::boot_task::remove_boot_task`]). The default refuses.
+    fn remove_boot_task(&self, ctx: &HelperContext) -> Result<(), String> {
+        let _ = ctx;
+        Err("the start-up task is not supported here".to_owned())
+    }
 }
 
 /// What "Close now" does for `finding`: terminate each matched process (only those in `session` when given), stop
@@ -222,11 +250,29 @@ pub fn autostart_actions(
 /// Checks that `planned` targets something `report` (a fresh scan) attributes to its catalogue entry. This is the
 /// whole authorisation model: an action on anything a scan does not tie to the catalogue is refused. With
 /// `session`, a process is only ended if the scan saw it in that Windows session (never another user's process).
+///
+/// The start-up task actions are the exception: they need no finding and are accepted only with the reserved entry
+/// [`BOOT_TASK_ENTRY`], which in turn is refused for every other action.
 pub fn check_action(
     planned: &PlannedAction,
     report: &ScanReport,
     session: Option<u32>,
 ) -> Result<(), String> {
+    match (planned.action.is_boot_task(), planned.entry_id == BOOT_TASK_ENTRY) {
+        (true, true) => return Ok(()),
+        (true, false) => {
+            return Err(format!(
+                "{:?} cannot carry the start-up task action",
+                planned.entry_id
+            ));
+        }
+        (false, true) => {
+            return Err(format!(
+                "{BOOT_TASK_ENTRY:?} carries only the start-up task actions"
+            ));
+        }
+        (false, false) => {}
+    }
     let finding = report
         .findings
         .iter()
@@ -287,13 +333,25 @@ pub fn check_action(
                 ));
             }
         }
+        Action::RegisterBootTask {} | Action::RemoveBootTask {} => {
+            return Err("the start-up task actions are checked above".to_owned());
+        }
     }
     Ok(())
 }
 
 /// Runs `actions` through `ops`, autostart changes first, then service stops, then terminations. Returns one
-/// outcome per action in the order given. A process that no longer exists counts as closed.
+/// outcome per action in the order given. A process that no longer exists counts as closed. The start-up task
+/// actions fail here: only the elevated helper runs them ([`run_elevated_request_in`]).
 pub fn execute(actions: &[PlannedAction], ops: &dyn SystemOps) -> Vec<ActionOutcome> {
+    execute_in(actions, ops, None)
+}
+
+fn execute_in(
+    actions: &[PlannedAction],
+    ops: &dyn SystemOps,
+    helper: Option<&HelperContext>,
+) -> Vec<ActionOutcome> {
     let mut order: Vec<usize> = (0..actions.len()).collect();
     order.sort_by_key(|&i| actions[i].action.phase());
     let mut outcomes: Vec<Option<ActionOutcome>> = vec![None; actions.len()];
@@ -319,6 +377,16 @@ pub fn execute(actions: &[PlannedAction], ops: &dyn SystemOps) -> Vec<ActionOutc
                 name,
                 enabled,
             } => to_outcome(planned, ops.set_startup_approved(*location, name, *enabled)),
+            Action::RegisterBootTask {} => match helper {
+                Some(ctx) => to_outcome(planned, ops.register_boot_task(ctx)),
+                None => {
+                    ActionOutcome::failure(planned, "only the elevated helper registers the start-up task")
+                }
+            },
+            Action::RemoveBootTask {} => match helper {
+                Some(ctx) => to_outcome(planned, ops.remove_boot_task(ctx)),
+                None => ActionOutcome::failure(planned, "only the elevated helper removes the start-up task"),
+            },
         };
         if let Some(err) = &outcome.error {
             tracing::warn!(entry = reason, action = ?planned.action, error = %err, "conflict action failed");
@@ -367,17 +435,30 @@ pub struct ElevatedResponse {
     pub outcomes: Vec<ActionOutcome>,
 }
 
-/// Validates an elevated request against a fresh scan and runs what passes. Used by the helper process.
-///
-/// Rules: the version must match and the request may hold at most [`MAX_ELEVATED_ACTIONS`] actions (otherwise
-/// every action is refused); each action must be one that needs administrator rights or a process termination
-/// (HKCU `StartupApproved` writes are refused: in the elevated process HKCU may be another user's hive); a process
-/// is only ended in the request's session (none without one); and each action must pass [`check_action`] against
-/// `report`. Refused actions are reported, never run.
+/// [`run_elevated_request_in`] with the running process's [`HelperContext::current`] (its own session, no request
+/// file, so the start-up task actions are refused). Prefer [`run_elevated_request_in`] in the helper.
 pub fn run_elevated_request(
     request: &ElevatedRequest,
     report: &ScanReport,
     ops: &dyn SystemOps,
+) -> ElevatedResponse {
+    run_elevated_request_in(request, report, ops, &HelperContext::current())
+}
+
+/// Validates an elevated request against a fresh scan and runs what passes. Used by the helper process with
+/// `helper` = [`HelperContext::for_request`] of its validated request file.
+///
+/// Rules: the version must match, the request may hold at most [`MAX_ELEVATED_ACTIONS`] actions, and a request
+/// that names a session must come from the helper's own session (otherwise every action is refused); each action
+/// must be one that needs administrator rights or a process termination (HKCU `StartupApproved` writes are refused:
+/// in the elevated process HKCU may be another user's hive); a process is only ended in the request's session
+/// (none without one); the start-up task actions also need the request's session; and each action must pass
+/// [`check_action`] against `report`. Refused actions are reported, never run.
+pub fn run_elevated_request_in(
+    request: &ElevatedRequest,
+    report: &ScanReport,
+    ops: &dyn SystemOps,
+    helper: &HelperContext,
 ) -> ElevatedResponse {
     let refuse_all = if request.version != ELEVATED_PROTOCOL_VERSION {
         Some(format!(
@@ -388,6 +469,11 @@ pub fn run_elevated_request(
         Some(format!(
             "request holds {} actions, more than {MAX_ELEVATED_ACTIONS}",
             request.actions.len()
+        ))
+    } else if request.session_id.is_some() && request.session_id != helper.session_id {
+        Some(format!(
+            "the request comes from Windows session {:?}, the helper runs in session {:?}",
+            request.session_id, helper.session_id
         ))
     } else {
         None
@@ -413,6 +499,8 @@ pub fn run_elevated_request(
         let is_termination = matches!(planned.action, Action::TerminateProcess { .. });
         let check = if is_termination && request.session_id.is_none() {
             Err("the request names no session, so no process is ended".to_owned())
+        } else if planned.action.is_boot_task() && request.session_id.is_none() {
+            Err("the request names no session, so the start-up task is not changed".to_owned())
         } else if elevated_kind {
             check_action(planned, report, request.session_id)
         } else {
@@ -429,7 +517,10 @@ pub fn run_elevated_request(
             }
         }
     }
-    let mut ran = execute(&accepted, ops).into_iter().map(Some).collect::<Vec<_>>();
+    let mut ran = execute_in(&accepted, ops, Some(helper))
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
     let outcomes = slots
         .into_iter()
         .map(|slot| match slot {
@@ -451,6 +542,15 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::catalog::{Access, Category, Class, Severity};
+
+    /// The helper context the existing tests run in: session 1, like the requests.
+    fn helper() -> HelperContext {
+        crate::boot_task::tests::ctx()
+    }
+
+    fn run(request: &ElevatedRequest, report: &ScanReport, ops: &dyn SystemOps) -> ElevatedResponse {
+        run_elevated_request_in(request, report, ops, &helper())
+    }
 
     /// Records every call; answers from a script.
     #[derive(Default)]
@@ -496,6 +596,18 @@ pub(crate) mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("approved {location:?} {name} {enabled}"));
+            Ok(())
+        }
+        fn register_boot_task(&self, ctx: &HelperContext) -> Result<(), String> {
+            self.calls
+                .borrow_mut()
+                .push(format!("register_boot_task {:?}", ctx.session_id));
+            Ok(())
+        }
+        fn remove_boot_task(&self, ctx: &HelperContext) -> Result<(), String> {
+            self.calls
+                .borrow_mut()
+                .push(format!("remove_boot_task {:?}", ctx.session_id));
             Ok(())
         }
     }
@@ -858,7 +970,7 @@ pub(crate) mod tests {
             ],
             Some(1),
         );
-        let response = run_elevated_request(&request, &report(), &ops);
+        let response = run(&request, &report(), &ops);
         assert_eq!(response.version, ELEVATED_PROTOCOL_VERSION);
         let ok: Vec<bool> = response.outcomes.iter().map(|o| o.ok).collect();
         assert_eq!(ok, [true, false, false, true, true]);
@@ -884,7 +996,7 @@ pub(crate) mod tests {
                 name: "SignalRgb.exe".into(),
             })
         };
-        let response = run_elevated_request(
+        let response = run(
             &ElevatedRequest::new(vec![kill(100), kill(200)], Some(1)),
             &report(),
             &ops,
@@ -893,7 +1005,7 @@ pub(crate) mod tests {
             response.outcomes.iter().map(|o| o.ok).collect::<Vec<_>>(),
             [true, false]
         );
-        let response = run_elevated_request(&ElevatedRequest::new(vec![kill(100)], None), &report(), &ops);
+        let response = run(&ElevatedRequest::new(vec![kill(100)], None), &report(), &ops);
         assert!(!response.outcomes[0].ok);
         assert_eq!(*ops.calls.borrow(), ["terminate 100 SignalRgb.exe"]);
     }
@@ -906,10 +1018,10 @@ pub(crate) mod tests {
         });
         let mut request = ElevatedRequest::new(vec![action.clone()], Some(1));
         request.version = 99;
-        let response = run_elevated_request(&request, &report(), &ops);
+        let response = run(&request, &report(), &ops);
         assert!(response.outcomes.iter().all(|o| !o.ok));
         let request = ElevatedRequest::new(vec![action; MAX_ELEVATED_ACTIONS + 1], Some(1));
-        let response = run_elevated_request(&request, &report(), &ops);
+        let response = run(&request, &report(), &ops);
         assert!(response.outcomes.iter().all(|o| !o.ok));
         assert!(ops.calls.borrow().is_empty());
     }
@@ -923,7 +1035,7 @@ pub(crate) mod tests {
             })],
             Some(1),
         );
-        let response = run_elevated_request(&request, &ScanReport::default(), &ops);
+        let response = run(&request, &ScanReport::default(), &ops);
         assert!(!response.outcomes[0].ok);
         assert!(ops.calls.borrow().is_empty());
     }
@@ -939,5 +1051,143 @@ pub(crate) mod tests {
         let action = &value["action"];
         assert_eq!(action["kind"].as_str(), Some("set_startup_approved"));
         assert_eq!(action["location"].as_str(), Some("hklm_run32"));
+    }
+
+    fn boot(action: Action) -> PlannedAction {
+        PlannedAction {
+            entry_id: BOOT_TASK_ENTRY.into(),
+            action,
+        }
+    }
+
+    #[test]
+    fn boot_task_actions_wire_format() {
+        for (action, json) in [
+            (Action::RegisterBootTask {}, r#"{"kind":"register_boot_task"}"#),
+            (Action::RemoveBootTask {}, r#"{"kind":"remove_boot_task"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&action).expect("serializes"), json);
+            assert_eq!(serde_json::from_str::<Action>(json).expect("parses"), action);
+            assert!(action.needs_admin());
+        }
+        let planned = boot(Action::RegisterBootTask {});
+        let text =
+            serde_json::to_string(&ElevatedRequest::new(vec![planned.clone()], Some(1))).expect("request");
+        let back: ElevatedRequest = serde_json::from_str(&text).expect("round trip");
+        assert_eq!(back.actions, [planned]);
+    }
+
+    #[test]
+    fn extra_fields_are_refused() {
+        for json in [
+            r#"{"kind":"register_boot_task","exe":"C:\\x.exe"}"#,
+            r#"{"kind":"remove_boot_task","user":"S-1-5-18"}"#,
+            r#"{"kind":"register_boot_task","arguments":"--evil"}"#,
+            r#"{"kind":"stop_service","name":"a","extra":1}"#,
+            r#"{"kind":"unknown_kind"}"#,
+        ] {
+            assert!(serde_json::from_str::<Action>(json).is_err(), "{json}");
+        }
+        assert!(serde_json::from_str::<Action>(r#"{"kind":"stop_service","name":"a"}"#).is_ok());
+    }
+
+    #[test]
+    fn boot_task_entry_id_is_reserved() {
+        let r = report();
+        assert_eq!(
+            check_action(&boot(Action::RegisterBootTask {}), &r, Some(1)),
+            Ok(())
+        );
+        assert_eq!(
+            check_action(&boot(Action::RemoveBootTask {}), &ScanReport::default(), None),
+            Ok(())
+        );
+        // Start-up task actions under a catalogue entry, and catalogue actions under the reserved entry.
+        assert!(check_action(&planned(Action::RegisterBootTask {}), &r, Some(1)).is_err());
+        assert!(
+            check_action(
+                &boot(Action::StopService {
+                    name: "SignalRgb.Service".into()
+                }),
+                &r,
+                Some(1)
+            )
+            .is_err()
+        );
+        // The catalogue never uses the reserved id.
+        assert!(
+            crate::Catalog::embedded()
+                .entries()
+                .iter()
+                .all(|e| e.id != BOOT_TASK_ENTRY)
+        );
+    }
+
+    #[test]
+    fn boot_task_actions_run_only_in_the_elevated_helper() {
+        let ops = FakeOps::default();
+        let outcomes = execute(&[boot(Action::RegisterBootTask {})], &ops);
+        assert!(!outcomes[0].ok);
+        assert!(ops.calls.borrow().is_empty());
+
+        let request = ElevatedRequest::new(
+            vec![
+                boot(Action::RegisterBootTask {}),
+                planned(Action::RemoveBootTask {}),
+                boot(Action::RemoveBootTask {}),
+                planned(Action::StopService {
+                    name: "SignalRgb.Service".into(),
+                }),
+            ],
+            Some(1),
+        );
+        let response = run(&request, &report(), &ops);
+        assert_eq!(
+            response.outcomes.iter().map(|o| o.ok).collect::<Vec<_>>(),
+            [true, false, true, true]
+        );
+        assert_eq!(
+            *ops.calls.borrow(),
+            [
+                "stop SignalRgb.Service",
+                "register_boot_task Some(1)",
+                "remove_boot_task Some(1)"
+            ]
+        );
+    }
+
+    #[test]
+    fn boot_task_actions_need_a_session() {
+        let ops = FakeOps::default();
+        let response = run(
+            &ElevatedRequest::new(vec![boot(Action::RegisterBootTask {})], None),
+            &report(),
+            &ops,
+        );
+        assert!(!response.outcomes[0].ok);
+        assert!(ops.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_request_from_another_session_is_refused_as_a_whole() {
+        let ops = FakeOps::default();
+        let request = ElevatedRequest::new(
+            vec![
+                boot(Action::RegisterBootTask {}),
+                planned(Action::StopService {
+                    name: "SignalRgb.Service".into(),
+                }),
+            ],
+            Some(2),
+        );
+        let response = run(&request, &report(), &ops);
+        assert!(response.outcomes.iter().all(|o| !o.ok));
+        let unknown_own = HelperContext {
+            session_id: None,
+            ..helper()
+        };
+        let response = run_elevated_request_in(&request, &report(), &ops, &unknown_own);
+        assert!(response.outcomes.iter().all(|o| !o.ok));
+        assert!(ops.calls.borrow().is_empty());
     }
 }

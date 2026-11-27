@@ -496,6 +496,166 @@ impl ConfigPacket {
     }
 }
 
+/// Highest effect value a packet written to flash may carry in a zone record (`enum MSI_MODE` ends at 39; 0x25, the
+/// per-LED effect, lies inside the range and is refused on its own).
+pub const MAX_SAVED_EFFECT: u8 = 39;
+
+/// Brightness value of a zone record (`speedAndBrightnessFlags >> 2`, 5 bits).
+fn record_brightness(flags: u8) -> u8 {
+    (flags & BRIGHTNESS_MASK) >> BRIGHTNESS_SHIFT
+}
+
+/// Save gate (research §1.4): no zone record of `packet` is in effect 0 (disable, untested upstream) or 0x25
+/// (per-LED: a board saved in it boots into per-LED mode without frame data). Returns the first offending record.
+pub fn check_savable_effects(packet: &ConfigPacket) -> Result<(), String> {
+    for o in ZONE_OFFSETS {
+        let effect = packet.0[o + EFFECT];
+        if effect == mode::DISABLE || effect == mode::DIRECT_EFFECT {
+            return Err(format!("zone record at byte {o} has effect {effect:#04x}"));
+        }
+    }
+    Ok(())
+}
+
+/// Colour flag bits the reference documents (`MSI_COLOR_FLAG_*`: the six sync bits and "use custom colour").
+const DOCUMENTED_COLOR_FLAGS: u8 = CF_USE_CUSTOM_COLOR
+    | CF_SYNC_ONBOARD
+    | CF_SYNC_JRAINBOW1
+    | CF_SYNC_JRAINBOW2
+    | CF_SYNC_JCORSAIR
+    | CF_SYNC_JPIPE1
+    | CF_SYNC_JPIPE2;
+
+/// Save gate on every zone record of a packet that is to reach flash (research §1.4), also those of zones the save
+/// does not change: an effect in `1..=`[`MAX_SAVED_EFFECT`] other than 0x25 (so neither "disable" nor per-LED), a
+/// brightness of at most 10, a speed of at most [`speed::HIGH`], and only documented colour flag bits. Effects
+/// outside our mode table (e.g. 25, which MSI software saves) are accepted. Returns the first offending record.
+pub fn check_saved_records(packet: &ConfigPacket) -> Result<(), String> {
+    for o in ZONE_OFFSETS {
+        let effect = packet.0[o + EFFECT];
+        let flags = packet.0[o + SPEED_BRIGHTNESS];
+        let color_flags = packet.0[o + COLOR_FLAGS];
+        if !(1..=MAX_SAVED_EFFECT).contains(&effect) || effect == mode::DIRECT_EFFECT {
+            return Err(format!("zone record at byte {o} has effect {effect:#04x}"));
+        }
+        if record_brightness(flags) > brightness::LEVEL_100 {
+            return Err(format!(
+                "zone record at byte {o} has brightness {}",
+                record_brightness(flags)
+            ));
+        }
+        if flags & SPEED_MASK > speed::HIGH {
+            return Err(format!(
+                "zone record at byte {o} has speed {}",
+                flags & SPEED_MASK
+            ));
+        }
+        if color_flags & !DOCUMENTED_COLOR_FLAGS != 0 {
+            return Err(format!(
+                "zone record at byte {o} has undocumented colour flags {color_flags:#04x}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Save gate: the ARGB header LED counts are within the headers' maxima (JRAINBOW1 200, JRAINBOW2 and JRAINBOW3
+/// 240).
+pub fn check_led_counts(packet: &ConfigPacket) -> Result<(), String> {
+    for (zone, max) in [
+        (MsiZone::JRainbow1, JRAINBOW1_MAX_LEDS),
+        (MsiZone::JRainbow2, JRAINBOW2_MAX_LEDS),
+        (MsiZone::JRainbow3, JRAINBOW2_MAX_LEDS),
+    ] {
+        let n = usize::from(packet.led_count(zone).unwrap_or(0));
+        if n > max {
+            return Err(format!("{zone:?} has {n} LEDs, more than {max}"));
+        }
+    }
+    Ok(())
+}
+
+/// The bits of a configuration packet that [`ConfigPacket::apply_mode`] and [`ConfigPacket::apply_zone_color`] may
+/// change when they are applied to `zones`: each zone's record (effect, colours, speed and brightness, colour flags,
+/// padding; never the LED count byte), the on-board record where JRGB/JPIPE zones mirror into it on boards without
+/// on-board LEDs, the on-board LEDs 1..n of the on-board zone, and the on-board sync bits (bit 7 of byte 78, bits
+/// 0x30 of byte 82) every mode change sets or clears. The save byte is not included.
+pub fn save_change_mask(layout: &Layout, zones: &[MsiZone]) -> [u8; CONFIG_LEN] {
+    let mut mask = [0u8; CONFIG_LEN];
+    let record = |mask: &mut [u8; CONFIG_LEN], off: usize| {
+        mask[off..=off + PADDING].fill(0xFF);
+    };
+    let ob = OFF_ON_BOARD[0];
+    for &zone in zones {
+        let Some(off) = zone_offset(zone, layout.mixed_mode) else {
+            continue;
+        };
+        record(&mut mask, off);
+        if layout.no_onboards && zone.is_jrgb_or_jpipe() {
+            record(&mut mask, ob);
+        }
+        if zone == MsiZone::OnBoard(0) {
+            for i in 0..layout.onboard_leds {
+                if let Some(o) = zone_offset(MsiZone::OnBoard(1 + i), layout.mixed_mode) {
+                    record(&mut mask, o);
+                }
+            }
+        }
+        mask[ob + SPEED_BRIGHTNESS] |= SB_SYNC_JRGB;
+        mask[ob + COLOR_FLAGS] |= CF_SYNC_JPIPE1 | CF_SYNC_JPIPE2;
+    }
+    mask
+}
+
+/// Save gate: `next` differs from `base` only in the bits [`save_change_mask`] allows for `zones` (the save byte is
+/// ignored). Returns the first byte that changed outside them.
+pub fn check_save_diff(
+    base: &ConfigPacket,
+    next: &ConfigPacket,
+    layout: &Layout,
+    zones: &[MsiZone],
+) -> Result<(), String> {
+    let mask = save_change_mask(layout, zones);
+    let bytes = base.0.iter().zip(&next.0).zip(&mask).take(SAVE_BYTE);
+    for (i, ((&old, &new), &allowed)) in bytes.enumerate() {
+        if (old ^ new) & !allowed != 0 {
+            return Err(format!(
+                "byte {i} changed from {old:#04x} to {new:#04x} outside the saved zones"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A backup of the board's original saved state (ADR 0001 #42), or a remembered own lighting (ADR 0001 #38), as a
+/// packet that is safe to send and to write back to flash, or `None`: [`ConfigPacket::from_own_lighting`] (185 bytes,
+/// report id 0x52, save byte 0, no per-LED effect), every zone record passing [`check_saved_records`] (effect `1..=39`
+/// other than 0x25, brightness at most 10, speed at most 2, documented flag bits), and LED counts within the headers'
+/// maxima ([`check_led_counts`]). Effects outside the mode table (e.g. 25, which MSI software saves) are accepted. The
+/// same rules gate every packet that reaches flash, so a backup accepted here can always be written back.
+pub fn validate_backup(bytes: &[u8]) -> Option<ConfigPacket> {
+    let packet = ConfigPacket::from_own_lighting(bytes)?;
+    (check_saved_records(&packet).is_ok() && check_led_counts(&packet).is_ok()).then_some(packet)
+}
+
+/// `base` with the bits [`save_change_mask`] allows for `zones` taken from `from` (each zone's record without its
+/// LED count byte, the on-board mirror and sync bits), everything else, LED counts included, kept from `base`; save
+/// byte 0. The packet a restore writes: the board's current configuration with only the backed-up records replaced.
+pub fn replace_records(
+    base: &ConfigPacket,
+    from: &ConfigPacket,
+    layout: &Layout,
+    zones: &[MsiZone],
+) -> ConfigPacket {
+    let mask = save_change_mask(layout, zones);
+    let mut out = base.0;
+    for ((o, f), m) in out.iter_mut().zip(&from.0).zip(&mask).take(SAVE_BYTE) {
+        *o = (*o & !m) | (f & m);
+    }
+    out[SAVE_BYTE] = 0;
+    ConfigPacket(out)
+}
+
 /// Which addressable headers a board exposes (`no_jrainbow1`, `no_jrainbow2`, `no_jcorsair` inverted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Headers {

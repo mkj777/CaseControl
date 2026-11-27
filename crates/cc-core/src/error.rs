@@ -30,6 +30,11 @@ pub enum DeviceError {
     /// The device is in a state where the driver must stop talking to it.
     #[error("device faulted: {0}")]
     Faulted(String),
+    /// A safety gate refused a write to the device's own memory (ADR 0001 #42) before anything reached that memory.
+    /// The device may have been sent a volatile state on the way (and is driven again afterwards); its memory is
+    /// unchanged, so the write does not count toward the daily cap.
+    #[error("refused: {0}")]
+    Refused(String),
 }
 
 impl DeviceError {
@@ -234,6 +239,7 @@ mod tests {
             DeviceError::Transport("x".into()),
             DeviceError::Timeout,
             DeviceError::Protocol("x".into()),
+            DeviceError::Refused("x".into()),
         ] {
             assert!(!e.is_fatal(), "{e}");
         }

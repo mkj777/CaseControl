@@ -101,3 +101,97 @@ pub struct ReleaseReport {
     /// Devices whose release failed.
     pub failed: Vec<ApplyFailure>,
 }
+
+/// How [`EngineHandle::shutdown_with`](crate::EngineHandle::shutdown_with) leaves the devices (ADR 0001 #42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownMode {
+    /// Hand every device back to its own lighting (explicit Quit, installer, today's default).
+    Release,
+    /// Keep CaseControl's colours on the devices (Windows shutdown, restart, sign-out): every device is sent its
+    /// latest output once more, then its thread stops without a release. The "unreleased" markers stay set.
+    Keep,
+}
+
+/// Why a device was not saved to or restored (see [`PersistResult::Skipped`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The app hides the device (it is not controlled).
+    Hidden,
+    /// The device is faulted.
+    Faulted,
+    /// Its driver cannot save to it (or not this kind of look).
+    NotCapable,
+    /// The engine does not drive it (never set, or released), so there is no look to save.
+    NotDriven,
+    /// Every zone of the look is hidden or empty.
+    NothingToSave,
+    /// Its driver cannot tell the device's original saved state completely, so it is never written.
+    OriginalUnknown,
+    /// The device's memory was written the maximum number of times today.
+    DailyCap,
+    /// There is no backup to write back.
+    NoBackup,
+    /// The device is not connected; its backup is written back when it is next connected.
+    Absent,
+    /// The call's time budget ran out before the device's turn (also: its worker took the request up too late).
+    TimeBudget,
+    /// Writing devices' memory is switched off for this engine ([`EngineConfig::device_memory_writes`]), e.g. in the
+    /// start-up instance before sign-in.
+    ///
+    /// [`EngineConfig::device_memory_writes`]: crate::EngineConfig::device_memory_writes
+    WritesDisabled,
+    /// The records of saving to the devices (backup, counts) cannot be stored durably this session (unreadable or
+    /// foreign `device-memory.toml`, no machine id, in-memory state), so nothing is written to the device.
+    StateUnavailable,
+}
+
+/// What happened to one device in [`EngineHandle::persist_all`](crate::EngineHandle::persist_all) or
+/// [`EngineHandle::restore_saved`](crate::EngineHandle::restore_saved).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum PersistResult {
+    /// Its memory was written (the look saved, or the backup written back).
+    Written,
+    /// The look equals the one saved last; nothing was written.
+    Unchanged,
+    /// Not written, for a reason that is not an error.
+    Skipped {
+        /// Why.
+        reason: SkipReason,
+    },
+    /// Writing failed or a safety gate refused it; the device's memory was not (completely) written.
+    Failed {
+        /// What went wrong.
+        error: String,
+    },
+    /// The device did not answer within the time budget. The request is still queued or running and may complete;
+    /// its records (backup, fingerprint, counts, pending restore) are updated when it does.
+    Unconfirmed,
+}
+
+/// One device's result in a [`PersistReport`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PersistEntry {
+    /// The device.
+    pub id: DeviceId,
+    /// What happened.
+    pub result: PersistResult,
+}
+
+/// Result of [`EngineHandle::persist_all`](crate::EngineHandle::persist_all) and
+/// [`EngineHandle::restore_saved`](crate::EngineHandle::restore_saved), one entry per device considered, in id
+/// order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PersistReport {
+    /// Per-device results.
+    pub devices: Vec<PersistEntry>,
+}
+
+impl PersistReport {
+    /// The result of device `id`, if it was considered.
+    pub fn result(&self, id: &DeviceId) -> Option<&PersistResult> {
+        self.devices.iter().find(|e| e.id == *id).map(|e| &e.result)
+    }
+}

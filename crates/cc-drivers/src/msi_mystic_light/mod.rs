@@ -14,7 +14,9 @@
 //!   reference's firmware gate (`GetFirmwareVersionInvalid`) and reads the configuration report 0x52 (185 bytes).
 //! - Hardware modes rewrite that configuration (`SetMode`, `SetZoneColor`) and send it as feature report 0x52, preceded
 //!   by the board's current configuration, exactly like the reference's `Update`. The save-to-flash byte (offset 184)
-//!   is zero except in [`Controller::save_to_hardware`](cc_core::Controller::save_to_hardware).
+//!   is zero except in [`Controller::save_to_hardware`](cc_core::Controller::save_to_hardware),
+//!   [`Controller::persist_look`](cc_core::Controller::persist_look) and
+//!   [`Controller::restore_saved_state`](cc_core::Controller::restore_saved_state) (see "Save to the board").
 //! - Direct mode first sends the enable message (a 0x52 report with the per-LED effect 0x25 on the on-board zone),
 //!   then one 725-byte feature report 0x53 per frame. While every ARGB header is within 40 LEDs (JRAINBOW1/2) and
 //!   120 LEDs (JRAINBOW3/JCORSAIR) all LEDs travel in that single "sync" report; larger headers switch to one report
@@ -23,26 +25,57 @@
 //! # Release
 //!
 //! `release()` re-reads the board's current configuration, sends it back, then sends the configuration read at open
-//! with the save byte forced to zero. Nothing is written to flash, so the board's saved (power-on) state is never
-//! touched.
+//! with the save byte forced to zero. Nothing is written to flash, so the board's saved (power-on) state is not
+//! touched (after a save, see below, the saved packet is what it hands back).
 //!
 //! Last good own lighting (ADR 0001 #38). What happens at open depends on the engine's persisted "unreleased" marker
 //! ([`DetectContext::is_unreleased`](cc_core::DetectContext::is_unreleased): CaseControl wrote to the board and did not
 //! hand it back, e.g. after a crash or sleep):
 //!
 //! - Marker set: the readback is CaseControl's state and is never reported as own lighting. If the detect context
-//!   holds a remembered state for the board that passes
-//!   [`ConfigPacket::from_own_lighting`](protocol::ConfigPacket::from_own_lighting) (185 bytes, report id 0x52, save
-//!   byte 0, no per-LED effect in any zone), it is restored right away (the two reports of a release), so the board
-//!   and `hardware_mode()` agree, and `release()` restores it later. Without one, `release()` restores the readback
-//!   and [`Controller::shows_own_lighting`](cc_core::Controller::shows_own_lighting) is `false`, so the marker stays.
+//!   holds a remembered state for the board that passes [`protocol::validate_backup`] (185 bytes, report id 0x52,
+//!   save byte 0, every zone record a savable effect with documented bits), it is restored right away (the two
+//!   reports of a release), so the board and `hardware_mode()` agree, and `release()` restores it later. Without one,
+//!   `release()` restores the readback and [`Controller::shows_own_lighting`](cc_core::Controller::shows_own_lighting)
+//!   is `false`, so the marker stays. The decision is the shared [`cc_core::OwnLighting`] seam.
 //! - Marker not set, readback per-LED (any zone in effect 0x25): another program drives the board. Nothing is stored
 //!   or restored; an untouched release sends nothing, a release after CaseControl drove it restores the per-LED
 //!   readback (warning at open).
 //! - Marker not set, readback not per-LED: it is reported through
 //!   [`Controller::own_lighting`](cc_core::Controller::own_lighting) (save byte 0) so the engine remembers it.
 //!
-//! The flash configuration is never written.
+//! A marked board with a valid remembered own lighting that the engine is about to drive
+//! ([`DetectContext::has_setting_pending`](cc_core::DetectContext::has_setting_pending), ADR 0001 #42) is not restored
+//! at open, so it does not flash the old look before the setting arrives; `release()` still restores it.
+//!
+//! # Save to the board (ADR 0001 #42)
+//!
+//! [`Controller::persist_look`](cc_core::Controller::persist_look) writes one configuration packet to flash. It is
+//! built on a trusted base only: the backup of the original (the own lighting seen before CaseControl's first write of
+//! the session, validated) or what this session last wrote to flash; never on the working configuration, a direct-mode
+//! readback or a state CaseControl left, so neither the per-LED enable message nor this session's volatile records
+//! reach flash. A board without a trusted base is never written. On the base the looked-for zones are set with the
+//! same `apply_mode` / `apply_zone_color` calls a hardware-mode update makes: a zone colour as Static at level 10
+//! (brightness baked into the colour), a hardware mode exactly as `set_mode` writes it, off as Static at brightness 0;
+//! zones the look leaves out keep the base's bytes, and every header's LED count byte stays the base's (research
+//! §1.4: unchanged; the configured header sizes are never written to flash). Gates (research §1.4), all
+//! `DeviceError::Refused`: the firmware gate as at open; 185 bytes, report 0x52;
+//! every zone record of the whole packet a savable effect `1..=39` other than 0x25, brightness at most 10, speed at
+//! most 2 and only documented flag bits ([`protocol::check_saved_records`]); LED counts within the maxima; every
+//! byte outside the saved zones' records and the on-board sync/mirror bits ([`protocol::save_change_mask`]) equal to
+//! the base; outside direct mode a fresh readback must equal the working configuration. Sequence: the packet with
+//! save 0 (this also leaves direct mode) and a readback that must equal it, then the reference's two reports with save
+//! 1, then a verifying readback; afterwards (also after a failure) direct mode is taken again with the last frame. The
+//! packet is the fingerprint, the next trusted base, and what `release()` hands back and the own lighting.
+//!
+//! A manual save ([`Controller::save_to_hardware`](cc_core::Controller::save_to_hardware)) is the same write of the
+//! hardware mode `set_mode` last sent; it is refused in direct mode or before any hardware mode was set.
+//!
+//! A restore ([`Controller::restore_saved_state`](cc_core::Controller::restore_saved_state)) validates the backup
+//! ([`protocol::validate_backup`]), leaves direct mode with it (volatile) when the board is driven, reads the board
+//! back (it must not be in per-LED mode) and writes that readback with only the backed-up records replaced
+//! ([`protocol::replace_records`], LED counts from the readback, gated like a save). When nothing was sent to the
+//! board since open and the readback already holds the backup, nothing is written.
 //!
 //! Off: [`Controller::off_mode`](cc_core::Controller::off_mode) is Static, so brightness 0 is Static at brightness 0
 //! (a hardware state) instead of black frames in per-LED mode.
@@ -176,6 +209,7 @@ where
                 &candidate,
                 ctx.stored_own_lighting(&candidate.id),
                 ctx.is_unreleased(&candidate.id),
+                ctx.has_setting_pending(&candidate.id),
             )
         });
         match result {

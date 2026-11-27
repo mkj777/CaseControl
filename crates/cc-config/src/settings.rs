@@ -32,8 +32,8 @@ const RETIRED_KEYS: &[&str] = &["all_off"];
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// The user wants the app to start with Windows. Only records intent: the desktop app applies it through
-    /// `tauri-plugin-autostart`; this crate never touches the registry.
+    /// The user wants the app to start when they sign in. Only records intent: the desktop app applies it (a per-user
+    /// Task Scheduler logon task since ADR 0001 #42); this crate never touches the registry or the Task Scheduler.
     pub autostart: bool,
     /// Start hidden in the tray.
     pub start_minimized: bool,
@@ -59,6 +59,18 @@ pub struct Settings {
     pub default_color: Rgb,
     /// Per-device overrides, keyed by device id.
     pub devices: BTreeMap<DeviceId, DeviceOverrides>,
+    /// "Keep colours when signing out" (ADR 0001 #42): sign-out leaves CaseControl's colours on the devices instead
+    /// of handing them back. Default on; written only when off. A value that is not a boolean loads as the default.
+    #[serde(deserialize_with = "lenient_true", skip_serializing_if = "is_true")]
+    pub keep_colors_on_sign_out: bool,
+    /// "Save colours to the devices" (ADR 0001 #42). Default off; written only when on. A value that is not a
+    /// boolean loads as the default.
+    #[serde(deserialize_with = "lenient_false", skip_serializing_if = "is_false")]
+    pub save_to_devices: bool,
+    /// "Apply colours before sign-in" (ADR 0001 #42): the start-up task exists. Default off; written only when on. A
+    /// value that is not a boolean loads as the default.
+    #[serde(deserialize_with = "lenient_false", skip_serializing_if = "is_false")]
+    pub apply_before_sign_in: bool,
     /// Unknown top-level keys, preserved across a load/save cycle.
     #[serde(flatten)]
     pub extra: toml::Table,
@@ -76,6 +88,9 @@ impl Default for Settings {
             master_brightness: FULL_BRIGHTNESS,
             default_color: DEFAULT_COLOR,
             devices: BTreeMap::new(),
+            keep_colors_on_sign_out: true,
+            save_to_devices: false,
+            apply_before_sign_in: false,
             extra: toml::Table::new(),
         }
     }
@@ -143,6 +158,32 @@ fn clamped_frame_rate<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<u3
 
 fn is_full_brightness(v: &u8) -> bool {
     *v == FULL_BRIGHTNESS
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+/// A boolean, or `default` (with a warning) for any other value. The switches of ADR 0001 #42 were kept as loose
+/// top-level keys before they became fields; a value of the wrong type must not make the whole file "broken".
+fn lenient_bool<'de, D: Deserializer<'de>>(d: D, default: bool) -> std::result::Result<bool, D::Error> {
+    let raw = toml::Value::deserialize(d)?;
+    Ok(raw.as_bool().unwrap_or_else(|| {
+        tracing::warn!(%raw, default, "setting is not a boolean, using the default");
+        default
+    }))
+}
+
+fn lenient_true<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<bool, D::Error> {
+    lenient_bool(d, true)
+}
+
+fn lenient_false<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<bool, D::Error> {
+    lenient_bool(d, false)
 }
 
 fn is_white(c: &Rgb) -> bool {
@@ -613,6 +654,36 @@ brightness = -4
             assert!(s.autostart);
             assert_eq!(s.default_color, DEFAULT_COLOR, "{bad}");
         }
+    }
+
+    #[test]
+    fn power_switches_are_fields_and_migrate_from_loose_keys() {
+        let (_tmp, paths) = temp_paths();
+        let s = Settings::default();
+        assert!(s.keep_colors_on_sign_out && !s.save_to_devices && !s.apply_before_sign_in);
+        let text = s.to_toml().expect("serialize");
+        for key in [
+            "keep_colors_on_sign_out",
+            "save_to_devices",
+            "apply_before_sign_in",
+        ] {
+            assert!(!text.contains(key), "defaults are not written: {text}");
+        }
+
+        // The keys an earlier build kept in `extra` load into the fields and leave `extra`.
+        let old = "autostart = true\nkeep_colors_on_sign_out = false\nsave_to_devices = true\napply_before_sign_in = true\n";
+        std::fs::write(paths.config_file(), old).expect("write");
+        let s = Settings::load(&paths).expect("load");
+        assert!(!s.keep_colors_on_sign_out && s.save_to_devices && s.apply_before_sign_in);
+        assert!(s.extra.is_empty(), "{:?}", s.extra);
+        s.save(&paths).expect("save");
+        assert_eq!(Settings::load(&paths).expect("reload"), s);
+
+        // A value of the wrong type is the default, not a broken file.
+        let s =
+            Settings::from_toml("keep_colors_on_sign_out = 3\nsave_to_devices = \"yes\"\n").expect("parse");
+        assert!(s.keep_colors_on_sign_out && !s.save_to_devices);
+        assert!(paths.config_file().exists());
     }
 
     #[test]

@@ -168,7 +168,7 @@ pub fn split(actions: &[PlannedAction], runnable: &[usize]) -> Split {
 }
 
 /// The main window's handle, so the UAC prompt comes to the front.
-fn owner_window<R: Runtime>(app: &AppHandle<R>) -> Option<isize> {
+pub(crate) fn owner_window<R: Runtime>(app: &AppHandle<R>) -> Option<isize> {
     #[cfg(windows)]
     {
         let hwnd = app.get_webview_window(crate::MAIN_WINDOW)?.hwnd().ok()?;

@@ -8,8 +8,11 @@ use crate::error::{ConfigError, Result};
 const APP_DIR: &str = "CaseControl";
 /// File name of the settings file inside [`Paths::config_dir`].
 const CONFIG_FILE: &str = "config.toml";
-/// File name of the machine state file inside [`Paths::config_dir`] (ADR 0001 #38).
+/// File name of the machine state file inside [`Paths::state_dir`] (ADR 0001 #38), and of the old one inside
+/// [`Paths::config_dir`].
 const HARDWARE_STATE_FILE: &str = "hardware-state.toml";
+/// File name of the device-memory records inside [`Paths::state_dir`] (ADR 0001 #42).
+pub(crate) const DEVICE_MEMORY_FILE: &str = "device-memory.toml";
 
 /// The directories this crate reads and writes. Nothing outside them is touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,8 +55,32 @@ impl Paths {
         self.config_dir.join(CONFIG_FILE)
     }
 
-    /// Full path of the machine state file ([`HardwareState`](crate::HardwareState)).
+    /// The machine-local folder of the machine state: the parent of [`logs_dir`](Self::logs_dir)
+    /// (`%LOCALAPPDATA%\CaseControl`), or [`config_dir`](Self::config_dir) when the logs folder has no parent. Not
+    /// roaming, so a profile that follows the user to another PC does not carry device backups along.
+    pub fn state_dir(&self) -> PathBuf {
+        self.logs_dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| self.config_dir.clone(), Path::to_path_buf)
+    }
+
+    /// Full path of the machine state file ([`HardwareState`](crate::HardwareState)): own lighting and markers, in
+    /// [`state_dir`](Self::state_dir).
     pub fn hardware_state_file(&self) -> PathBuf {
+        self.state_dir().join(HARDWARE_STATE_FILE)
+    }
+
+    /// Full path of the device-memory records ([`HardwareState`](crate::HardwareState), ADR 0001 #42), in
+    /// [`state_dir`](Self::state_dir).
+    pub fn device_memory_file(&self) -> PathBuf {
+        self.state_dir().join(DEVICE_MEMORY_FILE)
+    }
+
+    /// Where the machine state lived before it moved to [`state_dir`](Self::state_dir): `hardware-state.toml` in
+    /// [`config_dir`](Self::config_dir) (`%APPDATA%\CaseControl`). Read for the migration on every start while the
+    /// new file is missing (a failed or skipped migration is retried), never written.
+    pub fn legacy_hardware_state_file(&self) -> PathBuf {
         self.config_dir.join(HARDWARE_STATE_FILE)
     }
 
@@ -79,6 +106,31 @@ mod tests {
         assert_eq!(p.logs_dir, root.join("logs"));
         assert_eq!(p.config_file(), root.join("config.toml"));
         assert_eq!(p.hardware_state_file(), root.join("hardware-state.toml"));
+        assert_eq!(p.device_memory_file(), root.join("device-memory.toml"));
+        assert_eq!(p.legacy_hardware_state_file(), root.join("hardware-state.toml"));
+    }
+
+    #[test]
+    fn machine_state_lives_next_to_the_logs() {
+        let roaming = Path::new("u").join("Roaming").join("CaseControl");
+        let local = Path::new("u").join("Local").join("CaseControl");
+        let p = Paths {
+            config_dir: roaming.clone(),
+            profiles_dir: roaming.join("profiles"),
+            logs_dir: local.join("logs"),
+        };
+        assert_eq!(p.state_dir(), local);
+        assert_eq!(p.hardware_state_file(), local.join("hardware-state.toml"));
+        assert_eq!(p.device_memory_file(), local.join("device-memory.toml"));
+        assert_eq!(
+            p.legacy_hardware_state_file(),
+            roaming.join("hardware-state.toml")
+        );
+        let flat = Paths {
+            logs_dir: PathBuf::from("logs"),
+            ..p
+        };
+        assert_eq!(flat.state_dir(), roaming);
     }
 
     #[test]

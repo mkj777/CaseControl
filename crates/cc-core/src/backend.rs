@@ -33,6 +33,12 @@ pub struct DetectContext {
     /// lighting at open instead (validated, as above), then report [`Controller::shows_own_lighting`].
     #[serde(default)]
     pub unreleased: HashSet<DeviceId>,
+    /// Devices the engine drives with a setting right after they are opened (ADR 0001 #42: each device gets its
+    /// profile setting the moment it is found). A driver that would restore a remembered own lighting at open (see
+    /// [`unreleased`](Self::unreleased)) skips that write for such a device, since it is about to be driven anyway,
+    /// and keeps the remembered state only as what a later release hands back.
+    #[serde(default)]
+    pub setting_pending: HashSet<DeviceId>,
 }
 
 impl DetectContext {
@@ -54,6 +60,12 @@ impl DetectContext {
     /// Whether device `id` carries the "unreleased" marker (see [`unreleased`](Self::unreleased)).
     pub fn is_unreleased(&self, id: &DeviceId) -> bool {
         self.unreleased.contains(id)
+    }
+
+    /// Whether device `id` is driven with a setting right after it is opened (see
+    /// [`setting_pending`](Self::setting_pending)).
+    pub fn has_setting_pending(&self, id: &DeviceId) -> bool {
+        self.setting_pending.contains(id)
     }
 }
 

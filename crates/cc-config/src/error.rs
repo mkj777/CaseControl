@@ -39,6 +39,14 @@ pub enum ConfigError {
     /// No profile with this name exists.
     #[error("no profile named {0:?}")]
     NotFound(String),
+    /// A device-memory record (ADR 0001 #42) cannot be written durably this session (in-memory state, a file that is
+    /// read-only, or no machine id), so the write that needs it must not happen.
+    #[error("device memory records cannot be stored: {0}")]
+    NotDurable(String),
+    /// The stored backup of a device's original saved state (ADR 0001 #42) cannot be parsed; it is kept as it is and
+    /// no new backup replaces it, so the device must not be written.
+    #[error("the stored backup of device {0}'s original saved state cannot be read")]
+    BackupUnreadable(String),
 }
 
 impl ConfigError {

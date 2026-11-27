@@ -5,7 +5,8 @@
 //! `.json`, then starts `<own exe> --elevated-actions "<absolute request path>"` with the `runas` verb and waits for
 //! the process to exit (with a timeout). The helper validates and runs the request and writes an
 //! [`ElevatedResponse`](crate::ElevatedResponse) to [`result_path`] of the request, creating that file new (it never
-//! overwrites an existing file). The app reads the result and deletes both files.
+//! overwrites an existing file; [`write_helper_result`] re-validates the request path right before creating it).
+//! The app reads the result and deletes both files.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -20,11 +21,16 @@ pub const SERVICE_STOP_WAIT: Duration = Duration::from_secs(10);
 /// Base time the app gives the helper after the UAC prompt was accepted (its fresh scan and start-up).
 pub const HELPER_BASE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Time allowed per start-up task action (COM start-up, identity and ACL checks, register and read back).
+pub const BOOT_TASK_ACTION_WAIT: Duration = Duration::from_secs(15);
+
 /// How long the app waits for a helper running `actions`: [`HELPER_BASE_TIMEOUT`] plus [`SERVICE_STOP_WAIT`] and
-/// 2 s per service stop and 2 s per other action. On timeout the outcomes are reported as unknown, not failed.
+/// 2 s per service stop, [`BOOT_TASK_ACTION_WAIT`] per start-up task action and 2 s per other action. On timeout
+/// the outcomes are reported as unknown, not failed.
 pub fn helper_timeout(actions: &[crate::PlannedAction]) -> Duration {
     actions.iter().fold(HELPER_BASE_TIMEOUT, |t, a| match a.action {
         crate::Action::StopService { .. } => t + SERVICE_STOP_WAIT + Duration::from_secs(2),
+        crate::Action::RegisterBootTask {} | crate::Action::RemoveBootTask {} => t + BOOT_TASK_ACTION_WAIT,
         _ => t + Duration::from_secs(2),
     })
 }
@@ -163,6 +169,65 @@ pub fn result_path(request: &Path) -> PathBuf {
     request.with_extension("result.json")
 }
 
+/// The helper's response write: re-validates `request` with [`validate_helper_request`] (shape, no link or reparse
+/// point in any component, canonical path unchanged) immediately before creating [`result_path`] as a new file (it
+/// never overwrites one). On Windows it then reads the created file's final path through its handle
+/// (`GetFinalPathNameByHandleW`); unless that is exactly [`result_path`] of the validated request (so the file lies
+/// in the validated folder), the file is deleted through the same handle and the write fails before any content is
+/// written. Only then `contents` is written.
+///
+/// The re-validation narrows the window in which a process of the user could swap the `elevated` folder for a
+/// junction between the helper's first validation and its write; the final-path check catches a swap inside that
+/// window, so the helper never leaves a file it created elsewhere.
+pub fn write_helper_result(request: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    validate_helper_request(request).map_err(std::io::Error::other)?;
+    let target = result_path(request);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // GENERIC_WRITE | DELETE | READ_CONTROL | SYNCHRONIZE: write, and delete through the handle if misplaced.
+        options.access_mode(0x4000_0000 | 0x0001_0000 | 0x0002_0000 | 0x0010_0000);
+    }
+    let mut file = options.open(&target)?;
+    #[cfg(windows)]
+    {
+        let placed = crate::sys::final_path(&file).map(|p| final_path_matches(&p, &target));
+        if !matches!(placed, Ok(true)) {
+            let removed = crate::sys::delete_on_close(&file);
+            drop(file);
+            tracing::warn!(
+                target = %target.display(),
+                ?placed,
+                ?removed,
+                "the helper's result file is not where it was validated to be; removed"
+            );
+            return Err(std::io::Error::other(format!(
+                "the result file {} was not created in the validated folder",
+                target.display()
+            )));
+        }
+    }
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+/// Whether `final_path` (from `GetFinalPathNameByHandleW`, in `\\?\` form) names exactly `expected` (a plain
+/// drive-letter path), ASCII case-insensitively. A UNC or volume-GUID final path never matches.
+pub fn final_path_matches(final_path: &Path, expected: &Path) -> bool {
+    let text = final_path.to_string_lossy();
+    let Some(plain) = text.strip_prefix(r"\\?\") else {
+        return false;
+    };
+    let bytes = plain.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || &bytes[1..3] != br":\" {
+        return false;
+    }
+    plain.eq_ignore_ascii_case(&expected.to_string_lossy())
+}
+
 /// Starts `exe` elevated in helper mode for `request` (one UAC prompt, owned by window `owner` when given so it comes
 /// to the front) and waits up to `timeout` for it to exit. Returns the helper's exit code.
 pub fn run_elevated_helper(
@@ -270,12 +335,63 @@ mod tests {
             .join("elevated")
             .join("request-1-2.json");
         assert_eq!(validate_helper_request(&good), Ok(good.clone()));
+        // The result is written next to it exactly once.
+        write_helper_result(&good, b"{}").expect("result written");
+        assert_eq!(std::fs::read(result_path(&good)).expect("read"), b"{}");
+        assert!(write_helper_result(&good, b"{}").is_err(), "never overwrites");
+        assert!(write_helper_result(&good.with_file_name("request-7-7.json"), b"{}").is_err());
         // Missing file, a directory with the right name, and a wrong shape are refused.
         assert!(validate_helper_request(&good.with_file_name("request-1-3.json")).is_err());
         std::fs::create_dir_all(good.with_file_name("request-9-9.json")).expect("dir");
         assert!(validate_helper_request(&good.with_file_name("request-9-9.json")).is_err());
         assert!(validate_helper_request(&good.with_file_name("x.json")).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn final_path_must_be_the_validated_result_path() {
+        let expected = Path::new(r"C:\Users\u\AppData\Local\CaseControl\elevated\request-1-2.result.json");
+        let ok = Path::new(r"\\?\C:\Users\U\AppData\Local\CaseControl\elevated\request-1-2.result.json");
+        assert!(final_path_matches(ok, expected));
+        for bad in [
+            // A junction swapped in for the folder: the file landed elsewhere.
+            r"\\?\C:\Windows\System32\request-1-2.result.json",
+            r"\\?\D:\Users\u\AppData\Local\CaseControl\elevated\request-1-2.result.json",
+            r"\\?\UNC\server\share\request-1-2.result.json",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\request-1-2.result.json",
+            // Without the prefix the value did not come from GetFinalPathNameByHandleW.
+            r"C:\Users\u\AppData\Local\CaseControl\elevated\request-1-2.result.json",
+            r"\\?\C:\Users\u\AppData\Local\CaseControl\elevated\request-1-2.result.json.x",
+        ] {
+            assert!(!final_path_matches(Path::new(bad), expected), "{bad}");
+        }
+    }
+
+    /// The handle-based pieces of the check on a real temp file: the final path of a correctly placed file matches,
+    /// and a file marked through its handle is gone once the handle closes.
+    #[cfg(windows)]
+    #[test]
+    fn real_final_path_and_delete_through_the_handle() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let dir = std::env::temp_dir().join(format!("cc-final-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let canonical = std::fs::canonicalize(&dir).expect("canonical");
+        let text = canonical.to_string_lossy().into_owned();
+        let plain = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
+        let path = plain.join("request-3-4.result.json");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .access_mode(0x4000_0000 | 0x0001_0000 | 0x0002_0000 | 0x0010_0000)
+            .open(&path)
+            .expect("create");
+        let final_path = crate::sys::final_path(&file).expect("final path");
+        assert!(final_path_matches(&final_path, &path), "{}", final_path.display());
+        assert!(!final_path_matches(&final_path, &plain.join("other.json")));
+        crate::sys::delete_on_close(&file).expect("mark");
+        drop(file);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -293,10 +409,14 @@ mod tests {
                 pid: 1,
                 name: "a.exe".into(),
             }),
+            p(Action::RegisterBootTask {}),
         ]);
         assert_eq!(
             t,
-            HELPER_BASE_TIMEOUT + 2 * (SERVICE_STOP_WAIT + Duration::from_secs(2)) + Duration::from_secs(2)
+            HELPER_BASE_TIMEOUT
+                + 2 * (SERVICE_STOP_WAIT + Duration::from_secs(2))
+                + Duration::from_secs(2)
+                + BOOT_TASK_ACTION_WAIT
         );
     }
 

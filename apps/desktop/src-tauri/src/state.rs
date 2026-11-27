@@ -1,5 +1,15 @@
 //! The one managed [`AppState`]: storage locations, settings, the engine handle, the active profile's autosave, the
 //! last conflict scan and the shutdown latch.
+//!
+//! The engine starts with the active profile already seeded (ADR 0001 #42, early apply): [`AppState::init`] loads it
+//! before the engine opens any device, so each device gets its setting the moment it is found; [`start_profiles`]
+//! then only does the bookkeeping instead of applying it a second time. Before it loads the machine state and starts
+//! the engine, the signed-in instance takes the cross-session device lock ([`crate::power::take_device_lock`], which
+//! first asks a running start-up instance to finish) and holds it until [`shutdown_engine`] stopped the engine; so it
+//! reads the machine state only after a start-up instance wrote its last records.
+//!
+//! [`start_profiles`]: AppState::start_profiles
+//! [`shutdown_engine`]: AppState::shutdown_engine
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,15 +17,16 @@ use std::time::Duration;
 
 use cc_config::{HardwareState, Paths, Profile, ProfileStore, Settings};
 use cc_conflicts::ScanReport;
-use cc_engine::{ApplyReport, EngineHandle};
+use cc_engine::{ApplyReport, EngineHandle, PersistReport};
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::autosave::{AUTOSAVE_INTERVAL, Autosave};
-use crate::prefs::{clear_brightness_overrides, engine_config, start_brightness};
+use crate::power::{ExitPlan, exit_plan};
+use crate::prefs::{PowerSettings, clear_brightness_overrides, engine_config_for, start_brightness};
 use crate::profiles::{ProfileList, StartPlan, merge_snapshot, profile_list, start_plan};
 
-/// Time the engine gets to release every device on exit.
-pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Time the engine gets to release every device on an explicit exit.
+pub const SHUTDOWN_TIMEOUT: Duration = crate::power::STOP_TIMEOUT;
 
 /// Where settings and profiles live.
 #[derive(Debug)]
@@ -41,6 +52,17 @@ pub struct AppState {
     /// Held by every profile operation (switch, create, duplicate, rename, delete) and every autosave write, so a
     /// write always goes to the profile that was active when the change was made.
     profile_lock: Mutex<()>,
+    /// The profile whose settings the engine was started with (ADR 0001 #42, early apply).
+    seeded_profile: Option<String>,
+    /// The line under "Save colours to the devices" after it was last switched this session.
+    save_note: Mutex<Option<String>>,
+    /// Serialises the "Save colours to the devices" switch (a save and a restore never overlap).
+    persist_lock: Mutex<()>,
+    /// Serialises the start-up autostart check with the "Start with Windows" switch, so the check never acts on a
+    /// setting the user changed meanwhile.
+    autostart_lock: Mutex<()>,
+    /// Serialises the start-up check of the start-up task with the "Apply colours before sign-in" switch.
+    boot_task_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -80,14 +102,26 @@ impl AppState {
                 )
             }
         };
-        // The machine state (last good own lighting per device, ADR 0001 #38) lives next to the settings; without
-        // storage it is kept in memory for this session only.
+        // A start-up instance (`--apply-at-boot`) may still be driving the devices and writing the machine state; ask
+        // it to finish and wait for it before the machine state is read.
+        crate::power::take_device_lock(crate::power::SESSION_LOCK_WAIT);
+        // The machine state (last good own lighting per device, ADR 0001 #38, and the records of saving to the
+        // devices) lives in the local app-data folder; without storage it is kept in memory for this session only.
         let hardware_state = match &storage {
             Ok(s) => HardwareState::load(&s.paths),
             Err(_) => HardwareState::in_memory(),
         };
+        // Early apply (ADR 0001 #42): the active profile, as the start will pick it, is handed to the engine so each
+        // device gets its setting as soon as it is found.
+        let seed = storage
+            .as_ref()
+            .ok()
+            .and_then(|s| active_profile_for_start(s, &settings));
+        if let Some(profile) = &seed {
+            tracing::info!(profile = %profile.name, devices = profile.devices.len(), "active profile seeded into the engine");
+        }
         let engine = cc_engine::start(
-            engine_config(&settings, hardware_state),
+            engine_config_for(&settings, hardware_state, seed.as_ref()),
             cc_drivers::all_backends(),
         )
         .map_err(|err| {
@@ -103,6 +137,11 @@ impl AppState {
             shut_down: AtomicBool::new(false),
             autosave: Autosave::new(AUTOSAVE_INTERVAL),
             profile_lock: Mutex::new(()),
+            seeded_profile: seed.map(|p| p.name),
+            save_note: Mutex::new(None),
+            persist_lock: Mutex::new(()),
+            autostart_lock: Mutex::new(()),
+            boot_task_lock: Mutex::new(()),
         }
     }
 
@@ -165,15 +204,25 @@ impl AppState {
                 };
                 let settings = self.settings().clone();
                 let legacy = settings.devices.values().any(|ov| ov.brightness.is_some());
-                engine.replace_brightness(start_brightness(Some(&profile), &settings));
-                let report = self.apply_visible(engine, &profile);
-                tracing::info!(
-                    profile = %profile.name,
-                    applied = report.applied.len(),
-                    missing = report.missing.len(),
-                    failed = report.failed.len(),
-                    "active profile applied on start"
-                );
+                let seeded = self
+                    .seeded_profile
+                    .as_deref()
+                    .is_some_and(|seeded| crate::profiles::same_name(seeded, &profile.name));
+                if seeded {
+                    // The engine got this profile and its brightness before detection and drove each device as it
+                    // was found; applying it again would only resend the same frames.
+                    tracing::info!(profile = %profile.name, "active profile applied at detection");
+                } else {
+                    engine.replace_brightness(start_brightness(Some(&profile), &settings));
+                    let report = self.apply_visible(engine, &profile);
+                    tracing::info!(
+                        profile = %profile.name,
+                        applied = report.applied.len(),
+                        missing = report.missing.len(),
+                        failed = report.failed.len(),
+                        "active profile applied on start"
+                    );
+                }
                 if legacy {
                     match self.write_profile_snapshot(&profile.name) {
                         Ok(()) => self.clear_legacy_brightness(),
@@ -385,17 +434,146 @@ impl AppState {
         }
     }
 
-    /// Writes a pending change of the active profile, then releases every device and stops the engine, exactly
-    /// once; later calls return immediately.
+    /// Takes the autostart lock: hold it while the logon task is checked or changed.
+    pub fn autostart_lock(&self) -> MutexGuard<'_, ()> {
+        self.autostart_lock.lock()
+    }
+
+    /// Takes the start-up task lock: hold it while the start-up task is checked or changed.
+    pub fn boot_task_lock(&self) -> MutexGuard<'_, ()> {
+        self.boot_task_lock.lock()
+    }
+
+    /// The line under "Save colours to the devices", if any.
+    pub fn save_note(&self) -> Option<String> {
+        self.save_note.lock().clone()
+    }
+
+    /// Turns "Save colours to the devices" on or off (ADR 0001 #42): saves the switch, then saves the colours to
+    /// every capable device (on) or writes their original saved state back (off; devices that are not connected are
+    /// restored when they are next connected). The result per device is logged; the devices that were not saved or
+    /// restored are kept as the line Settings shows under the switch. Fails without writing any device when the
+    /// switch cannot be saved.
+    pub fn set_save_to_devices(&self, on: bool) -> Result<(), String> {
+        let _serial = self.persist_lock.lock();
+        self.update_settings(|s| {
+            s.save_to_devices = on;
+            Ok(())
+        })?;
+        tracing::info!(on, "save colours to the devices switched");
+        let Ok(engine) = &self.engine else {
+            *self.save_note.lock() = None;
+            return Ok(());
+        };
+        let timeout = crate::power::SWITCH_PERSIST_TIMEOUT;
+        let report = if on {
+            engine.persist_all(timeout)
+        } else {
+            engine.restore_saved(timeout)
+        };
+        *self.save_note.lock() = self.note_for(engine, &report, !on);
+        Ok(())
+    }
+
+    fn note_for(&self, engine: &EngineHandle, report: &PersistReport, restoring: bool) -> Option<String> {
+        crate::power::log_report(report, restoring);
+        crate::power::persist_note(report, restoring, |id| {
+            engine
+                .device(id)
+                .map(|d| d.description.info.name)
+                .unwrap_or_else(|| id.to_string())
+        })
+    }
+
+    /// Writes a pending change of the active profile, then, depending on why the app closes (ADR 0001 #42, see
+    /// [`crate::power::exit_plan`]), saves the colours to the devices, releases the devices or keeps CaseControl's
+    /// colours on them, and stops the engine, exactly once; later calls return immediately. Lets go of the device
+    /// lock afterwards. The raw session-end flags and the decision are logged.
     pub fn shutdown_engine(&self) {
+        self.shutdown_engine_with(None);
+    }
+
+    /// Like [`shutdown_engine`](Self::shutdown_engine), for the uninstaller's clean-up (ADR 0001 #42): releases every
+    /// device and never saves to them, whatever the switches say.
+    pub fn shutdown_engine_for_uninstall(&self) {
+        self.shutdown_engine_with(Some(ExitPlan::uninstall()));
+    }
+
+    fn shutdown_engine_with(&self, forced: Option<ExitPlan>) {
         if self.shut_down.swap(true, Ordering::AcqRel) {
             return;
         }
+        let why = cc_system::session_end::current();
+        let power = PowerSettings::of(&self.settings());
+        let plan =
+            forced.unwrap_or_else(|| exit_plan(why, power.keep_colors_on_sign_out, power.save_to_devices));
+        tracing::info!(
+            message = ?cc_system::session_end::last_message(),
+            shutting_down = cc_system::session_end::shutting_down(),
+            ?why,
+            uninstall = forced.is_some(),
+            keep_colors_on_sign_out = power.keep_colors_on_sign_out,
+            save_to_devices = power.save_to_devices,
+            mode = ?plan.mode,
+            persist = plan.persist,
+            "exit decision"
+        );
         self.autosave.stop();
         self.flush_profile();
         if let Ok(engine) = &self.engine {
-            tracing::info!("releasing devices and stopping the engine");
-            engine.shutdown(SHUTDOWN_TIMEOUT);
+            self.stop_engine(engine, &plan);
         }
+        crate::power::drop_device_lock();
+    }
+
+    /// Saves to the devices when the plan says so, then stops the engine. A running switch of "Save colours to the
+    /// devices" is waited for at most `plan.switch_wait` (its save or restore goes on in the engine; a restore has
+    /// marked its devices pending already); after that the save is skipped, and at a session end the time waited is
+    /// taken from the save's budget.
+    fn stop_engine(&self, engine: &EngineHandle, plan: &ExitPlan) {
+        if plan.persist {
+            let waiting = std::time::Instant::now();
+            match self.persist_lock.try_lock_for(plan.switch_wait) {
+                Some(_serial) => {
+                    let budget = if plan.switch_wait < crate::power::QUIT_SWITCH_WAIT {
+                        plan.persist_timeout.saturating_sub(waiting.elapsed())
+                    } else {
+                        plan.persist_timeout
+                    };
+                    tracing::info!(
+                        budget_ms = budget.as_millis() as u64,
+                        "saving the colours to the devices before exit"
+                    );
+                    let report = engine.persist_all(budget);
+                    crate::power::log_report(&report, false);
+                }
+                None => tracing::warn!(
+                    waited_ms = plan.switch_wait.as_millis() as u64,
+                    "the save colours switch is still running; not saving again before exit"
+                ),
+            }
+        }
+        tracing::info!(mode = ?plan.mode, "stopping the engine");
+        engine.shutdown_with(plan.mode, plan.stop_timeout);
+    }
+}
+
+/// The profile the start will make active ([`start_plan`]), loaded read-only, or `None` when there is none yet or it
+/// cannot be read (the start then creates or reports it as before).
+pub fn active_profile_for_start(storage: &Storage, settings: &Settings) -> Option<Profile> {
+    let names = storage
+        .profiles
+        .list()
+        .map_err(|err| tracing::warn!(%err, "cannot list profiles; nothing seeded"))
+        .ok()?;
+    match start_plan(&names, settings.last_profile.as_deref()) {
+        StartPlan::Create(_) => None,
+        StartPlan::Apply { name, .. } => storage
+            .profiles
+            .load(&name)
+            .map_err(
+                |err| tracing::warn!(profile = %name, %err, "cannot load the active profile; nothing seeded"),
+            )
+            .ok(),
     }
 }
