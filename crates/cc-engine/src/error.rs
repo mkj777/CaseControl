@@ -28,6 +28,10 @@ pub enum EngineError {
     /// The engine has been shut down.
     #[error("engine is shut down")]
     ShutDown,
+    /// A manual save did not write the device's memory, for a reason that is not a device error (no backup, daily
+    /// cap, writes switched off, a safety gate).
+    #[error("not saved to the device: {0}")]
+    NotSaved(String),
     /// A worker thread could not be started.
     #[error("could not start a device thread: {0}")]
     Spawn(String),

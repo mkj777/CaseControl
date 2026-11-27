@@ -32,6 +32,83 @@ Families: `msi_mystic_light` (pass JRAINBOW1/2 LED counts as arguments if they d
 - [ ] Conflicts page lists OpenRGB, SignalRGB, G HUB, LampArray, inpoutx64; End process / Stop service (UAC) work.
 - [ ] FanControl keeps reading sensors and controlling fans the whole time (no errors in its log).
 
+## Colours across shutdown, sign-out and start (ADR 0001 #42)
+
+Installed release build only (debug builds create no tasks). Logs: `%LOCALAPPDATA%\CaseControl\logs`
+(`casecontrol.<date>.log`, and `boot-apply-<date>.log` for the start-up task). Every exit writes one `exit decision`
+line with the raw session message (`Query`/`End` with its flags), `shutting_down`, the switches and the chosen mode;
+note them in the results table, they are what Windows sent.
+
+Before: all devices driven by CaseControl with a distinctive profile (e.g. all red); "Save colours to the devices" off.
+
+- [ ] **Shutdown** (Fast Startup off: `powercfg /h off` or Control Panel): Start > Power > Shut down. The colours stay
+      while Windows shuts down (no hand-back flash). Log: `why=ShutdownOrRestart` (or `Unknown`), `mode=Keep`. After
+      the next power-on and sign-in: no flash of the old look on the MSI board when CaseControl starts.
+- [ ] **Shutdown with Fast Startup on**: as above; record what the log says (Fast Startup may report a sign-out).
+- [ ] **Restart**: colours stay until the reset; log `ShutdownOrRestart`, `Keep`.
+- [ ] **Sign-out, "Keep colours when signing out" on** (default): colours stay on the sign-in screen; log
+      `why=SignOut`, `mode=Keep`.
+- [ ] **Sign-out, switch off**: every device returns to its own lighting; log `SignOut`, `mode=Release`.
+- [ ] **Tray Quit / `casecontrol-desktop.exe --quit`**: every device returns to its own lighting; log `NotEnding`,
+      `Release`.
+- [ ] **Installer over a running app** (manual install of the same or a newer version): devices released; log
+      `CloseApp`, `Release`.
+- [ ] **Start with Windows**: switch on; Task Scheduler (root folder) shows `CaseControl Logon <SID>` starting
+      `casecontrol-desktop.exe --hidden`; `HKCU\...\Run\CaseControl` is gone. Sign out and in: the app starts hidden.
+      Note the logon start time (sign-in to the `CaseControl starting` log line) and the time until the MSI board
+      shows the profile (`active profile seeded into the engine` to the board's first output). Switch off: the task
+      is gone.
+- [ ] **Migration**: with an older version installed and its Run entry switched off in Task Manager, install this one:
+      autostart is off in Settings, the Run value and `StartupApproved\Run\CaseControl` are gone, no task exists.
+- [ ] **Apply colours before sign-in on**: one UAC prompt; Settings shows the switch on; Task Scheduler shows
+      `CaseControl Start-up <SID>` (runs whether the user is signed in or not, `--apply-at-boot`). Decline the UAC
+      prompt once: the switch stays off and the error shows in Settings.
+- [ ] **Power-on before sign-in**: shut down, power on, wait on the sign-in screen: the profile's colours appear
+      before sign-in. `boot-apply-<date>.log`: which folders were used (`KnownFolders` or `ProfileList`), the devices
+      found, skipped devices (the GPU if NvAPI is not available in session 0), `keeping the colours`, and the `token`
+      line (expected: elevation `default`, integrity `medium` or `system`; note what it says). Sign in quickly while
+      it still runs: the signed-in log shows `asked the start-up instance to finish`, the boot log `asked to finish;
+      stopping now`, and the signed-in instance takes the lock within a few seconds (at most 10 s; log `device lock
+      taken` or `starting without it`). No device memory is written by the start-up task (no `save colours` or
+      `restore saved state` lines in the boot log).
+- [ ] **Apply colours before sign-in off**: one UAC prompt; the task is gone; the switch is off.
+- [ ] **Start-up task deleted by hand**: with the switch on, delete `CaseControl Start-up <SID>` in the Task Scheduler
+      (as administrator), restart CaseControl: the switch shows off (log `apply colours before sign-in follows the
+      start-up task`).
+- [ ] **Logon task disabled by hand**: with Start with Windows on, disable `CaseControl Logon <SID>` in the Task
+      Scheduler, restart CaseControl: Start with Windows shows off (log `the logon task was disabled`); the task is
+      not enabled again. Switching it on again works.
+- [ ] **UAC with another account**: switch Apply colours before sign-in on and approve the prompt with another
+      administrator's name and password: the switch stays off and Settings shows the full sentence about the other
+      account.
+- [ ] **Both switches at once**: switch Save colours to the devices while the UAC prompt of Apply colours before
+      sign-in is open: the save switch works; only the switch whose command runs is greyed out.
+- [ ] **Save colours to the devices on**: the line under the switch names the devices that were not saved (expected:
+      Wooting, PRO Wireless, RTX 5080 "can't store lighting"; G560 possibly "original state unknown"). Log one result
+      per device. Power off completely (unplug or PSU switch for 10 s), power on, stay in the BIOS or on the sign-in
+      screen without the start-up task: the MSI board (and the G560 if saved) shows the saved colours from power-on.
+- [ ] **Save at Quit / sign-out / shutdown** with the switch on: change a colour, Quit: the log shows one save (or
+      `Unchanged` when nothing changed) before the release. At most 20 writes per device and day.
+- [ ] **Save colours to the devices off**: the original saved state is written back (power-cycle shows the old
+      hardware effect); an unplugged G560 is listed as "not connected; restored when connected" and restored when it
+      is plugged in again (log).
+- [ ] **Uninstall**: with Start with Windows, Apply colours before sign-in and Save colours to the devices on, uninstall
+      from Settings > Apps: the running app quits, one UAC prompt for the start-up task (declining leaves the task and
+      is logged), both tasks are gone afterwards, saved devices show their original saved state after a power-cycle.
+      The app log shows `the uninstaller asked to quit` and `uninstall=true`, `persist=false` in the exit decision (no
+      save to the devices on that quit). An update (Update now) runs none of this.
+- [ ] **Uninstall with a pending update**: let an update download (Settings shows "Version x is ready") but do not
+      install it, then uninstall: the running app quits without starting the update installer (no second installer
+      window, the app does not come back), the clean-up runs as above.
+- [ ] **Silent uninstall** (`uninstall.exe /S` from the install folder): no UAC prompt appears; the clean-up log says
+      `silent uninstall: the start-up task is left`; the logon task is gone; saved devices are restored.
+- [ ] **Uninstall with a switched-off family**: with Save colours to the devices on (MSI saved), switch the MSI
+      detector off in Settings, uninstall: the MSI board is still restored (clean-up log lists it).
+- [ ] **Upgrade with the old setup keeps the start-up task**: with Start with Windows and Apply colours before sign-in
+      on, run the installer of a newer (or the same) version over the installed one and choose to uninstall first on
+      its reinstall page: no clean-up runs (no UAC prompt, no `uninstall clean-up` log line), both tasks still exist
+      afterwards and Settings shows both switches on; the saved device state is not restored.
+
 ## Results
 
 | Date | Test | Result | Notes |

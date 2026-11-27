@@ -1,6 +1,11 @@
 <script setup lang="ts">
-// Settings: startup, update rate, device detectors and information about this build. Every change is saved and
-// applied right away. The fallback colour of a takeover lives in the Lighting toolbar, and the OpenRGB port check has
+// Settings: startup, hardware, update rate, device detectors and information about this build. Every change is saved
+// and applied right away.
+//
+// ADR 0001 #42: "Apply colours before sign-in" (Startup) and "Save colours to the devices" (Hardware) have their own
+// commands because one asks for a Windows permission prompt and the other writes to devices. Each of the two switches
+// is busy (disabled, `aria-busy`) only while its own command runs; the other controls stay usable. After "Save colours
+// to the devices" was switched, the line under it names the devices that were not saved or restored. The fallback colour of a takeover lives in the Lighting toolbar, and the OpenRGB port check has
 // no switch here; it keeps its stored value and default (ADR 0001 #37).
 //
 // App updates (ADR 0001 #41) sit in About, next to the version, without a heading of their own: the updater's status
@@ -16,6 +21,8 @@ import {
   getSettings,
   installUpdate,
   on,
+  setApplyBeforeSignIn,
+  setSaveToDevices,
   setSettings,
   updateStatus,
   type AppInfo,
@@ -54,6 +61,34 @@ onMounted(async () => {
     error.value = errorText(e)
   }
 })
+
+type OwnSwitch = 'before-sign-in' | 'save-to-devices'
+/** Which of the two switches with their own command (a permission prompt, device writes) are running now. */
+const busy = ref<Record<OwnSwitch, boolean>>({ 'before-sign-in': false, 'save-to-devices': false })
+/** A switch is off only while its own command runs, or for the whole session when settings cannot be saved. */
+function switchLocked(which: OwnSwitch): boolean {
+  return busy.value[which] || settings.value?.save_error != null
+}
+
+/** Runs one of the two switches with their own command; errors show in the page's error notice as the backend
+ * gives them. */
+async function runSwitch(which: OwnSwitch, on: boolean) {
+  busy.value[which] = true
+  error.value = null
+  try {
+    settings.value = which === 'before-sign-in' ? await setApplyBeforeSignIn(on) : await setSaveToDevices(on)
+  } catch (e) {
+    error.value = errorText(e)
+    // Reload so the switch shows what is actually stored.
+    try {
+      settings.value = await getSettings()
+    } catch {
+      // keep the error shown above
+    }
+  } finally {
+    busy.value[which] = false
+  }
+}
 
 async function patch(p: SettingsPatch) {
   saving.value = true
@@ -204,6 +239,37 @@ async function onInstallUpdate() {
           :disabled="locked"
           @update:model-value="patch({ start_minimized: $event })"
         />
+        <Switch
+          :model-value="settings.apply_before_sign_in"
+          label="Apply colours before sign-in"
+          hint="Needs administrator rights to turn on or off."
+          :disabled="switchLocked('before-sign-in')"
+          :aria-busy="busy['before-sign-in']"
+          @update:model-value="runSwitch('before-sign-in', $event)"
+        />
+      </div>
+
+      <div class="group">
+        <h2>Hardware</h2>
+        <Switch
+          :model-value="settings.keep_colors_on_sign_out"
+          label="Keep colours when signing out"
+          :disabled="locked"
+          @update:model-value="patch({ keep_colors_on_sign_out: $event })"
+        />
+        <div class="with-note">
+          <Switch
+            :model-value="settings.save_to_devices"
+            label="Save colours to the devices"
+            hint="Devices that can store lighting show it from power-on. Writes their memory at most once per session."
+            :disabled="switchLocked('save-to-devices')"
+            :aria-busy="busy['save-to-devices']"
+            @update:model-value="runSwitch('save-to-devices', $event)"
+          />
+          <p v-if="settings.save_to_devices_note" class="note" aria-live="polite">
+            {{ settings.save_to_devices_note }}
+          </p>
+        </div>
       </div>
 
       <div class="group">
@@ -296,6 +362,22 @@ async function onInstallUpdate() {
 
 .rate {
   width: var(--control-max-width);
+}
+
+.with-note {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: var(--row-max-width);
+}
+
+.note {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  /* Device names and reasons can be copied (ADR 0001 #32). */
+  user-select: text;
+  cursor: text;
 }
 
 .update-actions {

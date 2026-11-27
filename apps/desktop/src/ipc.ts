@@ -128,6 +128,8 @@ export type DeviceError =
   | { Transport: string }
   | { Protocol: string }
   | { Faulted: string }
+  /** A safety gate refused a write to the device's own memory before anything reached it (ADR 0001 #42). */
+  | { Refused: string }
 
 // ---- cc-config / cc-engine -------------------------------------------------------------------------------------
 
@@ -367,8 +369,18 @@ export interface ProfileList {
 }
 
 export interface SettingsView {
+  /** Start with Windows (a per-user logon task in installed builds). */
   autostart: boolean
   start_minimized: boolean
+  /** "Apply colours before sign-in": the start-up task exists (ADR 0001 #42). Changed by `setApplyBeforeSignIn`. */
+  apply_before_sign_in: boolean
+  /** "Keep colours when signing out" (on by default). */
+  keep_colors_on_sign_out: boolean
+  /** "Save colours to the devices". Changed by `setSaveToDevices`. */
+  save_to_devices: boolean
+  /** The one line under "Save colours to the devices" after it was switched this session: the devices that were not
+   * saved or restored and why. */
+  save_to_devices_note: string | null
   frame_rate: number
   /** Detector switch per family id. */
   detectors: Record<string, boolean>
@@ -383,6 +395,7 @@ export interface SettingsView {
 export interface SettingsPatch {
   autostart?: boolean
   start_minimized?: boolean
+  keep_colors_on_sign_out?: boolean
   frame_rate?: number
   detectors?: Record<string, boolean>
   check_openrgb_port?: boolean
@@ -469,6 +482,12 @@ export const setDontAsk = (entry: string, dontAsk: boolean) => invoke<ConflictSc
 
 export const getSettings = () => invoke<SettingsView>('get_settings')
 export const setSettings = (patch: SettingsPatch) => invoke<SettingsView>('set_settings', { patch })
+/** "Apply colours before sign-in" (ADR 0001 #42): creates or removes the start-up task behind one Windows permission
+ * prompt. Rejects (setting unchanged) when the prompt is declined, the task cannot be changed or in a debug build. */
+export const setApplyBeforeSignIn = (on: boolean) => invoke<SettingsView>('set_apply_before_sign_in', { on })
+/** "Save colours to the devices" (ADR 0001 #42): on saves the colours to every device that can store them now, off
+ * writes their original saved state back. Resolves when the devices are done. */
+export const setSaveToDevices = (on: boolean) => invoke<SettingsView>('set_save_to_devices', { on })
 /** The takeover fallback colour, the `default_color` setting (ADR 0001 #36, #37): `persist = false` while the picker
  * is dragged (used, not saved), `true` for the final value (saved). Resolves with the colour now in effect. */
 export const setDefaultColor = (color: Rgb, persist: boolean) =>

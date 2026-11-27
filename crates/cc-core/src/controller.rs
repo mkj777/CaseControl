@@ -4,6 +4,7 @@ use crate::color::Rgb;
 use crate::device::DeviceDescription;
 use crate::error::DeviceError;
 use crate::mode::ModeState;
+use crate::persist::{PersistCaps, PersistLook, PersistOutcome};
 
 /// One physical controller.
 ///
@@ -31,7 +32,10 @@ pub trait Controller: Send {
         Err(DeviceError::Unsupported)
     }
 
-    /// Persists the current mode in the device's flash. Unsupported unless the driver overrides it.
+    /// Persists the current hardware mode in the device's flash, through the same gates as
+    /// [`persist_look`](Self::persist_look); refused while the device is not driven by a hardware mode. The engine
+    /// routes a manual save through `persist_look` itself (backup first, daily cap, fingerprint) and does not call
+    /// this. Unsupported unless the driver overrides it.
     fn save_to_hardware(&mut self) -> Result<(), DeviceError> {
         Err(DeviceError::Unsupported)
     }
@@ -78,6 +82,42 @@ pub trait Controller: Send {
     /// changes the device's state in a way that outlives the app. `None` (the default) keeps black in the direct mode.
     fn off_mode(&self) -> Option<u32> {
         None
+    }
+
+    /// What this device can save to its own memory (ADR 0001 #42); `None` (the default) when it cannot. Must not do
+    /// I/O.
+    fn persist_caps(&self) -> Option<PersistCaps> {
+        None
+    }
+
+    /// Writes `look` to the device's memory so it shows it from power-on (ADR 0001 #34, #42). Returns
+    /// [`PersistOutcome::Unchanged`] without any I/O when the look's fingerprint equals `last` (the fingerprint of the
+    /// previous write). The driver enforces every safety gate of its device and refuses
+    /// ([`DeviceError::Refused`], nothing written to the memory) when one fails; the device keeps showing what the
+    /// engine drives it with. Never called on live edits. Unsupported unless the driver overrides it.
+    fn persist_look(
+        &mut self,
+        _look: &PersistLook,
+        _last: Option<&[u8]>,
+    ) -> Result<PersistOutcome, DeviceError> {
+        Err(DeviceError::Unsupported)
+    }
+
+    /// The device's original saved state (what it showed from power-on before CaseControl first saved to it), as
+    /// driver-opaque bytes for [`restore_saved_state`](Self::restore_saved_state); `None` (the default) when the
+    /// driver cannot tell it completely, in which case the engine never saves to the device. Captured before
+    /// CaseControl's first write of the session. Must not do I/O.
+    fn saved_state_backup(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Writes `backup` (from [`saved_state_backup`](Self::saved_state_backup), possibly of an earlier run) back to
+    /// the device's memory. Validates the bytes before sending anything. Returns [`PersistOutcome::Unchanged`] when
+    /// the driver can tell that the memory already holds the backup (nothing written). A refusal before anything
+    /// reached the memory is [`DeviceError::Refused`] or [`DeviceError::InvalidArgument`]. Unsupported unless the
+    /// driver overrides it.
+    fn restore_saved_state(&mut self, _backup: &[u8]) -> Result<PersistOutcome, DeviceError> {
+        Err(DeviceError::Unsupported)
     }
 }
 
@@ -156,6 +196,13 @@ pub(crate) mod tests {
         assert_eq!(c.own_lighting(), None);
         assert!(c.shows_own_lighting());
         assert_eq!(c.off_mode(), None);
+        assert_eq!(c.persist_caps(), None);
+        assert_eq!(
+            c.persist_look(&PersistLook::Off, None),
+            Err(DeviceError::Unsupported)
+        );
+        assert_eq!(c.saved_state_backup(), None);
+        assert_eq!(c.restore_saved_state(&[1, 2]), Err(DeviceError::Unsupported));
         assert_eq!(c.release(), Ok(()));
     }
 

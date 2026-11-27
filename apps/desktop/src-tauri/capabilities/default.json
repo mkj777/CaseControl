@@ -40,6 +40,8 @@
     "allow-close-program",
     "allow-get-settings",
     "allow-set-settings",
+    "allow-set-apply-before-sign-in",
+    "allow-set-save-to-devices",
     "allow-set-default-color",
     "allow-update-status",
     "allow-check-for-updates",

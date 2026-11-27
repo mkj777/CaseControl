@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use cc_core::{
     Bus, ColorMode, Controller, DeviceDescription, DeviceError, DeviceId, DeviceInfo, DeviceKind, Led, Mode,
-    ModeCaps, ModeState, Rgb, Zone, ZoneKind as CoreZoneKind,
+    ModeCaps, ModeState, OwnLighting, OwnSource, Rgb, Zone, ZoneKind as CoreZoneKind,
 };
-use cc_nvapi::{GpuHandle, NvApi, NvApiError, ZoneControlParams, ZoneKind};
+use cc_nvapi::{CtrlMode, GpuHandle, NvApi, NvApiError, ZoneColor, ZoneControlParams, ZoneKind};
 
 use super::mapping;
 
@@ -208,12 +208,96 @@ pub fn readback_state(desc: &DeviceDescription, params: &ZoneControlParams) -> O
     desc.validate_state(&state).is_ok().then_some(state)
 }
 
+/// Version byte of an own-lighting record (`encode_own`).
+pub const OWN_VERSION: u8 = 1;
+/// Bytes per zone in an own-lighting record: zone type (`u32`, little-endian), colour tag, R, G, B, W, brightness.
+const OWN_ZONE_LEN: usize = 10;
+
+/// The lighting `params` shows, as bytes for the engine to remember as the GPU's own lighting (ADR 0001 #38):
+/// `OWN_VERSION`, the zone count, then per zone its type and its manual colour (tag 0 RGB, 1 RGBW, 2 brightness
+/// only). `None` unless every zone is in manual mode with a decoded colour (an animation cannot be remembered).
+#[must_use]
+pub fn encode_own(params: &ZoneControlParams) -> Option<Vec<u8>> {
+    let count = u8::try_from(params.zones.len()).ok()?;
+    let mut out = vec![OWN_VERSION, count];
+    for zone in &params.zones {
+        if zone.mode != CtrlMode::Manual {
+            return None;
+        }
+        let record = match zone.manual {
+            ZoneColor::Rgb { r, g, b, brightness } => [0, r, g, b, 0, brightness],
+            ZoneColor::Rgbw {
+                r,
+                g,
+                b,
+                w,
+                brightness,
+            } => [1, r, g, b, w, brightness],
+            ZoneColor::Single { brightness } => [2, 0, 0, 0, 0, brightness],
+            ZoneColor::Other => return None,
+        };
+        out.extend_from_slice(&zone.kind.to_raw().to_le_bytes());
+        out.extend_from_slice(&record);
+    }
+    Some(out)
+}
+
+/// `current` (a fresh `GetControl` result) with every zone set to the manual colour of an `encode_own` record, or
+/// `None` when the bytes do not fit: wrong version or length, another zone count, a zone type that differs from the
+/// GPU's, a colour that does not fit its zone type, or a brightness above 100. Everything else is `current`'s.
+#[must_use]
+pub fn decode_own(bytes: &[u8], current: &ZoneControlParams) -> Option<ZoneControlParams> {
+    let (&[version, count], records) = bytes.split_first_chunk::<2>()?;
+    if version != OWN_VERSION
+        || usize::from(count) != current.zones.len()
+        || records.len() != OWN_ZONE_LEN * current.zones.len()
+    {
+        return None;
+    }
+    let mut out = current.clone();
+    for (record, zone) in records.as_chunks::<OWN_ZONE_LEN>().0.iter().zip(&mut out.zones) {
+        let (kind, color) = record.split_first_chunk::<4>()?;
+        if u32::from_le_bytes(*kind) != zone.kind.to_raw() {
+            return None;
+        }
+        let &[tag, r, g, b, w, brightness] = color else {
+            return None;
+        };
+        if brightness > mapping::MAX_BRIGHTNESS {
+            return None;
+        }
+        zone.manual = match (tag, zone.kind) {
+            (0, ZoneKind::Rgb) if w == 0 => ZoneColor::Rgb { r, g, b, brightness },
+            (1, ZoneKind::Rgbw) => ZoneColor::Rgbw {
+                r,
+                g,
+                b,
+                w,
+                brightness,
+            },
+            (2, ZoneKind::SingleColor | ZoneKind::ColorFixed) if [r, g, b, w] == [0; 4] => {
+                ZoneColor::Single { brightness }
+            }
+            _ => return None,
+        };
+        zone.mode = CtrlMode::Manual;
+    }
+    Some(out)
+}
+
 /// NVIDIA Illumination V1 controller.
 ///
 /// Lifecycle: constructed from the params of a successful `GetControl` (the hardware state to restore). The first
 /// write after construction or after [`release`](Controller::release) re-reads `GetControl` if the kept state was
 /// already written back, so `SetControl` is never called without a preceding successful `GetControl`. Every write
 /// sends the whole params struct (all zones), and is skipped when it equals the last params sent.
+///
+/// Own lighting (ADR 0001 #38, the shared [`OwnLighting`] seam): built without the engine's "unreleased" marker, the
+/// params read at construction are the GPU's own lighting and are reported (`encode_own`). Built with the marker,
+/// they are CaseControl's state: a remembered own lighting that fits the GPU (`decode_own`) is what `release()`
+/// writes back (even if nothing was sent) and what `hardware_mode()` reports, and
+/// [`Controller::shows_own_lighting`] stays `false` until that release; without one, `release()` writes back what it
+/// read and the marker stays.
 #[derive(Debug)]
 pub struct IllumController<A> {
     desc: DeviceDescription,
@@ -230,10 +314,13 @@ pub struct IllumController<A> {
     dirty: bool,
     /// The lighting the GPU showed on its own when control was last taken (what `release()` writes back).
     hardware: Option<ModeState>,
+    /// What `release()` writes back and where it came from.
+    own: OwnLighting<ZoneControlParams>,
 }
 
 impl<A: IllumApi> IllumController<A> {
-    /// Builds a controller from the params `api.get_control()` just returned.
+    /// Builds a controller from the params `api.get_control()` just returned, for a GPU without the "unreleased"
+    /// marker (see [`new_with_stored`](Self::new_with_stored)).
     ///
     /// # Errors
     /// [`DeviceError::Protocol`] if the GPU reports no illumination zones or the description fails validation.
@@ -245,6 +332,26 @@ impl<A: IllumApi> IllumController<A> {
         treats_rgbw_as_rgb: bool,
         current: ZoneControlParams,
     ) -> Result<Self, DeviceError> {
+        Self::new_with_stored(api, id, name, location, treats_rgbw_as_rgb, current, None, false)
+    }
+
+    /// [`new`](Self::new) with what the engine remembers (ADR 0001 #38): `unreleased`, CaseControl wrote to the GPU
+    /// and did not hand it back, so `current` is its state; `stored`, the GPU's last good own lighting
+    /// (`encode_own` bytes), used only when `unreleased` and when it fits (`decode_own`).
+    ///
+    /// # Errors
+    /// As [`new`](Self::new).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_stored(
+        api: A,
+        id: DeviceId,
+        name: &str,
+        location: String,
+        treats_rgbw_as_rgb: bool,
+        current: ZoneControlParams,
+        stored: Option<&[u8]>,
+        unreleased: bool,
+    ) -> Result<Self, DeviceError> {
         let kinds: Vec<ZoneKind> = current.zones.iter().map(|z| z.kind).collect();
         if kinds.is_empty() {
             return Err(DeviceError::Protocol("GPU reports no illumination zones".into()));
@@ -252,17 +359,34 @@ impl<A: IllumApi> IllumController<A> {
         let desc = describe(id, name, location, &kinds);
         desc.validate()
             .map_err(|e| DeviceError::Protocol(format!("invalid description: {e}")))?;
-        let hardware = readback_state(&desc, &current);
+        let remembered = if unreleased {
+            let params = stored.and_then(|b| decode_own(b, &current));
+            if params.is_none() && stored.is_some() {
+                tracing::warn!(id = %desc.info.id, "stored own lighting does not fit the GPU; ignoring it");
+            }
+            params
+        } else {
+            None
+        };
+        let own = OwnLighting::at_open(current.clone(), true, remembered, unreleased);
+        if own.source() == OwnSource::LeftByUs {
+            tracing::warn!(
+                id = %desc.info.id,
+                "GPU shows a state CaseControl left and no own lighting is stored for it; release() writes that state back"
+            );
+        }
+        let hardware = readback_state(&desc, own.handback());
         Ok(Self {
             hardware,
             desc,
             api,
             kinds,
             treats_rgbw_as_rgb,
-            working: current.clone(),
-            initial: Some(current),
+            working: current,
+            initial: Some(own.handback().clone()),
             last_sent: None,
             dirty: false,
+            own,
         })
     }
 
@@ -285,6 +409,7 @@ impl<A: IllumApi> IllumController<A> {
                 self.kinds
             )));
         }
+        self.own.retaken(current.clone());
         self.hardware = readback_state(&self.desc, &current);
         self.working = current.clone();
         self.initial = Some(current);
@@ -378,9 +503,11 @@ impl<A: IllumApi + Send> Controller for IllumController<A> {
         let Some(initial) = self.initial.as_ref() else {
             return Ok(());
         };
-        if self.dirty {
+        // A remembered own lighting the GPU does not show yet is written back even if nothing was sent.
+        if self.dirty || self.own.handback_pending() {
             self.api.set_control(initial).map_err(device_error)?;
         }
+        self.own.handed_back();
         self.initial = None;
         self.last_sent = None;
         self.dirty = false;
@@ -389,6 +516,17 @@ impl<A: IllumApi + Send> Controller for IllumController<A> {
 
     fn hardware_mode(&self) -> Option<ModeState> {
         self.hardware.clone()
+    }
+
+    /// The params `release()` writes back (`encode_own`) when they are the GPU's own lighting.
+    fn own_lighting(&self) -> Option<Vec<u8>> {
+        self.own.own().and_then(encode_own)
+    }
+
+    /// `false` while built with the "unreleased" marker until a release wrote the remembered own lighting back, and
+    /// for good when none was remembered.
+    fn shows_own_lighting(&self) -> bool {
+        self.own.shows_own_lighting()
     }
 }
 
@@ -896,5 +1034,86 @@ mod tests {
     fn controller_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<IllumController<NvApiGpu>>();
+    }
+
+    fn marked(fake: &Fake, stored: Option<&[u8]>) -> IllumController<Fake> {
+        let current = fake.clone().get_control().expect("fake get");
+        fake.clear();
+        IllumController::new_with_stored(
+            fake.clone(),
+            DeviceId::nvapi(0x2C02_10DE, 0x2095_10DE),
+            "NVIDIA GeForce RTX 5080 FE",
+            "NvAPI GPU 0".into(),
+            false,
+            current,
+            stored,
+            true,
+        )
+        .expect("controller")
+    }
+
+    #[test]
+    fn own_lighting_encoding_round_trips_and_rejects_what_does_not_fit() {
+        let params = rtx5080_params();
+        let bytes = encode_own(&params).expect("manual zones encode");
+        // Version, count, then per zone: type 4 (SINGLE_COLOR, LE), tag 2, R G B W 0, brightness.
+        assert_eq!(&bytes[..12], &[1, 3, 4, 0, 0, 0, 2, 0, 0, 0, 0, 50]);
+        assert_eq!(bytes.len(), 2 + 3 * 10);
+        let dark = ZoneControlParams::new(false, vec![single(0), single(0), single(0)]);
+        assert_eq!(decode_own(&bytes, &dark), Some(params.clone()));
+        let bad = |f: &dyn Fn(&mut Vec<u8>)| {
+            let mut b = bytes.clone();
+            f(&mut b);
+            decode_own(&b, &dark).is_none()
+        };
+        assert!(bad(&|b| b[0] = 2), "version");
+        assert!(bad(&|b| b[1] = 2), "zone count");
+        assert!(bad(&|b| b.truncate(20)), "length");
+        assert!(bad(&|b| b[2] = 1), "zone type differs");
+        assert!(bad(&|b| b[6] = 0), "RGB colour on a single-colour zone");
+        assert!(bad(&|b| b[11] = 101), "brightness above 100");
+        let mut animated = rtx5080_params();
+        animated.zones[1].mode = CtrlMode::PiecewiseLinear;
+        assert_eq!(encode_own(&animated), None, "an animation cannot be remembered");
+    }
+
+    #[test]
+    fn unmarked_gpu_reports_its_readback_as_own_lighting() {
+        let fake = Fake::with_state(rtx5080_params());
+        let c = controller(&fake);
+        assert_eq!(c.own_lighting(), encode_own(&rtx5080_params()));
+        assert!(c.shows_own_lighting());
+    }
+
+    #[test]
+    fn marked_gpu_keeps_the_marker_and_release_writes_the_stored_own_lighting() {
+        // CaseControl left the zones at 100 %; the remembered own lighting is 50/60/60.
+        let stored = encode_own(&rtx5080_params()).expect("encodes");
+        let left = ZoneControlParams::new(false, vec![single(100), single(100), single(100)]);
+        let fake = Fake::with_state(left);
+        let mut c = marked(&fake, Some(&stored));
+        assert!(!c.shows_own_lighting(), "the marker stays until a release");
+        assert_eq!(c.own_lighting(), Some(stored.clone()));
+        assert_eq!(c.hardware_mode().and_then(|s| s.brightness), Some(60));
+        // Nothing was sent, yet the release writes the stored state back.
+        c.release().expect("release");
+        assert_eq!(fake.calls(), vec![Call::Set(rtx5080_params())]);
+        assert!(c.shows_own_lighting());
+    }
+
+    #[test]
+    fn marked_gpu_without_stored_state_writes_back_what_it_read_and_keeps_the_marker() {
+        let left = ZoneControlParams::new(false, vec![single(100), single(100), single(100)]);
+        let fake = Fake::with_state(left.clone());
+        let mut c = marked(&fake, Some(&[1, 2, 3]));
+        assert_eq!(c.own_lighting(), None);
+        assert!(!c.shows_own_lighting());
+        c.set_direct(&[Rgb::BLACK; 3]).expect("set");
+        c.release().expect("release");
+        assert_eq!(fake.calls().last(), Some(&Call::Set(left)));
+        assert!(!c.shows_own_lighting(), "still CaseControl's state");
+        // Taking control again keeps it that way.
+        c.set_direct(&[Rgb::WHITE; 3]).expect("set");
+        assert_eq!(c.own_lighting(), None);
     }
 }

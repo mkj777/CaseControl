@@ -161,13 +161,15 @@ impl Backend for NvidiaIlluminationBackend {
                 .get_control()
                 .map_err(controller::device_error)
                 .and_then(|current| {
-                    IllumController::new(
+                    IllumController::new_with_stored(
                         api,
                         id.clone(),
                         c.entry.name,
                         location.clone(),
                         c.entry.treats_rgbw_as_rgb,
                         current,
+                        ctx.stored_own_lighting(&id),
+                        ctx.is_unreleased(&id),
                     )
                 });
             match opened {

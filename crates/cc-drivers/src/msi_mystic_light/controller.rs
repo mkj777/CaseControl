@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use cc_core::{
     Bus, ColorMode, Controller, DeviceDescription, DeviceError, DeviceId, DeviceInfo, DeviceKind, Led, Mode,
-    ModeCaps, ModeState, Rgb, Zone, ZoneKind,
+    ModeCaps, ModeState, OwnLighting, OwnSource, PersistCaps, PersistLook, PersistOutcome, Rgb, Zone,
+    ZoneKind,
 };
 use cc_hid::{HidError, HidTransport};
 
@@ -340,15 +341,26 @@ pub struct MysticLight185 {
     board: Board,
     board_id: u16,
     firmware: Firmware,
-    /// The configuration read at open, or the remembered last good own lighting when the board was opened with the
-    /// "unreleased" marker (ADR 0001 #38); `release()` sends it back with the save byte forced to zero.
-    original: ConfigPacket,
-    /// `original` is a state CaseControl left on the board (opened with the "unreleased" marker and no usable
-    /// remembered own lighting): it is not reported as own lighting, and the marker stays after a release.
-    left_by_us: bool,
-    /// The board does not show `original` yet (restoring the remembered own lighting at open failed): `release()`
-    /// sends it even if nothing was sent since open.
-    restore_pending: bool,
+    /// What `release()` sends back (save byte forced to zero) and where it came from (ADR 0001 #38): the configuration
+    /// read at open, the remembered own lighting of a board opened with the "unreleased" marker, or what this session
+    /// wrote to flash. While the board does not show a remembered own lighting yet (restoring it at open failed, or
+    /// was skipped because a setting is about to drive the board), `release()` sends it even if nothing was sent.
+    own: OwnLighting<ConfigPacket>,
+    /// The board's original saved state for "save colours to the devices" (ADR 0001 #42): the own lighting captured
+    /// in a non-direct state before CaseControl's first write of the session (the readback at open, or the
+    /// remembered own lighting of a marked board), if it passes [`protocol::validate_backup`]. A save or a restore
+    /// does not change it.
+    backup: Option<ConfigPacket>,
+    /// The only base a flash write builds on (ADR 0001 #42): the validated backup, then what this session last wrote
+    /// to flash. `None` when the board was opened in a state CaseControl or another program left and no validated
+    /// own lighting exists: nothing is ever written to its flash then.
+    trusted: Option<ConfigPacket>,
+    /// The hardware mode `set_mode` last sent, while the board shows it (cleared by direct colours and a release);
+    /// what a manual save writes.
+    mode_state: Option<ModeState>,
+    /// Anything was sent since open (never reset), or the board was opened with the "unreleased" marker (an earlier
+    /// instance sent something): a readback no longer tells what the flash holds.
+    sent_since_open: bool,
     /// Working configuration (`data` in the reference): the original plus our header sizes and mode changes.
     data: ConfigPacket,
     per_led: PerLedBuffers,
@@ -450,7 +462,7 @@ impl MysticLight185 {
     ///
     /// Same as [`open_with_stored`](Self::open_with_stored) without a remembered own lighting.
     pub fn open(dev: Box<dyn HidTransport>, candidate: &Candidate) -> Result<Self, DeviceError> {
-        Self::open_with_stored(dev, candidate, None, false)
+        Self::open_with_stored(dev, candidate, None, false, false)
     }
 
     /// [`open`](Self::open) with what the engine remembers about the board (ADR 0001 #38): `stored`, its last good
@@ -462,18 +474,25 @@ impl MysticLight185 {
     ///   reported as own lighting. If `stored` passes [`ConfigPacket::from_own_lighting`] (185 bytes, report id 0x52,
     ///   save byte 0, no zone in the per-LED effect), it is restored right away (the same two reports as `release()`)
     ///   and becomes what `release()` restores and [`hardware_mode`](cc_core::Controller::hardware_mode) reports, so
-    ///   the board and the UI agree; if that write fails, `release()` sends it even when nothing else was sent.
+    ///   the board and the UI agree; if that write fails, `release()` sends it even when nothing else was sent. With
+    ///   `setting_pending` (the engine drives the board right after open, ADR 0001 #42) the write at open is skipped,
+    ///   so the board does not flash the old look before the setting arrives; `release()` still restores `stored`.
     ///   Without a usable `stored`, `release()` restores the readback and
     ///   [`shows_own_lighting`](cc_core::Controller::shows_own_lighting) stays `false`.
     /// - Not `unreleased` and the readback is per-LED: another program drives the board. Nothing is stored or
     ///   restored, and the release of an untouched controller sends nothing (warning).
     /// - Not `unreleased` and the readback is not per-LED: it is what `release()` restores, and it is reported as the
     ///   new own lighting to remember.
+    ///
+    /// The own lighting found this way (not the readback of a marked board) is also the backup of the board's
+    /// original saved state ([`Controller::saved_state_backup`](cc_core::Controller::saved_state_backup)) when it
+    /// passes [`protocol::validate_backup`].
     pub fn open_with_stored(
         mut dev: Box<dyn HidTransport>,
         candidate: &Candidate,
         stored: Option<&[u8]>,
         unreleased: bool,
+        setting_pending: bool,
     ) -> Result<Self, DeviceError> {
         let len = read_config_len(dev.as_mut())?;
         match protocol::classify(len) {
@@ -503,12 +522,12 @@ impl MysticLight185 {
 
         let read = read_config(dev.as_mut())?;
         let good = if unreleased {
-            let good = stored.and_then(ConfigPacket::from_own_lighting);
+            let good = stored.and_then(protocol::validate_backup);
             if good.is_none() && stored.is_some() {
                 tracing::warn!(
                     target: "cc_drivers::msi",
                     id = %candidate.id,
-                    "stored own lighting is not a valid 185-byte configuration; ignoring it"
+                    "stored own lighting is not a valid saved configuration; ignoring it"
                 );
             }
             good
@@ -522,16 +541,19 @@ impl MysticLight185 {
             }
             None
         };
-        let left_by_us = unreleased && good.is_none();
-        if left_by_us {
+        let readback_is_own = !read.has_direct_effect();
+        let own = OwnLighting::at_open(read, readback_is_own, good, unreleased);
+        if own.source() == OwnSource::LeftByUs {
             tracing::warn!(
                 target: "cc_drivers::msi",
                 id = %candidate.id,
                 "board shows a state CaseControl left and no own lighting is stored for it; release() restores that state"
             );
         }
-        let restore = good.is_some();
-        let original = good.unwrap_or(read);
+        let restore = own.source() == OwnSource::Stored;
+        let backup = own
+            .own()
+            .and_then(|p| protocol::validate_backup(&p.with_save(false)));
 
         let config = listed.copied().unwrap_or(boards::DEFAULT_BOARD);
         let board = Board::new(board_id, config);
@@ -550,15 +572,28 @@ impl MysticLight185 {
             serial: candidate.serial.clone(),
             firmware: Some(firmware.display()),
         };
-        let mut c = Self::assemble(dev, info, board, board_id, firmware, original);
-        c.left_by_us = left_by_us;
-        if restore {
+        let mut c = Self::assemble(dev, info, board, board_id, firmware, own);
+        c.trusted = backup.clone();
+        c.backup = backup;
+        // A marked board shows what an earlier instance sent (volatile): its readback says nothing about the flash,
+        // as if this instance had sent it.
+        c.sent_since_open = unreleased;
+        if restore && setting_pending {
+            tracing::info!(
+                target: "cc_drivers::msi",
+                id = %c.desc.info.id,
+                "board shows a state CaseControl left and a setting is about to drive it; release() restores the stored own lighting"
+            );
+        } else if restore {
             match c.hand_back() {
-                Ok(()) => tracing::info!(
-                    target: "cc_drivers::msi",
-                    id = %c.desc.info.id,
-                    "board showed a state CaseControl left; restored the last good own lighting stored for it"
-                ),
+                Ok(()) => {
+                    c.own.handed_back();
+                    tracing::info!(
+                        target: "cc_drivers::msi",
+                        id = %c.desc.info.id,
+                        "board showed a state CaseControl left; restored the last good own lighting stored for it"
+                    );
+                }
                 Err(e) => {
                     tracing::warn!(
                         target: "cc_drivers::msi",
@@ -566,7 +601,6 @@ impl MysticLight185 {
                         error = %e,
                         "restoring the stored own lighting at open failed; release() will try again"
                     );
-                    c.restore_pending = true;
                 }
             }
             // Only the restore was sent: the board is not under software control.
@@ -581,8 +615,9 @@ impl MysticLight185 {
         board: Board,
         board_id: u16,
         firmware: Firmware,
-        original: ConfigPacket,
+        own: OwnLighting<ConfigPacket>,
     ) -> Self {
+        let original = own.handback();
         // Header sizes start from the LED-count bytes the board reported (`cycle_or_led_num`; JCORSAIR has none and
         // starts at 0), clamped to the resizable range by `layout_zones`. OpenRGB starts at 0 instead, which would
         // make the first hardware mode write count 0 to every header.
@@ -617,9 +652,11 @@ impl MysticLight185 {
             board,
             board_id,
             firmware,
-            original,
-            left_by_us: false,
-            restore_pending: false,
+            own,
+            backup: None,
+            trusted: None,
+            mode_state: None,
+            sent_since_open: false,
             data,
             per_led: PerLedBuffers::new(),
             colors,
@@ -633,7 +670,12 @@ impl MysticLight185 {
     /// The configuration `release()` restores: the one read from the device at open, or the remembered own lighting
     /// restored at open (see [`open_with_stored`](Self::open_with_stored)).
     pub fn original_config(&self) -> &ConfigPacket {
-        &self.original
+        self.own.handback()
+    }
+
+    /// The base the next flash write builds on (see [`Controller::persist_look`]), if the board has one.
+    pub fn trusted_base(&self) -> Option<&ConfigPacket> {
+        self.trusted.as_ref()
     }
 
     /// The working configuration the next hardware-mode update sends.
@@ -668,6 +710,7 @@ impl MysticLight185 {
 
     fn send(&mut self, bytes: &[u8]) -> Result<(), DeviceError> {
         self.touched = true;
+        self.sent_since_open = true;
         self.dev.send_feature_report(bytes).map_err(hid_err)
     }
 
@@ -764,12 +807,13 @@ impl MysticLight185 {
         self.send(&p)
     }
 
-    /// `Update(save)` outside direct mode: read the board's current configuration, send it back, then send `next`
-    /// ("Windows Mystic Light sends two consecutive reports"). `save` sets the save-to-flash byte of both.
-    fn update_hardware(&mut self, next: &ConfigPacket, save: bool) -> Result<(), DeviceError> {
+    /// `Update(false)` outside direct mode: read the board's current configuration, send it back, then send `next`
+    /// ("Windows Mystic Light sends two consecutive reports"), both with the save byte 0. Flash writes go through
+    /// [`write_flash`](Self::write_flash) only.
+    fn update_hardware(&mut self, next: &ConfigPacket) -> Result<(), DeviceError> {
         let current = read_config(self.dev.as_mut())?;
-        self.send(&current.with_save(save))?;
-        self.send(&next.with_save(save))
+        self.send(&current.with_save(false))?;
+        self.send(&next.with_save(false))
     }
 
     /// The hand-back transition shared by `release()` and the restore at open: leave direct mode, read the current
@@ -789,8 +833,284 @@ impl MysticLight185 {
                 tracing::warn!(target: "cc_drivers::msi", error = %e, "release: reading current state failed");
             }
         }
-        let original = self.original.with_save(false);
+        let original = self.own.handback().with_save(false);
         self.send(&original)
+    }
+
+    /// The firmware and class gates of a flash write, as at open: the firmware version must not be below the
+    /// reference's minimum for this board.
+    fn check_flash_gates(&self) -> Result<(), DeviceError> {
+        if boards::firmware_version_invalid(self.firmware.aprom, boards::board_config(self.board_id)) {
+            return Err(DeviceError::Refused(format!(
+                "controller firmware {} is below the minimum supported version; not writing flash",
+                self.firmware.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The packet a save of `look` writes, the trusted base it is built on, and the zones it changes. Built on the
+    /// trusted base (never on the working configuration or a direct-mode readback) with the same `apply_mode` /
+    /// `apply_zone_color` calls a hardware-mode update uses; zones the look leaves out and every LED count byte keep
+    /// the base's bytes. The save byte is 0. Refused without a trusted base.
+    fn persist_packet(
+        &self,
+        look: &PersistLook,
+    ) -> Result<(ConfigPacket, ConfigPacket, Vec<MsiZone>), DeviceError> {
+        let base = self.trusted.clone().ok_or_else(|| {
+            DeviceError::Refused(
+                "no trusted configuration to build on (the board was found in a state CaseControl or another program left)"
+                    .into(),
+            )
+        })?;
+        let layout = self.board.layout;
+        let mut next = base.clone();
+        let mut changed = Vec::new();
+        let zones = self.board.config.zones.iter().zip(&self.desc.zones);
+        let off = |next: &mut ConfigPacket, changed: &mut Vec<MsiZone>| {
+            // Every zone, also headers sized 0 (they may still have LEDs), as the off output of set_mode.
+            for msi in self.board.config.zones {
+                next.apply_mode(&layout, *msi, mode::STATIC, 0, protocol::brightness::OFF, false);
+                next.apply_zone_color(&layout, *msi, Rgb::BLACK, Rgb::BLACK);
+                changed.push(*msi);
+            }
+        };
+        match look {
+            PersistLook::Off => off(&mut next, &mut changed),
+            PersistLook::Zones(colors) => {
+                if colors.len() != self.desc.zones.len() {
+                    return Err(DeviceError::InvalidArgument(format!(
+                        "{} zone colours for {} zones",
+                        colors.len(),
+                        self.desc.zones.len()
+                    )));
+                }
+                for ((msi, zone), color) in zones.zip(colors) {
+                    let Some(color) = color else { continue };
+                    if zone.len == 0 {
+                        continue;
+                    }
+                    // One colour per header as Static at full level: brightness is baked into the colour.
+                    next.apply_mode(
+                        &layout,
+                        *msi,
+                        mode::STATIC,
+                        0,
+                        protocol::brightness::LEVEL_100,
+                        false,
+                    );
+                    next.apply_zone_color(&layout, *msi, *color, *color);
+                    changed.push(*msi);
+                }
+            }
+            PersistLook::Mode(state) => {
+                self.desc
+                    .validate_state(state)
+                    .map_err(|e| DeviceError::InvalidArgument(e.to_string()))?;
+                if self.desc.direct_mode == Some(state.mode) {
+                    return Err(DeviceError::InvalidArgument(
+                        "the direct mode cannot be saved; save its colours per zone".into(),
+                    ));
+                }
+                let m = self
+                    .desc
+                    .mode(state.mode)
+                    .ok_or_else(|| DeviceError::InvalidArgument(format!("unknown mode {}", state.mode)))?;
+                let random = m.color_mode == ColorMode::Random;
+                let default_speed = if m.caps.contains(ModeCaps::SPEED) {
+                    protocol::speed::MEDIUM
+                } else {
+                    0
+                };
+                let effect =
+                    u8::try_from(state.mode).map_err(|_| DeviceError::InvalidArgument("mode id".into()))?;
+                let speed = state
+                    .speed
+                    .and_then(|s| u8::try_from(s).ok())
+                    .unwrap_or(default_speed);
+                let brightness = state
+                    .brightness
+                    .and_then(|b| u8::try_from(b).ok())
+                    .unwrap_or(protocol::brightness::LEVEL_100);
+                if state.mode == u32::from(mode::STATIC) && brightness == protocol::brightness::OFF {
+                    off(&mut next, &mut changed);
+                } else {
+                    // Exactly the bytes set_mode writes: each zone with LEDs gets the mode and its first LED's colour
+                    // (the mode's colours for per-LED colour modes, else the colour buffer, as set_mode uses it).
+                    for (msi, zone) in zones {
+                        if zone.len == 0 {
+                            continue;
+                        }
+                        let color = if m.color_mode == ColorMode::PerLed {
+                            state.colors.get(zone.start).copied().unwrap_or(Rgb::BLACK)
+                        } else {
+                            self.colors.get(zone.start).copied().unwrap_or(Rgb::BLACK)
+                        };
+                        next.apply_mode(&layout, *msi, effect, speed, brightness, random);
+                        next.apply_zone_color(&layout, *msi, color, color);
+                        changed.push(*msi);
+                    }
+                }
+            }
+        }
+        if changed.is_empty() {
+            return Err(DeviceError::InvalidArgument("no zone to save".into()));
+        }
+        next.0[protocol::SAVE_BYTE] = 0;
+        Ok((next, base, changed))
+    }
+
+    /// Every gate a packet must pass before it reaches flash (research §1.4), as [`DeviceError::Refused`]: 185 bytes
+    /// with report id 0x52 (by construction of [`ConfigPacket`], checked again), every zone record of the whole packet
+    /// savable ([`protocol::check_saved_records`]), LED counts within the maxima, and every byte outside the saved
+    /// zones' records and the on-board sync/mirror bits equal to the trusted `base` (LED counts included).
+    fn check_persist_packet(
+        &self,
+        next: &ConfigPacket,
+        base: &ConfigPacket,
+        changed: &[MsiZone],
+    ) -> Result<(), DeviceError> {
+        let refuse = |why: String| DeviceError::Refused(format!("save refused: {why}"));
+        if next.0.len() != CONFIG_LEN || next.0[0] != CONFIG_REPORT_ID {
+            return Err(refuse("not a 185-byte 0x52 report".into()));
+        }
+        protocol::check_saved_records(next).map_err(refuse)?;
+        protocol::check_led_counts(next).map_err(refuse)?;
+        protocol::check_save_diff(base, next, &self.board.layout, changed).map_err(refuse)?;
+        Ok(())
+    }
+
+    /// Writes `next` (gated, save byte 0) to flash: leaves direct mode volatile by sending `next` with save 0 and
+    /// checks the readback equals it (else [`DeviceError::Refused`]: nothing reached flash), then the reference's
+    /// two-report save (the readback, then `next`, both with save 1), then checks the readback again (a mismatch is
+    /// a protocol error: the flash may hold anything). The caller records the result
+    /// ([`after_flash`](Self::after_flash)) and takes direct mode again.
+    fn write_flash(&mut self, next: &ConfigPacket) -> Result<(), DeviceError> {
+        let same = |a: &ConfigPacket, b: &ConfigPacket| a.with_save(false) == b.with_save(false);
+        self.direct = false;
+        self.direct_configured = false;
+        self.mode_state = None;
+        self.sync = protocol::sync_direct_mode(next);
+        self.send(&next.with_save(false))?;
+        let shown = read_config(self.dev.as_mut())?;
+        if !same(&shown, next) {
+            return Err(DeviceError::Refused(
+                "the board does not show the packet to save; not writing flash".into(),
+            ));
+        }
+        protocol::check_saved_records(&shown)
+            .map_err(|e| DeviceError::Refused(format!("save refused: {e}")))?;
+        self.send(&shown.with_save(true))?;
+        self.send(&next.with_save(true))?;
+        let stored = read_config(self.dev.as_mut())?;
+        if !same(&stored, next) {
+            return Err(DeviceError::Protocol(
+                "the board reads back something else after the save".into(),
+            ));
+        }
+        tracing::info!(
+            target: "cc_drivers::msi",
+            id = %self.desc.info.id,
+            packet = %cc_hid::hex(&next.with_save(false)),
+            "configuration saved to flash"
+        );
+        Ok(())
+    }
+
+    /// After a verified flash write of `written`: it is the next trusted base, what `release()` hands back and the own
+    /// lighting; the working configuration is `written` with the configured header sizes (volatile updates keep
+    /// sending those; flash keeps the base's counts).
+    fn after_flash(&mut self, written: &ConfigPacket) {
+        let written = ConfigPacket(written.with_save(false));
+        self.trusted = Some(written.clone());
+        self.own.saved(written.clone());
+        let mut data = written;
+        for (z, zone) in self.board.config.zones.iter().zip(&self.desc.zones) {
+            data.set_led_count(*z, u8::try_from(zone.len).unwrap_or(u8::MAX));
+        }
+        self.data = data;
+    }
+
+    /// The configuration a restore writes (see [`Controller::restore_saved_state`]): a fresh readback outside
+    /// per-LED mode with the backed-up records of `backup` replaced, gated like a save, and whether it was written
+    /// (not when `may_skip` and the readback already holds the backup). When anything was sent this session (direct
+    /// mode, or a hardware mode with the configured header sizes) or the board was opened with the "unreleased" marker
+    /// (it shows what an earlier instance sent), the board is first sent the backup with the LED counts of the trusted
+    /// base (volatile), so the readback carries the board's stored counts, never the configured sizes.
+    fn restore_target(
+        &mut self,
+        backup: &ConfigPacket,
+        may_skip: bool,
+    ) -> Result<(ConfigPacket, bool), DeviceError> {
+        if self.direct || self.sent_since_open {
+            let mut leave = backup.clone();
+            if let Some(base) = &self.trusted {
+                for z in [MsiZone::JRainbow1, MsiZone::JRainbow2, MsiZone::JRainbow3] {
+                    if let Some(n) = base.led_count(z) {
+                        leave.set_led_count(z, n);
+                    }
+                }
+            }
+            self.mode_state = None;
+            self.direct = false;
+            self.direct_configured = false;
+            self.send(&leave.with_save(false))?;
+        }
+        let readback = read_config(self.dev.as_mut())?;
+        let refuse = |why: String| DeviceError::Refused(format!("restore refused: {why}"));
+        if readback.has_direct_effect() {
+            return Err(refuse("the board is in per-LED mode".into()));
+        }
+        let layout = self.board.layout;
+        let zones = self.board.config.zones;
+        let target = protocol::replace_records(&readback, backup, &layout, zones);
+        protocol::check_saved_records(&target).map_err(refuse)?;
+        protocol::check_led_counts(&target).map_err(refuse)?;
+        protocol::check_save_diff(&readback, &target, &layout, zones).map_err(refuse)?;
+        if may_skip && target.with_save(false) == readback.with_save(false) {
+            return Ok((target, false));
+        }
+        self.write_flash(&target)?;
+        Ok((target, true))
+    }
+
+    /// After a flash write: takes direct mode again and re-sends the last frame when the board was driven with
+    /// direct colours (`colors` and the per-LED buffers still hold it). A failure is logged; the next frame retries.
+    fn resume_direct(&mut self, was_direct: bool) {
+        if !was_direct {
+            return;
+        }
+        let r = self.enter_direct().and_then(|()| self.update_direct());
+        if let Err(e) = r {
+            tracing::warn!(target: "cc_drivers::msi", error = %e, "re-entering direct mode after the flash write failed");
+            self.direct = false;
+            self.direct_configured = false;
+        }
+    }
+
+    /// After a flash write of `written` (or a failed one) outside direct mode: the board shows `written`, with the
+    /// trusted base's LED counts, not what it showed before. `shown` (the working configuration with the configured
+    /// header sizes, and the hardware mode it is) becomes the working configuration again and is sent as a
+    /// hardware-mode update (volatile), so only the flash changed. A failure is logged; the next output sends the
+    /// working configuration again.
+    fn resume_hardware(
+        &mut self,
+        written: &ConfigPacket,
+        (data, mode_state): (ConfigPacket, Option<ModeState>),
+    ) {
+        self.data = data;
+        self.sync = protocol::sync_direct_mode(&self.data);
+        if self.data.with_save(false) == written.with_save(false) {
+            self.mode_state = mode_state;
+            return;
+        }
+        let next = self.data.clone();
+        match self.update_hardware(&next) {
+            Ok(()) => self.mode_state = mode_state,
+            Err(e) => {
+                tracing::warn!(target: "cc_drivers::msi", error = %e, "showing the output again after the flash write failed");
+            }
+        }
     }
 
     fn check_zone(&self, zone: usize) -> Result<(), DeviceError> {
@@ -815,6 +1135,7 @@ impl Controller for MysticLight185 {
                 self.colors.len()
             )));
         }
+        self.mode_state = None;
         self.enter_direct()?;
         self.colors.copy_from_slice(colors);
         for zone in 0..self.desc.zones.len() {
@@ -833,6 +1154,7 @@ impl Controller for MysticLight185 {
                 range.len()
             )));
         }
+        self.mode_state = None;
         self.enter_direct()?;
         self.colors[range].copy_from_slice(colors);
         self.stage_zone(zone);
@@ -898,7 +1220,10 @@ impl Controller for MysticLight185 {
             self.data.apply_zone_color(&layout, *msi, color, color);
         }
         let next = self.data.clone();
-        self.update_hardware(&next, false)
+        self.mode_state = None;
+        self.update_hardware(&next)?;
+        self.mode_state = Some(state.clone());
+        Ok(())
     }
 
     fn resize_zone(&mut self, zone: usize, len: usize) -> Result<(), DeviceError> {
@@ -936,48 +1261,148 @@ impl Controller for MysticLight185 {
         self.select_per_led_protocol()
     }
 
+    /// The hardware mode `set_mode` last sent, written to flash through every gate of
+    /// [`persist_look`](Controller::persist_look). Refused ([`DeviceError::Unsupported`]) in direct mode (the
+    /// reference's `Update(true)` only sends a per-LED frame there) and when no hardware mode was set, so neither the
+    /// enable message nor a readback reaches flash.
     fn save_to_hardware(&mut self) -> Result<(), DeviceError> {
         if self.direct {
-            // In direct mode the reference's Update(true) only sends a per-LED frame; there is nothing to save.
             return Err(DeviceError::Unsupported);
         }
-        let next = self.data.clone();
-        self.update_hardware(&next, true)
+        let Some(state) = self.mode_state.clone() else {
+            return Err(DeviceError::Unsupported);
+        };
+        self.persist_look(&PersistLook::Mode(state), None).map(|_| ())
     }
 
     fn release(&mut self) -> Result<(), DeviceError> {
-        if !self.touched && !self.restore_pending {
+        if !self.touched && !self.own.handback_pending() {
             return Ok(());
         }
         self.hand_back()?;
         self.touched = false;
-        self.restore_pending = false;
+        self.mode_state = None;
+        self.own.handed_back();
         Ok(())
     }
 
-    /// The mode in the configuration `release()` restores (read at open, or the remembered own lighting).
+    /// The mode in the configuration `release()` restores (read at open, the remembered own lighting, or what was
+    /// written to flash).
     fn hardware_mode(&self) -> Option<ModeState> {
-        hardware_state(&self.original, &self.board, &self.desc)
+        hardware_state(self.own.handback(), &self.board, &self.desc)
     }
 
-    /// `original` (save byte 0) unless it is a state CaseControl left or has a zone in per-LED mode. When `original`
-    /// is the remembered own lighting restored at open, these are the bytes already stored.
+    /// The hand-back configuration (save byte 0) unless it is a state CaseControl or another program left. When it is
+    /// the remembered own lighting restored at open, these are the bytes already stored.
     fn own_lighting(&self) -> Option<Vec<u8>> {
-        if self.left_by_us {
-            None
-        } else {
-            self.original.own_lighting()
-        }
+        self.own.own().and_then(ConfigPacket::own_lighting)
     }
 
-    /// `false` while `original` is a state CaseControl left, or while the restore at open is still pending.
+    /// `false` while the hand-back configuration is a state CaseControl left, or while the restore of the
+    /// remembered own lighting is still pending.
     fn shows_own_lighting(&self) -> bool {
-        !self.left_by_us && !self.restore_pending
+        self.own.shows_own_lighting()
     }
 
     /// Static at brightness 0: a hardware state, so brightness 0 does not switch the board to per-LED mode (whose
     /// enable message outlives the app if it ends without a release; ADR 0001 #38).
     fn off_mode(&self) -> Option<u32> {
         Some(u32::from(mode::STATIC))
+    }
+
+    /// One colour per header (Static at full level) and every hardware mode.
+    fn persist_caps(&self) -> Option<PersistCaps> {
+        Some(PersistCaps {
+            zone_colors: true,
+            hardware_modes: true,
+        })
+    }
+
+    /// Writes the configuration packet for `look` to flash (ADR 0001 #42, research §1.4). The packet is the trusted
+    /// base (the validated backup, or what this session last wrote to flash; never the working configuration or a
+    /// direct-mode readback) with the looked-for zones set exactly as a hardware-mode update sets them: a zone colour
+    /// as Static at level 10, a mode as `set_mode` writes it, off as Static at brightness 0; LED counts stay the
+    /// base's. Every gate refusal is [`DeviceError::Refused`]. When the board is not in direct mode, a fresh readback
+    /// must equal the working configuration first (else another program changed it). The fingerprint is the packet.
+    /// After the write `release()` hands back the saved packet; direct mode is taken again with the last frame, or
+    /// outside direct mode the working configuration shown before (configured header sizes, not the flash's counts)
+    /// is sent again as a hardware-mode update; both also when the write failed.
+    fn persist_look(
+        &mut self,
+        look: &PersistLook,
+        last: Option<&[u8]>,
+    ) -> Result<PersistOutcome, DeviceError> {
+        self.check_flash_gates()?;
+        let (next, base, changed) = self.persist_packet(look)?;
+        self.check_persist_packet(&next, &base, &changed)?;
+        let fingerprint = next.with_save(false).to_vec();
+        if last == Some(fingerprint.as_slice()) {
+            return Ok(PersistOutcome::Unchanged);
+        }
+        let was_direct = self.direct;
+        if !was_direct {
+            let shown = read_config(self.dev.as_mut())?;
+            if shown.with_save(false) != self.data.with_save(false) {
+                return Err(DeviceError::Refused(
+                    "the board shows a configuration CaseControl did not send; not writing flash".into(),
+                ));
+            }
+        }
+        let shown = (self.data.clone(), self.mode_state.clone());
+        let written = self.write_flash(&next);
+        if written.is_ok() {
+            self.after_flash(&next);
+        }
+        if was_direct {
+            self.resume_direct(true);
+        } else {
+            self.resume_hardware(&next, shown);
+        }
+        written.map(|()| PersistOutcome::Written { fingerprint })
+    }
+
+    /// The own lighting captured before CaseControl's first write of the session (or what a restore wrote back), if
+    /// it passed [`protocol::validate_backup`] at open.
+    fn saved_state_backup(&self) -> Option<Vec<u8>> {
+        self.backup.as_ref().map(|p| p.with_save(false).to_vec())
+    }
+
+    /// Validates `backup` ([`protocol::validate_backup`]), then writes back the board's configuration with the
+    /// backed-up records replaced: when the board is driven in direct mode it first leaves it with the backup
+    /// (volatile), then a fresh readback outside per-LED mode gets the backup's zone records (LED counts stay the
+    /// readback's), is gated like a save ([`protocol::check_save_diff`] against the readback) and written with the same
+    /// sequence. When nothing was sent since open, the board was not opened with the "unreleased" marker and the
+    /// readback already holds the backup, nothing is written ([`PersistOutcome::Unchanged`]). Afterwards the written configuration is what `release()` hands back and the
+    /// next trusted base; the backup stays. Direct mode is taken again with the last frame, also after a failure.
+    fn restore_saved_state(&mut self, backup: &[u8]) -> Result<PersistOutcome, DeviceError> {
+        let packet = protocol::validate_backup(backup).ok_or_else(|| {
+            DeviceError::InvalidArgument("the backup is not a valid saved configuration; nothing sent".into())
+        })?;
+        self.check_flash_gates()?;
+        let was_direct = self.direct;
+        let may_skip = !was_direct && !self.sent_since_open;
+        match self.restore_target(&packet, may_skip) {
+            Ok((target, false)) => {
+                tracing::info!(
+                    target: "cc_drivers::msi",
+                    id = %self.desc.info.id,
+                    "the board already holds its original saved configuration; nothing written"
+                );
+                self.trusted = Some(target.clone());
+                self.own.saved(target);
+                Ok(PersistOutcome::Unchanged)
+            }
+            Ok((target, true)) => {
+                self.after_flash(&target);
+                self.resume_direct(was_direct);
+                Ok(PersistOutcome::Written {
+                    fingerprint: target.with_save(false).to_vec(),
+                })
+            }
+            Err(e) => {
+                self.resume_direct(was_direct);
+                Err(e)
+            }
+        }
     }
 }

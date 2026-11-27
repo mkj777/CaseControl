@@ -14,7 +14,10 @@
 //!   [`autostart_actions`] (and the checked [`terminate_process`] behind them), run through
 //!   [`SystemOps`] (`WindowsOps` on Windows). Everything that needs administrator rights runs in one elevated helper
 //!   invocation of the app's own executable ([`run_elevated_helper`]), which re-validates each action against a
-//!   fresh scan ([`run_elevated_request`]).
+//!   fresh scan ([`run_elevated_request_in`]).
+//! - Runs CaseControl's own start-up task actions in that helper ([`Action::RegisterBootTask`],
+//!   [`Action::RemoveBootTask`], ADR 0001 #42): the helper derives the user, executable and arguments itself
+//!   ([`boot_task`]) and registers the task through `cc-system`.
 //!
 //! What it deliberately does not do:
 //! - No action without a user click, and no action on anything a scan does not tie to a catalog entry.
@@ -28,10 +31,12 @@
 //! - Store/MSIX packages and their startup tasks are not enumerated, so Store-only apps (HyperX NGENUITY) are only
 //!   partly detectable. Scheduled tasks are not read.
 //!
-//! All `unsafe` code lives in the private `sys` module (Windows only).
+//! All `unsafe` code lives in the private `sys` module (Windows only); the Task Scheduler, identity and ACL calls of
+//! the start-up task actions live in `cc-system`.
 
 mod actions;
 mod autostart;
+pub mod boot_task;
 mod catalog;
 mod elevation;
 #[cfg(windows)]
@@ -50,6 +55,9 @@ pub use autostart::{
     STARTUP_APPROVED, ShellLink, command_executable, encode_startup_approved, file_name, filetime,
     parse_shell_link, parse_startup_approved,
 };
+#[cfg(windows)]
+pub use boot_task::WindowsBootTaskEnv;
+pub use boot_task::{BOOT_TASK_ENTRY, BootTaskEnv, HelperContext};
 pub use catalog::{
     AFFECTS_ALL, Access, Catalog, CatalogError, Category, Class, DYNAMIC_LIGHTING_ENTRY, Entry,
     OPENRGB_ENTRY, Severity,
@@ -57,12 +65,15 @@ pub use catalog::{
 /// Device family ids the catalog's `affects` lists refer to (re-exported from `cc-core`).
 pub use cc_core::family;
 pub use elevation::{
-    ELEVATED_ACTIONS_FLAG, ElevationError, HELPER_BASE_TIMEOUT, SERVICE_STOP_WAIT, helper_parameters,
-    helper_request_path, helper_timeout, is_helper_invocation, request_path_shape_ok, result_path,
-    run_elevated_helper, validate_helper_request,
+    BOOT_TASK_ACTION_WAIT, ELEVATED_ACTIONS_FLAG, ElevationError, HELPER_BASE_TIMEOUT, SERVICE_STOP_WAIT,
+    helper_parameters, helper_request_path, helper_timeout, is_helper_invocation, request_path_shape_ok,
+    result_path, run_elevated_helper, validate_helper_request, write_helper_result,
 };
 #[cfg(windows)]
-pub use platform::{WindowsAutostart, WindowsOps, WindowsProcesses, WindowsRegistry, WindowsServices};
+pub use platform::{
+    WindowsAutostart, WindowsHelperAutostart, WindowsOps, WindowsProcesses, WindowsRegistry, WindowsServices,
+    remove_own_run_entry,
+};
 
 /// The Windows session of the current process (`None` when unknown or not on Windows).
 pub fn current_session_id() -> Option<u32> {
@@ -79,7 +90,7 @@ pub use probe::{OPENRGB_SDK_PORT, OpenRgbProbe, PROBE_TIMEOUT};
 pub use resolve::{
     Action, ActionOutcome, ELEVATED_PROTOCOL_VERSION, ElevatedRequest, ElevatedResponse,
     MAX_ELEVATED_ACTIONS, PlannedAction, SystemOps, autostart_actions, check_action, close_actions, execute,
-    run_elevated_request,
+    run_elevated_request, run_elevated_request_in,
 };
 pub use scan::{Evidence, Finding, ScanOptions, ScanReport, Scanner, glob_match, sort_findings};
 pub use sources::{
@@ -98,5 +109,17 @@ impl Scanner {
             WindowsRegistry,
         )
         .with_autostart(WindowsAutostart)
+    }
+
+    /// [`Scanner::windows`] for the elevated helper: autostart entries from [`WindowsHelperAutostart`] (the common
+    /// Startup folder only when the system or administrators own it).
+    pub fn windows_helper() -> Self {
+        Scanner::new(
+            Catalog::embedded(),
+            WindowsProcesses,
+            WindowsServices,
+            WindowsRegistry,
+        )
+        .with_autostart(WindowsHelperAutostart)
     }
 }

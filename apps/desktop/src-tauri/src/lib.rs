@@ -1,19 +1,30 @@
 //! CaseControl desktop shell (Tauri 2).
 //!
 //! One process (ADR 0001 #3): a window with the Lighting, Conflicts and Settings pages, a tray icon
-//! with Show / Apply profile / Release devices / Quit, close-to-tray, a single-instance guard, autostart
-//! registration, file logging, and the IPC commands and events the pages use. The window has no Windows title bar
+//! with Show / Apply profile / Release devices / Quit, close-to-tray, a single-instance guard, autostart as a
+//! Task Scheduler logon task ([`autostart`]), file logging, and the IPC commands and events the pages use. The window has no Windows title bar
 //! (ADR 0001 #29); the frontend draws its own window controls. Devices and zones the user hid are kept out of
 //! control by the commands (see [`hidden`], ADR 0001 #26).
 //!
-//! On start it loads settings and profiles (`cc-config`), starts the device engine (`cc-engine`) with every
-//! compiled-in driver (`cc-drivers`) and applies the active profile; there is always exactly one, created as "Profile
-//! 1" when none exists, and every change to what a device shows is saved into it by a coalescing autosave thread
-//! ([`autosave`], ADR 0001 #40). Every exit path (tray Quit, the
-//! `quit` command, a second instance started with `--quit`, `RunEvent::ExitRequested`/`Exit` (no update install there), which also covers
-//! Windows session end) writes a pending profile change and releases the devices through
-//! [`AppState::shutdown_engine`] exactly once. A `--quit`
-//! process itself never starts the engine (see [`run`]).
+//! On start it loads settings and profiles (`cc-config`), takes the cross-session device lock, starts the device
+//! engine (`cc-engine`) with every compiled-in driver (`cc-drivers`) and the active profile seeded, so each device
+//! gets its setting as soon as it is found (ADR 0001 #42); there is always exactly one active profile, created as
+//! "Profile 1" when none exists, and every change to what a device shows is saved into it by a coalescing autosave
+//! thread ([`autosave`], ADR 0001 #40). Every exit path (tray Quit, the `quit` command, a second instance started
+//! with `--quit`, Update now, `RunEvent::ExitRequested`/`Exit` (no update install there), which also covers Windows
+//! sign-out and shutdown) goes through [`AppState::shutdown_engine`] exactly once: it writes a pending profile
+//! change, saves the colours to the devices when that switch is on, and releases the devices or keeps the colours on
+//! them depending on why the app closes ([`power`], ADR 0001 #42; the session-end watch of `cc-system` is installed
+//! on the main window in the setup hook). A `--quit` process itself never starts the engine (see [`run`]).
+//!
+//! `main` handles three modes before [`run`]: the [`elevated`] helper, the start-up task's headless
+//! `--apply-at-boot` ([`boot`]) and the uninstaller's `--uninstall-cleanup` ([`cleanup`]). A command line that names
+//! `--apply-at-boot` or `--uninstall-cleanup` in any other than their exact form ends at once with an error code
+//! ([`boot::malformed_mode_invocation`]), and the window never starts in session 0 ([`refuse_session_zero`]).
+//!
+//! The uninstaller's clean-up stops a running instance with `--quit-for-uninstall` ([`UNINSTALL_QUIT_FLAG`]): like
+//! `--quit`, but the running instance releases its devices without saving to them and without installing a pending
+//! update ([`shutdown_for_uninstall`]).
 //!
 //! After the start (also a hidden one) a background thread scans for conflicting software; if RGB suites affect a
 //! visible device, the window is shown and `startup-conflicts` carries the start dialog model (ADR 0001 #31, see
@@ -27,11 +38,13 @@
 //! with "Update now" ([`install_update_now`]), which releases the devices first and restarts the app.
 //!
 //! The updater is its only network access (ADR 0001 #13, #39); it has no telemetry, changes other software's
-//! autostart only reversibly and only on a click (ADR 0001 #31), and enables its own autostart only when the user
-//! switches it on in Settings.
+//! autostart only reversibly and only on a click (ADR 0001 #31), and creates its own logon and start-up tasks only
+//! when the user switches them on in Settings.
 
 pub mod autosave;
 pub mod autostart;
+pub mod boot;
+pub mod cleanup;
 pub mod commands;
 pub mod conflict_actions;
 pub mod conflicts;
@@ -39,6 +52,7 @@ pub mod elevated;
 pub mod events;
 pub mod hidden;
 pub mod logging;
+pub mod power;
 pub mod prefs;
 pub mod profiles;
 pub mod startup;
@@ -62,6 +76,10 @@ pub const HIDDEN_FLAG: &str = "--hidden";
 /// Command-line flag that asks a running instance to shut down (releasing every device) and starts nothing itself.
 pub const QUIT_FLAG: &str = "--quit";
 
+/// Command-line flag the uninstaller's clean-up uses to stop a running instance: it releases every device, never saves
+/// to them and never installs a pending update ([`shutdown_for_uninstall`]); starts nothing itself.
+pub const UNINSTALL_QUIT_FLAG: &str = "--quit-for-uninstall";
+
 /// What a command line asks the desktop app to do. `--elevated-actions` is not parsed here: `main` handles it
 /// before anything else (see [`elevated::helper_main`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -70,6 +88,15 @@ pub struct LaunchArgs {
     pub hidden: bool,
     /// `--quit`: make the running instance shut down; never start one.
     pub quit: bool,
+    /// `--quit-for-uninstall`: make the running instance shut down for the uninstaller; never start one.
+    pub uninstall_quit: bool,
+}
+
+impl LaunchArgs {
+    /// Whether this process only asks a running instance to quit (either flag) and never starts one.
+    pub fn quits(&self) -> bool {
+        self.quit || self.uninstall_quit
+    }
 }
 
 impl LaunchArgs {
@@ -87,6 +114,8 @@ impl LaunchArgs {
                 parsed.hidden = true;
             } else if arg == OsStr::new(QUIT_FLAG) {
                 parsed.quit = true;
+            } else if arg == OsStr::new(UNINSTALL_QUIT_FLAG) {
+                parsed.uninstall_quit = true;
             }
         }
         parsed
@@ -131,7 +160,8 @@ fn cancel_exit() {
     EXITING.store(false, Ordering::Release);
 }
 
-/// Orderly shutdown and process exit: releases every device to its hardware mode (once), installs a pending update
+/// Orderly shutdown and process exit: stops the engine (once; a normal quit releases every device to its hardware
+/// mode, see [`AppState::shutdown_engine`]), installs a pending update
 /// (see [`install_update_on_exit`]), then exits. Tray Quit, the `quit` command and `--quit` call this on the main
 /// thread; the run-loop exit events call [`AppState::shutdown_engine`] directly. Ignored while another exit path
 /// (e.g. Update now) runs.
@@ -148,6 +178,35 @@ pub fn shutdown<R: Runtime>(app: &AppHandle<R>) {
     app.exit(0);
 }
 
+/// The uninstaller's clean-up asked this instance to quit (`--quit-for-uninstall`, ADR 0001 #42): releases every
+/// device without saving to them ([`AppState::shutdown_engine_for_uninstall`]) and exits without installing a pending
+/// update (the uninstall removes the app; the downloaded update is left alone). Ignored while another exit path
+/// runs.
+pub fn shutdown_for_uninstall<R: Runtime>(app: &AppHandle<R>) {
+    if !begin_exit() {
+        tracing::info!("uninstall quit requested while CaseControl is already exiting or updating; ignored");
+        return;
+    }
+    tracing::info!("shutting down for the uninstaller");
+    if let Some(state) = app.try_state::<AppState>() {
+        state.shutdown_engine_for_uninstall();
+    }
+    app.exit(0);
+}
+
+/// The window never starts in session 0 (services, the start-up task's S4U logon): returns the exit code when the
+/// process runs there (logged), `None` otherwise or when the session cannot be read.
+pub fn refuse_session_zero() -> Option<i32> {
+    match cc_system::current_session_id() {
+        Ok(0) => {
+            logging::init();
+            tracing::error!("CaseControl's window cannot start in session 0; exiting");
+            Some(boot::EXIT_BAD_INVOCATION)
+        }
+        _ => None,
+    }
+}
+
 /// Starts the installer of a pending update without restarting the app; call only after the devices were released.
 /// On success the process ends here (after Tauri's exit cleanup, so the tray icon is removed); otherwise it returns
 /// and the caller exits normally. A no-op in debug builds and when nothing is pending.
@@ -161,7 +220,7 @@ pub fn install_update_on_exit<R: Runtime>(app: &AppHandle<R>) {
 pub const UPDATES_DISABLED: &str = updater::DISABLED_REASON;
 
 /// The arguments CaseControl restarts with after Update now: the current command line without the program name,
-/// `--hidden` and `--quit`. The user clicked Update now in the window, so the new version must show it even when
+/// `--hidden`, `--quit` and `--quit-for-uninstall`. The user clicked Update now in the window, so the new version must show it even when
 /// this instance was started hidden by autostart.
 pub fn update_now_args<I, S>(args: I) -> Vec<String>
 where
@@ -172,7 +231,7 @@ where
         .skip(1)
         .filter(|a| {
             let a = a.as_ref();
-            a != OsStr::new(HIDDEN_FLAG) && a != OsStr::new(QUIT_FLAG)
+            a != OsStr::new(HIDDEN_FLAG) && a != OsStr::new(QUIT_FLAG) && a != OsStr::new(UNINSTALL_QUIT_FLAG)
         })
         .map(|a| a.as_ref().to_string_lossy().into_owned())
         .collect()
@@ -248,6 +307,67 @@ fn restart_with<R: Runtime>(app: &AppHandle<R>, args: &[String]) {
     app.exit(0);
 }
 
+/// Installs the session-end watch of `cc-system` on the main window and the event-target window of tao (ADR 0001
+/// #42). Runs on the main thread (the setup hook). Problems are logged; without the watch a session end counts as
+/// `Unknown` (colours kept) when Windows reports it is shutting down, else as a normal quit.
+fn install_session_end_watch<R: Runtime>(app: &AppHandle<R>) {
+    #[cfg(windows)]
+    {
+        let hwnd = app.get_webview_window(MAIN_WINDOW).and_then(|w| w.hwnd().ok());
+        let Some(hwnd) = hwnd else {
+            tracing::warn!("no main window handle; session end is not watched");
+            return;
+        };
+        match cc_system::session_end::install(hwnd.0 as isize) {
+            Ok(installed) => tracing::info!(?installed, "session-end watch installed"),
+            Err(err) => tracing::warn!(%err, "cannot watch the session end"),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+    }
+}
+
+/// On a background thread: aligns "Apply colours before sign-in" with the start-up task when it can be read
+/// ([`commands::align_apply_before_sign_in`]), then checks the logon task and migrates the old `Run` entry (release
+/// builds; see [`autostart::sync_at_start`]). Skipped entirely while the settings cannot be saved, so an unreadable
+/// settings file never deletes a task. Each check holds its lock, so the matching switch does not run meanwhile.
+fn spawn_task_checks<R: Runtime>(app: AppHandle<R>) {
+    let spawned = std::thread::Builder::new()
+        .name("cc-autostart".into())
+        .spawn(move || {
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            if let Some(err) = state.settings_error() {
+                tracing::warn!(%err, "settings cannot be saved; autostart and start-up task not checked");
+                return;
+            }
+            {
+                let _serial = state.boot_task_lock();
+                commands::align_apply_before_sign_in(&state, commands::read_boot_task_state());
+            }
+            if !autostart::MANAGES_TASK {
+                return;
+            }
+            let _serial = state.autostart_lock();
+            let autostart = state.settings().autostart;
+            autostart::sync_at_start(autostart, || {
+                let saved = state.update_settings(|s| {
+                    s.autostart = false;
+                    Ok(())
+                });
+                if let Err(err) = saved {
+                    tracing::warn!(%err, "cannot turn autostart off in the settings");
+                }
+            });
+        });
+    if let Err(err) = spawned {
+        tracing::error!(%err, "cannot start the autostart check");
+    }
+}
+
 /// Starts the thread that writes the active profile after changes (ADR 0001 #40); it ends at shutdown.
 fn spawn_autosave<R: Runtime>(app: AppHandle<R>) {
     let spawned = std::thread::Builder::new()
@@ -312,13 +432,20 @@ pub fn run() {
         version = env!("CARGO_PKG_VERSION"),
         hidden = launch.hidden,
         quit = launch.quit,
+        uninstall_quit = launch.uninstall_quit,
         "CaseControl starting"
     );
 
     let app = tauri::Builder::default()
         // Must be the first plugin so a second instance exits before anything else initializes.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if LaunchArgs::parse(&args).quit {
+            let forwarded = LaunchArgs::parse(&args);
+            if forwarded.uninstall_quit {
+                tracing::info!(?args, "the uninstaller asked to quit");
+                shutdown_for_uninstall(app);
+                return;
+            }
+            if forwarded.quit {
                 tracing::info!(?args, "second instance asked to quit");
                 shutdown(app);
                 return;
@@ -328,10 +455,6 @@ pub fn run() {
                 tracing::error!(%err, "cannot show main window");
             }
         }))
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec![HIDDEN_FLAG]),
-        ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::app_info,
@@ -366,6 +489,8 @@ pub fn run() {
             commands::close_program,
             commands::get_settings,
             commands::set_settings,
+            commands::set_apply_before_sign_in,
+            commands::set_save_to_devices,
             commands::set_default_color,
             commands::update_status,
             commands::check_for_updates,
@@ -391,9 +516,10 @@ pub fn run() {
             });
             updater.install_pending(&updater::Restart::SameArgs, || {});
             app.manage(updater.clone());
+            // Record why Windows closes the app (sign-out, shutdown, installer) before anything can end the session.
+            install_session_end_watch(app.handle());
             let state = AppState::init();
             let start_minimized = state.settings().start_minimized;
-            autostart::sync_run_entry(app.handle(), state.settings().autostart);
             if let Ok(engine) = state.engine() {
                 events::spawn_forwarder(app.handle().clone(), engine.subscribe());
             }
@@ -407,6 +533,7 @@ pub fn run() {
             });
             app.manage(state);
             spawn_autosave(app.handle().clone());
+            spawn_task_checks(app.handle().clone());
             tray::create(app.handle(), &profiles)?;
             // The window is declared with `visible: false` so a hidden start never flashes it.
             if !launch.hidden && !start_minimized {
@@ -426,15 +553,16 @@ pub fn run() {
             panic!("error while running CaseControl: {err}");
         }
     };
-    if launch.quit {
+    if launch.quits() {
         // A running instance would have made this process exit inside `build`, so none is running. The setup hook
         // (engine, tray, window) never runs; release the single-instance lock and leave.
-        tracing::info!("--quit: no running instance; exiting");
+        tracing::info!("asked to quit: no running instance; exiting");
         app.handle().cleanup_before_exit();
         return;
     }
     app.run(|app, event| {
-        // `Exit` also arrives on Windows session end (WM_ENDSESSION), where the process ends right after.
+        // `Exit` also arrives on Windows session end (WM_ENDSESSION), where the process ends right after; the
+        // session-end watch recorded why, and `shutdown_engine` keeps or releases the devices accordingly.
         // No update install here: `Exit` also arrives on session end, where Windows may kill a running installer.
         // A pending update installs on an explicit quit (`shutdown`) or on the next start.
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit)
@@ -468,14 +596,16 @@ mod tests {
             parse(&["casecontrol.exe", "--quit"]),
             LaunchArgs {
                 hidden: false,
-                quit: true
+                quit: true,
+                uninstall_quit: false
             }
         );
         assert_eq!(
             parse(&["casecontrol.exe", "--hidden", "--quit"]),
             LaunchArgs {
                 hidden: true,
-                quit: true
+                quit: true,
+                uninstall_quit: false
             }
         );
         assert!(!parse(&["--quit"]).quit);
@@ -484,6 +614,20 @@ mod tests {
         assert!(!parse(&["casecontrol.exe", "--QUIT"]).quit);
         assert!(!parse(&["casecontrol.exe", "quit"]).quit);
         assert_eq!(parse(&[]), LaunchArgs::default());
+    }
+
+    #[test]
+    fn uninstall_quit_flag_is_its_own() {
+        let parsed = parse(&["casecontrol.exe", "--quit-for-uninstall"]);
+        assert!(parsed.uninstall_quit && !parsed.quit && parsed.quits());
+        assert!(!parse(&["casecontrol.exe", "--quit"]).uninstall_quit);
+        assert!(parse(&["casecontrol.exe", "--quit"]).quits());
+        assert!(!parse(&["casecontrol.exe", "--hidden"]).quits());
+        assert!(!parse(&["--quit-for-uninstall"]).uninstall_quit);
+        assert_eq!(
+            update_now_args(["casecontrol.exe", "--quit-for-uninstall", "--other"]),
+            vec!["--other".to_owned()]
+        );
     }
 
     #[test]

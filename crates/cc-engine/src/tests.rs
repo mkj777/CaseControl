@@ -10,14 +10,14 @@ use cc_config::{DeviceSetting, HardwareState};
 use cc_core::{
     Backend, Bus, ColorMode, Controller, DetectContext, Detected, DeviceDescription, DeviceError, DeviceId,
     DeviceInfo, DeviceKind, EngineEvent, HotplugAction, HotplugEvent, HotplugHandle, HotplugSender, Led,
-    Mode, ModeCaps, ModeState, Rgb, Zone, ZoneKind,
+    Mode, ModeCaps, ModeState, PersistCaps, PersistLook, PersistOutcome, Rgb, Zone, ZoneKind,
 };
 use parking_lot::Mutex;
 
 use crate::engine::{EngineConfig, EngineHandle, Shared, start_with};
 use crate::error::EngineError;
 use crate::hotplug::HotplugSource;
-use crate::view::{DeviceStatus, Takeover};
+use crate::view::{DeviceStatus, PersistResult, ShutdownMode, SkipReason, Takeover};
 use crate::worker::Timing;
 
 const RED: Rgb = Rgb::new(255, 0, 0);
@@ -52,6 +52,18 @@ struct Behavior {
     release_delay: Duration,
     /// `shows_own_lighting` reports `false` (the device was opened on a state CaseControl left).
     left_by_us: bool,
+    /// What `persist_caps` reports.
+    persist_caps: Option<PersistCaps>,
+    /// What `saved_state_backup` reports.
+    backup: Option<Vec<u8>>,
+    /// `persist_look` fails with a transport error.
+    fail_persist: bool,
+    /// `restore_saved_state` fails with a transport error.
+    fail_restore: bool,
+    /// `persist_look` refuses (a safety gate, nothing written).
+    refuse_persist: bool,
+    /// `restore_saved_state` refuses (a safety gate, nothing written).
+    refuse_restore: bool,
 }
 
 struct FakeCtrl {
@@ -149,6 +161,48 @@ impl Controller for FakeCtrl {
 
     fn shows_own_lighting(&self) -> bool {
         !self.behavior.lock().left_by_us
+    }
+
+    fn persist_caps(&self) -> Option<PersistCaps> {
+        self.behavior.lock().persist_caps
+    }
+
+    /// Logs `persist <look>`; the fingerprint is the look's debug text, so the same look is `Unchanged`.
+    fn persist_look(
+        &mut self,
+        look: &PersistLook,
+        last: Option<&[u8]>,
+    ) -> Result<PersistOutcome, DeviceError> {
+        let fingerprint = format!("{look:?}").into_bytes();
+        if last == Some(fingerprint.as_slice()) {
+            self.log("persist unchanged".into());
+            return Ok(PersistOutcome::Unchanged);
+        }
+        if self.behavior.lock().refuse_persist {
+            return Err(DeviceError::Refused("gate".into()));
+        }
+        self.log(format!("persist {look:?}"));
+        if self.behavior.lock().fail_persist {
+            return Err(DeviceError::Transport("persist failed".into()));
+        }
+        Ok(PersistOutcome::Written { fingerprint })
+    }
+
+    fn saved_state_backup(&self) -> Option<Vec<u8>> {
+        self.behavior.lock().backup.clone()
+    }
+
+    fn restore_saved_state(&mut self, backup: &[u8]) -> Result<PersistOutcome, DeviceError> {
+        if self.behavior.lock().refuse_restore {
+            return Err(DeviceError::Refused("gate".into()));
+        }
+        self.log(format!("restore {backup:?}"));
+        if self.behavior.lock().fail_restore {
+            return Err(DeviceError::Transport("restore failed".into()));
+        }
+        Ok(PersistOutcome::Written {
+            fingerprint: backup.to_vec(),
+        })
     }
 }
 
@@ -2457,6 +2511,15 @@ impl Drop for TempFile {
     }
 }
 
+/// The machine state in `file`, with its device-memory records next to it, bound to [`TEST_MACHINE`].
+fn state_at(file: &TempFile) -> HardwareState {
+    HardwareState::load_files(
+        file.0.clone(),
+        file.0.with_extension("memory.toml"),
+        Some(TEST_MACHINE),
+    )
+}
+
 /// Faults device `n` (its next frame fails fatally), then lets it work again.
 fn fault(e: &EngineHandle, s: &Spec, n: u16) {
     s.behavior.lock().fatal_direct = true;
@@ -2472,7 +2535,7 @@ fn fault(e: &EngineHandle, s: &Spec, n: u16) {
 fn own_lighting_is_recorded_once_and_handed_to_later_detections() {
     let file = TempFile::new("own-lighting");
     // Something remembered from an earlier run, for a device that is not connected.
-    let mut state = HardwareState::load_from(file.0.clone());
+    let mut state = state_at(&file);
     state.record_own_lighting(&id(9), &[9]).unwrap();
 
     let log = Log::default();
@@ -2499,7 +2562,7 @@ fn own_lighting_is_recorded_once_and_handed_to_later_detections() {
     );
     assert_eq!(e.hardware_state().get(&id(1)), Some(&[1u8, 2, 3][..]));
     assert_eq!(e.hardware_state().get(&id(2)), None, "nothing reported");
-    let saved = HardwareState::load_from(file.0.clone());
+    let saved = state_at(&file);
     assert_eq!(saved.get(&id(1)), Some(&[1u8, 2, 3][..]));
     assert_eq!(saved.get(&id(9)), Some(&[9u8][..]));
 
@@ -2513,7 +2576,7 @@ fn own_lighting_is_recorded_once_and_handed_to_later_detections() {
         contexts.lock().last().unwrap().own_lighting.get(&id(1)),
         Some(&vec![1, 2, 3])
     );
-    let saved = HardwareState::load_from(file.0.clone());
+    let saved = state_at(&file);
     assert_eq!(saved.get(&id(1)), Some(&[1u8, 2, 3][..]));
     assert!(!saved.is_unreleased(&id(1)));
 
@@ -2523,7 +2586,7 @@ fn own_lighting_is_recorded_once_and_handed_to_later_detections() {
     e.rescan();
     assert!(wait_until(SECOND, || e.device(&id(1)).unwrap().status
         == DeviceStatus::Released));
-    let saved = HardwareState::load_from(file.0.clone());
+    let saved = state_at(&file);
     assert_eq!(saved.get(&id(1)), Some(&[4u8][..]));
     e.shutdown(SECOND);
 }
@@ -2659,7 +2722,7 @@ fn take_over_all_retakes_devices_only_after_a_release() {
 /// Whether device `n` carries the "unreleased" marker, in the engine and in the file.
 fn unreleased(e: &EngineHandle, file: &TempFile, n: u16) -> bool {
     let engine = e.hardware_state().is_unreleased(&id(n));
-    let saved = HardwareState::load_from(file.0.clone()).is_unreleased(&id(n));
+    let saved = state_at(file).is_unreleased(&id(n));
     assert_eq!(engine, saved, "engine and file agree");
     engine
 }
@@ -2673,7 +2736,7 @@ fn unreleased_marker_follows_writes_and_releases() {
     let contexts = Arc::clone(&b.contexts);
     let e = start_with(
         EngineConfig {
-            hardware_state: HardwareState::load_from(file.0.clone()),
+            hardware_state: state_at(&file),
             ..cfg(60)
         },
         vec![Box::new(b)],
@@ -2720,7 +2783,7 @@ fn unreleased_marker_follows_writes_and_releases() {
     board.behavior.lock().left_by_us = false;
     drive(&e, &log, 1);
     e.shutdown(SECOND);
-    assert!(!HardwareState::load_from(file.0.clone()).is_unreleased(&id(1)));
+    assert!(!state_at(&file).is_unreleased(&id(1)));
 }
 
 #[test]
@@ -2856,4 +2919,725 @@ fn apply_replacing_resets_unlisted_devices_to_their_own_mode_or_the_default_colo
     assert_eq!(report.applied, [id(1)]);
     assert!(shows(&log, 1, &[BLUE; 7]));
     assert_eq!(e.current_settings().get(&id(1)), Some(&blue));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Shutdown that keeps the colours, early apply, save to devices (ADR 0001 #42)
+
+const CAPS: PersistCaps = PersistCaps {
+    zone_colors: true,
+    hardware_modes: true,
+};
+
+/// A device whose driver can save, with backup `[0xB0, n]`.
+fn saving(n: u16) -> Spec {
+    let s = spec(id(n), "S", DeviceKind::Light);
+    {
+        let mut b = s.behavior.lock();
+        b.persist_caps = Some(CAPS);
+        b.backup = Some(vec![0xB0, u8::try_from(n).unwrap()]);
+    }
+    s
+}
+
+#[test]
+fn keep_shutdown_flushes_the_latest_output_and_keeps_the_marker() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+    // 1 frame per second: the second frame waits for its slot.
+    let e = engine(1, vec![Box::new(b)]);
+    drive(&e, &log, 1);
+    e.set_direct(&id(1), vec![GREEN; 7]).unwrap();
+    std::thread::sleep(SECOND / 10);
+    assert_eq!(frames(&log, 1).last(), Some(&hex(&[RED; 7])), "green is paced");
+    assert!(e.hardware_state().is_unreleased(&id(1)));
+
+    e.shutdown_with(ShutdownMode::Keep, SECOND);
+    assert_eq!(frames(&log, 1).last(), Some(&hex(&[GREEN; 7])), "flushed");
+    assert!(entries(&log, "release").is_empty(), "no hand-back");
+    assert!(
+        e.hardware_state().is_unreleased(&id(1)),
+        "the device still shows CaseControl's output"
+    );
+    e.shutdown(SECOND);
+    assert!(entries(&log, "release").is_empty(), "idempotent");
+}
+
+#[test]
+fn keep_shutdown_honours_the_budget() {
+    let log = Log::default();
+    let s = spec(id(1), "A", DeviceKind::Light);
+    s.behavior.lock().mode_delay = Duration::from_millis(800);
+    let b = FakeBackend::new("f", vec![s], &log);
+    let timing = Timing {
+        ack_timeout: Duration::from_millis(50),
+        ..fast_timing()
+    };
+    let e = start_with(cfg(30), vec![Box::new(b)], None, timing).unwrap();
+    assert_eq!(e.set_mode(&id(1), static_red()), Err(EngineError::Timeout));
+    let t = Instant::now();
+    e.shutdown_with(ShutdownMode::Keep, Duration::from_millis(200));
+    assert!(t.elapsed() < Duration::from_millis(500), "{:?}", t.elapsed());
+}
+
+/// A backend that takes long to detect: it waits (up to two seconds) until device `n` of another backend was sent
+/// a frame, and records whether that happened while it was still detecting.
+struct SlowBackend {
+    log: Log,
+    n: u16,
+    saw_frame: Arc<Mutex<bool>>,
+}
+
+impl Backend for SlowBackend {
+    fn name(&self) -> &'static str {
+        "slow"
+    }
+
+    fn bus(&self) -> Bus {
+        Bus::Hid
+    }
+
+    fn detect(&self, _ctx: &DetectContext) -> Vec<Detected> {
+        let n = self.n;
+        let log = Arc::clone(&self.log);
+        *self.saw_frame.lock() = wait_until(2 * SECOND, || !frames(&log, n).is_empty());
+        Vec::new()
+    }
+
+    fn subscribe_hotplug(&self, _tx: HotplugSender) -> Option<Box<dyn HotplugHandle>> {
+        None
+    }
+}
+
+#[test]
+fn initial_settings_reach_each_device_as_its_backend_finishes() {
+    let log = Log::default();
+    let first = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+    let contexts = Arc::clone(&first.contexts);
+    let saw_frame = Arc::new(Mutex::new(false));
+    let slow = SlowBackend {
+        log: Arc::clone(&log),
+        n: 1,
+        saw_frame: Arc::clone(&saw_frame),
+    };
+    let config = EngineConfig {
+        initial_settings: BTreeMap::from([(id(1), DeviceSetting::Direct { colors: vec![RED; 7] })]),
+        brightness: BTreeMap::from([(id(1), 50)]),
+        ..cfg(30)
+    };
+    let e = start_with(config, vec![Box::new(first), Box::new(slow)], None, fast_timing()).unwrap();
+    assert!(
+        *saw_frame.lock(),
+        "device 1 was driven while the next backend was still detecting"
+    );
+    // The first frame already has the start brightness.
+    assert_eq!(frames(&log, 1).first(), Some(&hex(&[Rgb::new(128, 0, 0); 7])));
+    assert!(contexts.lock()[0].has_setting_pending(&id(1)));
+    assert_eq!(
+        e.device(&id(1)).unwrap().setting,
+        Some(DeviceSetting::Direct { colors: vec![RED; 7] })
+    );
+}
+
+/// The machine id the tests bind their machine state to.
+const TEST_MACHINE: &str = "test-machine";
+
+/// The temp files behind a [`durable_state`]; removed on drop.
+struct StateFiles(#[allow(dead_code)] TempFile, #[allow(dead_code)] TempFile);
+
+/// A machine state backed by two temp files, so device-memory records can be written durably (an in-memory state
+/// refuses them, and with them every save to a device).
+fn durable_state(tag: &str) -> (StateFiles, HardwareState) {
+    let state = TempFile::new(&format!("{tag}-state"));
+    let memory = TempFile::new(&format!("{tag}-memory"));
+    let hw = HardwareState::load_files(state.0.clone(), memory.0.clone(), Some(TEST_MACHINE));
+    (StateFiles(state, memory), hw)
+}
+
+/// An engine over `specs` with a durable machine state.
+fn saving_engine(tag: &str, specs: Vec<Spec>, log: &Log) -> (StateFiles, EngineHandle) {
+    let (files, hardware_state) = durable_state(tag);
+    let config = EngineConfig {
+        hardware_state,
+        ..cfg(60)
+    };
+    let b = FakeBackend::new("f", specs, log);
+    let e = start_with(config, vec![Box::new(b)], None, fast_timing()).unwrap();
+    (files, e)
+}
+
+#[test]
+fn persist_all_saves_visible_driven_capable_devices_with_brightness_baked_in() {
+    let log = Log::default();
+    let b = FakeBackend::new(
+        "f",
+        vec![
+            saving(1),
+            saving(2),
+            saving(3),
+            spec(id(4), "Plain", DeviceKind::Light),
+        ],
+        &log,
+    );
+    let (_files, hardware_state) = durable_state("persist-all");
+    let config = EngineConfig {
+        excluded: HashSet::from([id(2)]),
+        dark_zones: argb_dark(1),
+        brightness: BTreeMap::from([(id(1), 50)]),
+        hardware_state,
+        ..cfg(60)
+    };
+    let e = start_with(config, vec![Box::new(b)], None, fast_timing()).unwrap();
+    // Device 1: red on the board LED, a red/blue mix on the strip; ARGB 1 is dark.
+    e.set_direct(&id(1), vec![RED, GREEN, GREEN, GREEN, RED, BLUE, RED])
+        .unwrap();
+    e.set_direct(&id(2), vec![RED; 7]).unwrap();
+    e.set_direct(&id(4), vec![RED; 7]).unwrap();
+    assert!(wait_until(SECOND, || !frames(&log, 4).is_empty()
+        && !frames(&log, 2).is_empty()
+        && !frames(&log, 1).is_empty()));
+
+    let report = e.persist_all(SECOND);
+    assert_eq!(report.result(&id(1)), Some(&PersistResult::Written));
+    let skipped = |reason| Some(PersistResult::Skipped { reason });
+    assert_eq!(report.result(&id(2)).cloned(), skipped(SkipReason::Hidden));
+    assert_eq!(report.result(&id(3)).cloned(), skipped(SkipReason::NotDriven));
+    assert_eq!(report.result(&id(4)).cloned(), skipped(SkipReason::NotCapable));
+    // At 50 %: red 128; the strip [128,0,0] [0,0,128] [128,0,0] averages in linear light to (2/3 of 0.2158) ->
+    // 0.1439 -> 106 red, (1/3 of 0.2158) -> 0.0719 -> 76 blue.
+    let look = PersistLook::Zones(vec![Some(Rgb::new(128, 0, 0)), None, Some(Rgb::new(106, 0, 76))]);
+    assert_eq!(entries(&log, "persist"), [format!("{} persist {look:?}", id(1))]);
+    let hw = e.hardware_state();
+    let day = crate::engine::today();
+    assert_eq!(
+        hw.saved_backup(&id(1)),
+        Some(&[0xB0, 1][..]),
+        "backed up before the write"
+    );
+    assert_eq!(hw.saved_writes(&id(1), day), 1);
+    assert_eq!(hw.saved_fingerprint(&id(1)), Some(format!("{look:?}").as_bytes()));
+    assert_eq!(hw.saved_backup(&id(2)), None, "hidden: never touched");
+
+    // The same look again: unchanged, not counted.
+    let report = e.persist_all(SECOND);
+    assert_eq!(report.result(&id(1)), Some(&PersistResult::Unchanged));
+    assert_eq!(e.hardware_state().saved_writes(&id(1), day), 1);
+
+    // Brightness 0 saves the off state; the backup is not replaced.
+    e.set_device_brightness(&id(1), 0).unwrap();
+    let report = e.persist_all(SECOND);
+    assert_eq!(report.result(&id(1)), Some(&PersistResult::Written));
+    assert_eq!(entries(&log, "persist Off").len(), 1);
+    assert_eq!(e.hardware_state().saved_writes(&id(1), day), 2);
+    assert_eq!(e.hardware_state().saved_backup(&id(1)), Some(&[0xB0, 1][..]));
+}
+
+#[test]
+fn persist_saves_a_hardware_mode_exactly_and_reads_the_own_lighting_again() {
+    let log = Log::default();
+    let s = saving(1);
+    let (_files, e) = saving_engine("persist-mode", vec![s.clone()], &log);
+    e.set_mode(&id(1), static_red()).unwrap();
+    assert_eq!(e.device(&id(1)).unwrap().hardware, None);
+    // The driver now reports the saved state as what the device shows on its own.
+    s.behavior.lock().hardware = Some(static_red());
+    let report = e.persist_all(SECOND);
+    assert_eq!(report.result(&id(1)), Some(&PersistResult::Written));
+    assert_eq!(
+        entries(&log, "persist"),
+        [format!("{} persist {:?}", id(1), PersistLook::Mode(static_red()))]
+    );
+    assert_eq!(
+        e.device(&id(1)).unwrap().hardware,
+        Some(static_red()),
+        "slot.hardware refreshed"
+    );
+}
+
+#[test]
+fn persist_refuses_without_backup_at_the_daily_cap_and_when_the_backup_cannot_be_stored() {
+    let day = crate::engine::today();
+    // No backup from the driver: the original is unknown, nothing is written.
+    let log = Log::default();
+    let s = saving(1);
+    s.behavior.lock().backup = None;
+    let (_files, e) = saving_engine("no-backup", vec![s], &log);
+    drive(&e, &log, 1);
+    assert_eq!(
+        e.persist_all(SECOND).result(&id(1)),
+        Some(&PersistResult::Skipped {
+            reason: SkipReason::OriginalUnknown
+        })
+    );
+    assert!(entries(&log, "persist").is_empty());
+
+    // The day's cap is reached.
+    let log = Log::default();
+    let (_files, mut state) = durable_state("cap");
+    state.record_saved_backup(&id(1), &[1]).unwrap();
+    for _ in 0..20 {
+        state.record_saved_write(&id(1), None, day).unwrap();
+    }
+    let config = EngineConfig {
+        hardware_state: state,
+        ..cfg(60)
+    };
+    let b = FakeBackend::new("f", vec![saving(1)], &log);
+    let e = start_with(config, vec![Box::new(b)], None, fast_timing()).unwrap();
+    drive(&e, &log, 1);
+    assert_eq!(
+        e.persist_all(SECOND).result(&id(1)),
+        Some(&PersistResult::Skipped {
+            reason: SkipReason::DailyCap
+        })
+    );
+    assert!(entries(&log, "persist").is_empty());
+
+    // The backup cannot be stored (the file's folder is a file): the device is not written.
+    let log = Log::default();
+    let blocker = TempFile::new("blocker");
+    std::fs::write(&blocker.0, "x").unwrap();
+    let config = EngineConfig {
+        hardware_state: HardwareState::load_files(
+            blocker.0.join("hardware-state.toml"),
+            blocker.0.join("device-memory.toml"),
+            Some(TEST_MACHINE),
+        ),
+        ..cfg(60)
+    };
+    let b = FakeBackend::new("f", vec![saving(1)], &log);
+    let e = start_with(config, vec![Box::new(b)], None, fast_timing()).unwrap();
+    drive(&e, &log, 1);
+    assert!(matches!(
+        e.persist_all(SECOND).result(&id(1)),
+        Some(PersistResult::Failed { .. })
+    ));
+    assert!(entries(&log, "persist").is_empty());
+    assert_eq!(e.hardware_state().saved_backup(&id(1)), None);
+
+    // An in-memory state cannot keep a backup durably: nothing is written, nothing recorded.
+    let log = Log::default();
+    let e = engine(60, vec![Box::new(FakeBackend::new("f", vec![saving(1)], &log))]);
+    drive(&e, &log, 1);
+    assert_eq!(
+        e.persist_all(SECOND).result(&id(1)),
+        Some(&PersistResult::Skipped {
+            reason: SkipReason::StateUnavailable
+        })
+    );
+    assert!(entries(&log, "persist").is_empty());
+
+    // A failing write is reported and counted (it may have reached the memory); the fingerprint is dropped.
+    let log = Log::default();
+    let s = saving(1);
+    let (_files, e) = saving_engine("fail", vec![s.clone()], &log);
+    drive(&e, &log, 1);
+    assert_eq!(
+        e.persist_all(SECOND).result(&id(1)),
+        Some(&PersistResult::Written)
+    );
+    assert!(e.hardware_state().saved_fingerprint(&id(1)).is_some());
+    s.behavior.lock().fail_persist = true;
+    e.set_direct(&id(1), vec![GREEN; 7]).unwrap();
+    assert!(wait_until(SECOND, || frames(&log, 1).last() == Some(&hex(&[GREEN; 7]))));
+    assert!(matches!(
+        e.persist_all(SECOND).result(&id(1)),
+        Some(PersistResult::Failed { .. })
+    ));
+    assert_eq!(e.hardware_state().saved_writes(&id(1), day), 2);
+    assert_eq!(e.hardware_state().saved_fingerprint(&id(1)), None);
+}
+
+#[test]
+fn a_write_that_cannot_be_recorded_drops_the_fingerprint_in_memory() {
+    let log = Log::default();
+    let (files, e) = saving_engine("unrecorded", vec![saving(1)], &log);
+    let memory = files.1.0.clone();
+    drive(&e, &log, 1);
+    assert_eq!(
+        e.persist_all(SECOND).result(&id(1)),
+        Some(&PersistResult::Written)
+    );
+    assert!(e.hardware_state().saved_fingerprint(&id(1)).is_some());
+
+    // The records cannot be written any more (a folder where the file was): the device still takes the green look,
+    // but neither the write nor dropping the red look's fingerprint reaches the file.
+    std::fs::remove_file(&memory).unwrap();
+    std::fs::create_dir(&memory).unwrap();
+    e.set_direct(&id(1), vec![GREEN; 7]).unwrap();
+    assert!(wait_until(SECOND, || frames(&log, 1).last() == Some(&hex(&[GREEN; 7]))));
+    assert_eq!(
+        e.persist_all(SECOND).result(&id(1)),
+        Some(&PersistResult::Written)
+    );
+    assert_eq!(e.hardware_state().saved_fingerprint(&id(1)), None);
+
+    // Red again: written, not taken as unchanged.
+    std::fs::remove_dir(&memory).unwrap();
+    e.set_direct(&id(1), vec![RED; 7]).unwrap();
+    assert!(wait_until(SECOND, || frames(&log, 1).last() == Some(&hex(&[RED; 7]))));
+    assert_eq!(
+        e.persist_all(SECOND).result(&id(1)),
+        Some(&PersistResult::Written)
+    );
+    assert!(entries(&log, "persist unchanged").is_empty());
+    assert_eq!(entries(&log, "persist Zones").len(), 3);
+}
+
+#[test]
+fn an_unreadable_backup_blocks_saving_and_is_kept() {
+    let log = Log::default();
+    let state = TempFile::new("unreadable-state");
+    let memory = TempFile::new("unreadable-memory");
+    let entry = format!("\"{}\" = \"not hex\"", id(1));
+    std::fs::write(
+        &memory.0,
+        format!("machine = \"{TEST_MACHINE}\"\n[saved_backup]\n{entry}\n"),
+    )
+    .unwrap();
+    let config = EngineConfig {
+        hardware_state: HardwareState::load_files(state.0.clone(), memory.0.clone(), Some(TEST_MACHINE)),
+        ..cfg(60)
+    };
+    let e = start_with(
+        config,
+        vec![Box::new(FakeBackend::new("f", vec![saving(1)], &log))],
+        None,
+        fast_timing(),
+    )
+    .unwrap();
+    drive(&e, &log, 1);
+    let Some(PersistResult::Failed { error }) = e.persist_all(SECOND).result(&id(1)).cloned() else {
+        panic!("expected a failure");
+    };
+    assert!(error.contains("unreadable"), "{error}");
+    assert!(entries(&log, "persist").is_empty(), "never written");
+    assert_eq!(e.hardware_state().saved_backup(&id(1)), None);
+    let text = std::fs::read_to_string(&memory.0).unwrap();
+    assert!(text.contains(&entry), "{text}");
+}
+
+#[test]
+fn refusals_before_any_write_are_not_counted_and_keep_the_fingerprint() {
+    let day = crate::engine::today();
+    let log = Log::default();
+    let s = saving(1);
+    let (_files, e) = saving_engine("refused", vec![s.clone()], &log);
+    drive(&e, &log, 1);
+    assert_eq!(
+        e.persist_all(SECOND).result(&id(1)),
+        Some(&PersistResult::Written)
+    );
+    let fingerprint = e.hardware_state().saved_fingerprint(&id(1)).map(<[u8]>::to_vec);
+    s.behavior.lock().refuse_persist = true;
+    e.set_direct(&id(1), vec![GREEN; 7]).unwrap();
+    assert!(wait_until(SECOND, || frames(&log, 1).last() == Some(&hex(&[GREEN; 7]))));
+    assert!(matches!(
+        e.persist_all(SECOND).result(&id(1)),
+        Some(PersistResult::Failed { .. })
+    ));
+    let hw = e.hardware_state();
+    assert_eq!(hw.saved_writes(&id(1), day), 1, "the refusal is not counted");
+    assert_eq!(hw.saved_fingerprint(&id(1)).map(<[u8]>::to_vec), fingerprint);
+    assert_eq!(
+        e.device(&id(1)).unwrap().status,
+        DeviceStatus::Active,
+        "no device failure"
+    );
+}
+
+#[test]
+fn manual_save_goes_through_the_persist_machinery() {
+    let day = crate::engine::today();
+    let log = Log::default();
+    let (_files, e) = saving_engine("manual", vec![saving(1)], &log);
+    // Not driven, then driven with direct colours: nothing to save by hand.
+    assert!(matches!(
+        e.save_to_hardware(&id(1)),
+        Err(EngineError::InvalidArgument(_))
+    ));
+    drive(&e, &log, 1);
+    assert!(matches!(
+        e.save_to_hardware(&id(1)),
+        Err(EngineError::InvalidArgument(_))
+    ));
+    assert!(entries(&log, "persist").is_empty());
+
+    // A hardware mode: backup first, then the write, counted, with its fingerprint.
+    e.set_mode(&id(1), static_red()).unwrap();
+    assert_eq!(e.save_to_hardware(&id(1)), Ok(()));
+    assert_eq!(
+        entries(&log, "persist"),
+        [format!("{} persist {:?}", id(1), PersistLook::Mode(static_red()))]
+    );
+    let hw = e.hardware_state();
+    assert_eq!(hw.saved_backup(&id(1)), Some(&[0xB0, 1][..]));
+    assert_eq!(hw.saved_writes(&id(1), day), 1);
+    assert_eq!(
+        hw.saved_fingerprint(&id(1)),
+        Some(format!("{:?}", PersistLook::Mode(static_red())).as_bytes())
+    );
+    // The same again: unchanged, not written.
+    assert_eq!(e.save_to_hardware(&id(1)), Ok(()));
+    assert_eq!(entries(&log, "persist Mode").len(), 1);
+    assert_eq!(entries(&log, "persist unchanged").len(), 1);
+    assert_eq!(e.hardware_state().saved_writes(&id(1), day), 1);
+
+    // Without a durable state: not saved.
+    let log = Log::default();
+    let e = engine(60, vec![Box::new(FakeBackend::new("f", vec![saving(1)], &log))]);
+    e.set_mode(&id(1), static_red()).unwrap();
+    assert!(matches!(
+        e.save_to_hardware(&id(1)),
+        Err(EngineError::NotSaved(_))
+    ));
+    assert!(entries(&log, "persist").is_empty());
+}
+
+#[test]
+fn device_memory_writes_can_be_switched_off() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![saving(1)], &log);
+    let plugged = Arc::clone(&b.plugged);
+    let hp = FakeHotplug::default();
+    let (_files, mut state) = durable_state("writes-off");
+    state.record_saved_backup(&id(1), &[1]).unwrap();
+    state.record_saved_backup(&id(2), &[2]).unwrap();
+    state.set_pending_restore(&id(2), true).unwrap();
+    let config = EngineConfig {
+        hardware_state: state,
+        device_memory_writes: false,
+        ..cfg(60)
+    };
+    let e = start_with(
+        config,
+        vec![Box::new(b)],
+        Some(Box::new(hp.clone())),
+        fast_timing(),
+    )
+    .unwrap();
+    e.set_mode(&id(1), static_red()).unwrap();
+    let off = Some(PersistResult::Skipped {
+        reason: SkipReason::WritesDisabled,
+    });
+    assert_eq!(e.persist_all(SECOND).result(&id(1)).cloned(), off);
+    assert!(
+        e.hardware_state().is_pending_restore(&id(2)),
+        "pending restores are kept"
+    );
+    assert!(matches!(
+        e.save_to_hardware(&id(1)),
+        Err(EngineError::NotSaved(_))
+    ));
+    let report = e.restore_saved(SECOND);
+    assert_eq!(report.result(&id(1)).cloned(), off);
+    assert_eq!(report.result(&id(2)).cloned(), off);
+    assert!(e.hardware_state().is_pending_restore(&id(1)), "marked for later");
+    // A device with a pending restore connects: it stays pending.
+    plugged.lock().push(saving(2));
+    hp.inject(HotplugAction::Arrived, r"\\?\hid#whatever");
+    assert!(wait_until(SECOND, || e.device(&id(2)).is_some()));
+    std::thread::sleep(SECOND / 10);
+    assert!(entries(&log, "persist").is_empty());
+    assert!(entries(&log, "restore").is_empty());
+    assert!(e.hardware_state().is_pending_restore(&id(2)));
+    assert_eq!(e.hardware_state().saved_backup(&id(2)), Some(&[2u8][..]));
+}
+
+#[test]
+fn restore_writes_back_drops_the_backup_and_restores_absent_devices_when_they_connect() {
+    let log = Log::default();
+    let failing = saving(3);
+    failing.behavior.lock().fail_restore = true;
+    let b = FakeBackend::new("f", vec![saving(1), failing], &log);
+    let plugged = Arc::clone(&b.plugged);
+    let hp = FakeHotplug::default();
+    let (_files, mut state) = durable_state("restore");
+    for (n, bytes) in [(1, [1u8, 1]), (2, [2, 2]), (3, [3, 3])] {
+        state.record_saved_backup(&id(n), &bytes).unwrap();
+        state.record_saved_write(&id(n), Some(&[0xF0]), 1).unwrap();
+    }
+    let config = EngineConfig {
+        hardware_state: state,
+        ..cfg(60)
+    };
+    let e = start_with(
+        config,
+        vec![Box::new(b)],
+        Some(Box::new(hp.clone())),
+        fast_timing(),
+    )
+    .unwrap();
+    drive(&e, &log, 1);
+    log.lock().clear();
+
+    let report = e.restore_saved(SECOND);
+    assert_eq!(report.result(&id(1)), Some(&PersistResult::Written));
+    assert_eq!(
+        report.result(&id(2)),
+        Some(&PersistResult::Skipped {
+            reason: SkipReason::Absent
+        })
+    );
+    assert!(matches!(
+        report.result(&id(3)),
+        Some(PersistResult::Failed { .. })
+    ));
+    assert_eq!(entries(&log, "restore")[0], format!("{} restore [1, 1]", id(1)));
+    // The driven device is sent its current output again after the restore.
+    assert!(wait_until(SECOND, || frames(&log, 1).last() == Some(&hex(&[RED; 7]))));
+    let hw = e.hardware_state();
+    assert_eq!(hw.saved_backup(&id(1)), None, "dropped after the write");
+    assert!(
+        !hw.is_pending_restore(&id(1)),
+        "a successful restore clears the mark"
+    );
+    assert_eq!(
+        hw.saved_backup(&id(3)),
+        Some(&[3u8, 3][..]),
+        "kept after a failure"
+    );
+    assert!(hw.is_pending_restore(&id(3)), "a failed restore stays pending");
+    assert_eq!(
+        hw.saved_fingerprint(&id(3)),
+        None,
+        "every restore drops the fingerprint"
+    );
+    assert_eq!(hw.restore_attempts(&id(3), crate::engine::today()), 1);
+    assert_eq!(
+        hw.saved_backup(&id(2)),
+        Some(&[2u8, 2][..]),
+        "kept until the device connects"
+    );
+    assert!(hw.is_pending_restore(&id(2)));
+
+    // Device 2 connects: its backup is written back and dropped.
+    plugged.lock().push(saving(2));
+    hp.inject(HotplugAction::Arrived, r"\\?\hid#whatever");
+    assert!(wait_until(SECOND, || entries(&log, "restore [2, 2]").len() == 1));
+    assert!(wait_until(SECOND, || e
+        .hardware_state()
+        .saved_backup(&id(2))
+        .is_none()));
+    assert!(!e.hardware_state().is_pending_restore(&id(2)));
+}
+
+#[test]
+fn restores_are_capped_and_stay_pending() {
+    let log = Log::default();
+    let failing = saving(1);
+    failing.behavior.lock().fail_restore = true;
+    let (_files, mut state) = durable_state("restore-cap");
+    state.record_saved_backup(&id(1), &[1]).unwrap();
+    let config = EngineConfig {
+        hardware_state: state,
+        ..cfg(60)
+    };
+    let b = FakeBackend::new("f", vec![failing.clone()], &log);
+    let e = start_with(config, vec![Box::new(b)], None, fast_timing()).unwrap();
+    for _ in 0..3 {
+        assert!(matches!(
+            e.restore_saved(SECOND).result(&id(1)),
+            Some(PersistResult::Failed { .. })
+        ));
+    }
+    assert_eq!(
+        e.restore_saved(SECOND).result(&id(1)),
+        Some(&PersistResult::Skipped {
+            reason: SkipReason::DailyCap
+        })
+    );
+    assert_eq!(entries(&log, "restore").len(), 3, "nothing written after the cap");
+    assert!(e.hardware_state().is_pending_restore(&id(1)));
+
+    // Refusals before anything was written do not count toward the cap.
+    let log = Log::default();
+    let refusing = saving(1);
+    refusing.behavior.lock().refuse_restore = true;
+    let (_files, mut state) = durable_state("restore-refused");
+    state.record_saved_backup(&id(1), &[1]).unwrap();
+    let config = EngineConfig {
+        hardware_state: state,
+        ..cfg(60)
+    };
+    let b = FakeBackend::new("f", vec![refusing], &log);
+    let e = start_with(config, vec![Box::new(b)], None, fast_timing()).unwrap();
+    for _ in 0..4 {
+        assert!(matches!(
+            e.restore_saved(SECOND).result(&id(1)),
+            Some(PersistResult::Failed { .. })
+        ));
+    }
+    assert_eq!(
+        e.hardware_state()
+            .restore_attempts(&id(1), crate::engine::today()),
+        0
+    );
+    assert_eq!(e.hardware_state().saved_writes(&id(1), crate::engine::today()), 0);
+}
+
+#[test]
+fn a_late_request_is_unconfirmed_and_skipped_by_the_worker() {
+    let log = Log::default();
+    let s = saving(1);
+    let (_files, hardware_state) = durable_state("late");
+    let config = EngineConfig {
+        hardware_state,
+        ..cfg(60)
+    };
+    let timing = Timing {
+        ack_timeout: Duration::from_millis(50),
+        ..fast_timing()
+    };
+    let b = FakeBackend::new("f", vec![s.clone()], &log);
+    let e = start_with(config, vec![Box::new(b)], None, timing).unwrap();
+    // The worker is busy with a slow mode change when the save arrives. The budget is generous so a slow CI runner
+    // still sends the request before it runs out; the worker stays busy well past it.
+    s.behavior.lock().mode_delay = Duration::from_millis(3000);
+    assert_eq!(e.set_mode(&id(1), static_red()), Err(EngineError::Timeout));
+    let report = e.persist_all(SECOND);
+    assert_eq!(report.result(&id(1)), Some(&PersistResult::Unconfirmed));
+    // The worker takes it up after its deadline and skips it.
+    std::thread::sleep(Duration::from_millis(3000));
+    assert!(entries(&log, "mode 1").len() == 1);
+    assert!(entries(&log, "persist").is_empty());
+    assert_eq!(e.hardware_state().saved_backup(&id(1)), None);
+}
+
+#[test]
+fn a_pending_setting_that_cannot_be_applied_hands_the_device_back() {
+    let log = Log::default();
+    let b = FakeBackend::new("f", vec![spec(id(1), "A", DeviceKind::Light)], &log);
+    let bad = ModeState {
+        mode: 9,
+        ..static_red()
+    };
+    let config = EngineConfig {
+        initial_settings: BTreeMap::from([(id(1), DeviceSetting::Mode { state: bad })]),
+        ..cfg(60)
+    };
+    let e = start_with(config, vec![Box::new(b)], None, fast_timing()).unwrap();
+    assert!(wait_until(SECOND, || entries(&log, "release").len() == 1));
+    assert_eq!(e.device(&id(1)).unwrap().status, DeviceStatus::Released);
+}
+
+#[test]
+fn persist_all_drops_pending_restores() {
+    let log = Log::default();
+    let (_files, mut state) = durable_state("drop-pending");
+    state.record_saved_backup(&id(9), &[9]).unwrap();
+    state.set_pending_restore(&id(9), true).unwrap();
+    let config = EngineConfig {
+        hardware_state: state,
+        ..cfg(60)
+    };
+    let b = FakeBackend::new("f", vec![saving(1)], &log);
+    let e = start_with(config, vec![Box::new(b)], None, fast_timing()).unwrap();
+    e.persist_all(SECOND);
+    assert!(!e.hardware_state().is_pending_restore(&id(9)));
+    assert_eq!(
+        e.hardware_state().saved_backup(&id(9)),
+        Some(&[9u8][..]),
+        "the backup stays"
+    );
 }

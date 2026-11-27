@@ -362,17 +362,10 @@ fn random_mode_packet_and_save() {
     e[82] = o[82] | 0x01 | 0x30;
     e[83] = 0;
     e[184] = 0;
-    let mut saved = e;
-    saved[184] = 1;
-
     let (mut c, fake) = open_7d75(|s| {
         s.feature_reply(0x52, current()[1..].to_vec())
             .feature(with_save(current(), 0))
             .feature(e.to_vec())
-            // save_to_hardware: Update(true) sets save_data on both reports.
-            .feature_reply(0x52, current()[1..].to_vec())
-            .feature(with_save(current(), 1))
-            .feature(saved.to_vec())
             // release: current state back, then the original with save 0.
             .feature_reply(0x52, current()[1..].to_vec())
             .feature(with_save(current(), 0))
@@ -387,8 +380,50 @@ fn random_mode_packet_and_save() {
         colors: vec![],
     };
     c.set_mode(&state).expect("rainbow wave");
-    c.save_to_hardware().expect("save");
+    // original() is no valid saved configuration (its records hold arbitrary effects): no trusted base, so a manual
+    // save is refused before anything is sent (never the readback with the save byte set, as the reference would).
+    assert!(matches!(c.save_to_hardware(), Err(DeviceError::Refused(_))));
     c.release().expect("release");
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn manual_save_writes_the_set_mode_packet_through_the_gates() {
+    // Rainbow wave (26) at speed HIGH, brightness 5 on the clean board: set_mode's packet, then the same packet to
+    // flash (built on the trusted base, which here equals what set_mode sent).
+    let state = ModeState {
+        mode: 26,
+        speed: Some(2),
+        brightness: Some(5),
+        direction: None,
+        colors: vec![],
+    };
+    let layout = protocol::Layout {
+        mixed_mode: true,
+        no_onboards: true,
+        onboard_leds: 0,
+    };
+    let mut p = protocol::ConfigPacket(clean());
+    for z in [MsiZone::JRgb1, MsiZone::JRgb2, MsiZone::JRainbow1] {
+        p.apply_mode(&layout, z, 26, 2, 5, true);
+        p.apply_zone_color(&layout, z, Rgb::BLACK, Rgb::BLACK);
+    }
+    let p = p.with_save(false);
+    let (mut c, fake) = open_clean(|s| {
+        let s = s
+            .feature_reply(0x52, current()[1..].to_vec())
+            .feature(with_save(current(), 0))
+            .feature(p.to_vec())
+            // The save: the board must show what set_mode sent, then the flash write.
+            .feature_reply(0x52, p[1..].to_vec());
+        flash_steps(s, &p)
+    });
+    // No hardware mode set yet: nothing to save, nothing sent.
+    assert_eq!(c.save_to_hardware(), Err(DeviceError::Unsupported));
+    c.set_mode(&state).expect("rainbow wave");
+    c.save_to_hardware().expect("saved");
+    assert_eq!(c.own_lighting(), Some(p.to_vec()));
+    assert_eq!(c.trusted_base().map(|b| b.0), Some(p));
     fake.finish().expect("script consumed");
 }
 
@@ -754,13 +789,13 @@ fn hardware_mode_decodes_the_configuration_read_at_open() {
     }
 }
 
-/// `original()` with JRGB1 (offset 1) in Rainbow wave (26) at speed HIGH, brightness 7 (flags 0x1E) and save byte 0:
-/// a good own lighting as an earlier open stored it.
+/// `clean()` with JRGB1 (offset 1) in Rainbow wave (26) at speed HIGH, brightness 7 (flags 0x1E), both JRAINBOW
+/// counts 0 and save byte 0: a good own lighting as an earlier open stored it (it passes `validate_backup`).
 fn stored_rainbow() -> [u8; CONFIG_LEN] {
-    let mut b = original();
+    let mut b = clean();
+    b[41] = 0;
     b[1] = 26;
     b[5] = 0x1E;
-    b[184] = 0;
     b
 }
 
@@ -1004,7 +1039,14 @@ fn invalid_stored_own_lighting_is_never_sent() {
     saving[184] = 1;
     let mut wrong_id = good;
     wrong_id[0] = 0x53;
+    // Not a savable record: accepted as own lighting only when it passes validate_backup (ADR 0001 #42).
+    let mut disabled = good;
+    disabled[164] = 0;
+    let mut undocumented = good;
+    undocumented[9] |= 0x40;
     let invalid: Vec<Vec<u8>> = vec![
+        disabled.to_vec(),
+        undocumented.to_vec(),
         per_led_onboard.to_vec(),
         per_led_header.to_vec(),
         saving.to_vec(),
@@ -1084,4 +1126,833 @@ fn static_at_brightness_zero_stays_out_of_per_led_mode() {
     c.set_mode(&off).expect("static 0");
     c.set_direct(&[C1, C2]).expect("frame after off");
     fake.finish().expect("script consumed");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Save to the device (ADR 0001 #42)
+
+use cc_core::{PersistLook, PersistOutcome};
+
+/// Zone record offsets of `FeaturePacket_185` (JRGB1, JPIPE1/2, JRAINBOW1/2, JCORSAIR, OUTERLL120, ON_BOARD 0..9,
+/// JRGB2), from the `// n` comments of the reference struct.
+const RECORDS: [usize; 18] = [
+    1, 11, 21, 31, 42, 53, 64, 74, 84, 94, 104, 114, 124, 134, 144, 154, 164, 174,
+];
+
+/// A configuration that passes every save gate: each record Static (1), brightness 10 / speed 0 (0x28), custom
+/// colour (0x80); JRAINBOW1 with 3 LEDs, JRAINBOW2 with 0; save byte 0.
+fn clean() -> [u8; CONFIG_LEN] {
+    let mut b = [0u8; CONFIG_LEN];
+    b[0] = 0x52;
+    for o in RECORDS {
+        b[o] = 0x01;
+        b[o + 4] = 0x28;
+        b[o + 8] = 0x80;
+    }
+    b[41] = 3;
+    b
+}
+
+fn open_clean(rest: impl FnOnce(ScriptBuilder) -> ScriptBuilder) -> (MysticLight185, FakeTransport) {
+    let fake = rest(open_steps_with(FakeTransport::builder(), clean())).build();
+    let c = MysticLight185::open(Box::new(fake.clone()), &candidate(0x7D75, None)).expect("opens");
+    (c, fake)
+}
+
+/// The flash write of `p` (save byte 0): volatile first and read back, then the two reports with save 1, then the
+/// verifying readback.
+fn flash_steps(s: ScriptBuilder, p: &[u8; CONFIG_LEN]) -> ScriptBuilder {
+    s.feature(with_save(*p, 0))
+        .feature_reply(0x52, p[1..].to_vec())
+        .feature(with_save(*p, 1))
+        .feature(with_save(*p, 1))
+        .feature_reply(0x52, p[1..].to_vec())
+}
+
+const AVG: Rgb = Rgb::new(0x30, 0x31, 0x32);
+
+/// `clean()` with JRGB1 = C1, JRGB2 = C2 (mixed mode: record 134) and JRAINBOW1 = AVG as Static at level 10, as
+/// SetMode / SetZoneColor write them: effect 1, colour and colour 2, flags (10 << 2) | 0 = 0x28, colour flags |= 0x80,
+/// padding 0. MS-7D75 has no on-board LEDs, so JRGB1/2 mirror into the on-board record (74): effect 1, colours of
+/// the last mirrored zone (JRGB2), colour flags |= SYNC_ONBOARD (0x81); Static (<= LIGHTNING) clears bit 7 of byte 78
+/// and 0x30 of byte 82. The JRAINBOW1 LED count (41) stays 3.
+fn saved_zones() -> [u8; CONFIG_LEN] {
+    let mut e = clean();
+    let put = |e: &mut [u8; CONFIG_LEN], o: usize, c: Rgb| {
+        e[o] = 0x01;
+        e[o + 1..o + 4].copy_from_slice(&[c.r, c.g, c.b]);
+        e[o + 4] = 0x28;
+        e[o + 5..o + 8].copy_from_slice(&[c.r, c.g, c.b]);
+        e[o + 8] = 0x80;
+        e[o + 9] = 0;
+    };
+    put(&mut e, 1, C1);
+    put(&mut e, 134, C2);
+    put(&mut e, 31, AVG);
+    put(&mut e, 74, C2);
+    e[82] = 0x81;
+    e
+}
+
+fn zones_look() -> PersistLook {
+    PersistLook::Zones(vec![Some(C1), Some(C2), Some(AVG), None])
+}
+
+#[test]
+fn persist_in_direct_mode_writes_the_working_config_never_the_enable_message() {
+    let p = saved_zones();
+    let frame = per_led(0x06, 0x00, &[(0, C1), (1, C2), (2, A), (3, B), (4, C)]);
+    let (mut c, fake) = open_clean(|s| {
+        let s = s.feature(expected_enable_sync()).feature(frame.clone());
+        // Leaves direct mode with the packet (save 0), saves it, then takes direct mode again with the last frame.
+        flash_steps(s, &p)
+            .feature(expected_enable_sync())
+            .feature(frame.clone())
+    });
+    assert_eq!(
+        c.saved_state_backup(),
+        Some(clean().to_vec()),
+        "the readback at open"
+    );
+    c.set_direct(&[C1, C2, A, B, C]).expect("frame");
+    let out = c.persist_look(&zones_look(), None).expect("saved");
+    assert_eq!(
+        out,
+        PersistOutcome::Written {
+            fingerprint: p.to_vec()
+        }
+    );
+    // The saved packet is the new own lighting and what release() hands back; the backup stays the original.
+    assert_eq!(c.own_lighting(), Some(p.to_vec()));
+    assert_eq!(c.saved_state_backup(), Some(clean().to_vec()));
+    assert_eq!(fake.remaining(), 0, "script consumed");
+
+    // The same look again: unchanged, nothing sent.
+    assert_eq!(
+        c.persist_look(&zones_look(), Some(&p)),
+        Ok(PersistOutcome::Unchanged)
+    );
+    fake.finish().expect("still nothing sent");
+}
+
+#[test]
+fn persist_off_outside_direct_mode_checks_the_board_first_and_release_hands_back_the_saved_packet() {
+    // Off: every header Static at brightness 0 (flags 0x00) with black colours, also JRAINBOW2 sized 0. The
+    // on-board mirror (74) takes the effect and the colours but keeps its own flags byte (78, bit 7 cleared).
+    let mut p = clean();
+    for o in [1, 134, 31, 42, 74] {
+        p[o] = 0x01;
+        p[o + 1..o + 8].copy_from_slice(&[0, 0, 0, 0x00, 0, 0, 0]);
+        p[o + 9] = 0;
+    }
+    p[78] = 0x28;
+    p[82] = 0x81;
+    let (mut c, fake) = open_clean(|s| {
+        // Not in direct mode: a fresh readback must equal the working configuration.
+        let s = s.feature_reply(0x52, clean()[1..].to_vec());
+        let s = flash_steps(s, &p);
+        // The board shows the saved packet now: the output shown before goes out again (volatile).
+        let s = hand_back_steps(s, p, &clean());
+        // release(): the current state back, then the saved packet (not the original).
+        hand_back_steps(s, current(), &with_save(p, 0))
+    });
+    assert_eq!(
+        c.persist_look(&PersistLook::Off, None),
+        Ok(PersistOutcome::Written {
+            fingerprint: p.to_vec()
+        })
+    );
+    c.release().expect("release");
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn persist_refuses_when_another_program_changed_the_board() {
+    let (mut c, fake) = open_clean(|s| s.feature_reply(0x52, current()[1..].to_vec()));
+    let r = c.persist_look(&zones_look(), None);
+    assert!(matches!(r, Err(DeviceError::Refused(_))), "{r:?}");
+    fake.finish().expect("nothing sent");
+}
+
+#[test]
+fn persist_aborts_before_flash_when_the_volatile_readback_differs() {
+    let p = saved_zones();
+    let (mut c, fake) = open_clean(|s| {
+        let s = s
+            .feature_reply(0x52, clean()[1..].to_vec())
+            .feature(with_save(p, 0))
+            .feature_reply(0x52, current()[1..].to_vec());
+        // The board was sent the packet (volatile): the output shown before goes out again.
+        hand_back_steps(s, current(), &clean())
+    });
+    let r = c.persist_look(&zones_look(), None);
+    // Nothing reached flash: a refusal, which does not count toward the daily cap.
+    assert!(matches!(r, Err(DeviceError::Refused(_))), "{r:?}");
+    // No report with the save byte set went out (the script holds none).
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn failed_flash_write_in_direct_mode_takes_direct_mode_again() {
+    let p = saved_zones();
+    let frame = per_led(0x06, 0x00, &[(0, C1), (1, C2), (2, A), (3, B), (4, C)]);
+    let (mut c, fake) = open_clean(|s| {
+        s.feature(expected_enable_sync())
+            .feature(frame.clone())
+            .feature(with_save(p, 0))
+            .feature_reply(0x52, current()[1..].to_vec())
+            // The volatile readback differs: no flash write, but direct mode and the last frame come back.
+            .feature(expected_enable_sync())
+            .feature(frame.clone())
+    });
+    c.set_direct(&[C1, C2, A, B, C]).expect("frame");
+    assert!(matches!(
+        c.persist_look(&zones_look(), None),
+        Err(DeviceError::Refused(_))
+    ));
+    assert_eq!(
+        c.trusted_base().map(|b| b.0),
+        Some(clean()),
+        "nothing new is trusted"
+    );
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn persist_without_a_trusted_base_is_refused_without_io() {
+    // Another program's per-LED readback (not marked): never a base for flash.
+    let fake = open_steps_with(FakeTransport::builder(), per_led_readback())
+        .feature(expected_enable_sync())
+        .feature(per_led(0x06, 0x00, &[(0, C1), (1, C2)]))
+        .build();
+    let mut c = detect_stored(&fake, None, false);
+    let mut colors = vec![Rgb::BLACK; 82];
+    colors[..2].copy_from_slice(&[C1, C2]);
+    c.set_direct(&colors).expect("frame");
+    let r = c.persist_look(&PersistLook::Off, None);
+    assert!(
+        matches!(&r, Err(DeviceError::Refused(m)) if m.contains("trusted")),
+        "{r:?}"
+    );
+    fake.finish().expect("only the frame was sent");
+
+    // A state CaseControl left (marked, nothing stored): no base either, also for a manual save.
+    let fake = open_steps_with(FakeTransport::builder(), clean()).build();
+    let mut c = detect_stored(&fake, None, true);
+    assert!(matches!(
+        c.persist_look(&zones_look(), None),
+        Err(DeviceError::Refused(_))
+    ));
+    fake.finish().expect("nothing sent");
+}
+
+#[test]
+fn zones_left_out_keep_the_base_not_this_sessions_set_mode_records() {
+    // set_mode Static red/green on every zone changes the working configuration; a save of JRGB1 alone changes only
+    // JRGB1 (and its on-board mirror) on the trusted base: JRGB2 (134) and JRAINBOW1 (31) keep clean()'s bytes.
+    let layout = protocol::Layout {
+        mixed_mode: true,
+        no_onboards: true,
+        onboard_leds: 0,
+    };
+    let red = Rgb::new(0xFF, 0, 0);
+    let green = Rgb::new(0, 0xFF, 0);
+    let mut shown = protocol::ConfigPacket(clean());
+    for (z, color) in [
+        (MsiZone::JRgb1, red),
+        (MsiZone::JRgb2, green),
+        (MsiZone::JRainbow1, red),
+    ] {
+        shown.apply_mode(&layout, z, 1, 0, 10, false);
+        shown.apply_zone_color(&layout, z, color, color);
+    }
+    let shown = shown.with_save(false);
+    let mut p = protocol::ConfigPacket(clean());
+    p.apply_mode(&layout, MsiZone::JRgb1, 1, 0, 10, false);
+    p.apply_zone_color(&layout, MsiZone::JRgb1, C1, C1);
+    let p = p.with_save(false);
+    assert_eq!(p[134..144], clean()[134..144]);
+    assert_eq!(p[31..42], clean()[31..42]);
+    let (mut c, fake) = open_clean(|s| {
+        let s = s
+            .feature_reply(0x52, current()[1..].to_vec())
+            .feature(with_save(current(), 0))
+            .feature(shown.to_vec())
+            .feature_reply(0x52, shown[1..].to_vec());
+        hand_back_steps(flash_steps(s, &p), p, &shown)
+    });
+    let state = ModeState {
+        mode: 1,
+        speed: None,
+        brightness: None,
+        direction: None,
+        colors: vec![red, green, red, red, red],
+    };
+    c.set_mode(&state).expect("static");
+    let look = PersistLook::Zones(vec![Some(C1), None, None, None]);
+    assert_eq!(
+        c.persist_look(&look, None),
+        Ok(PersistOutcome::Written {
+            fingerprint: p.to_vec()
+        })
+    );
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn led_counts_on_flash_come_from_the_trusted_base_not_the_configured_size() {
+    // JRAINBOW1 stores 3 LEDs; the user configured 10. Volatile updates carry 10, flash keeps 3.
+    let mut data = clean();
+    data[41] = 10;
+    let mut p = clean();
+    for o in [1, 134, 31, 42, 74] {
+        p[o] = 0x01;
+        p[o + 1..o + 8].copy_from_slice(&[0, 0, 0, 0x00, 0, 0, 0]);
+        p[o + 9] = 0;
+    }
+    p[78] = 0x28;
+    p[82] = 0x81;
+    assert_eq!(p[41], 3);
+    let (mut c, fake) = open_clean(|s| {
+        let s = flash_steps(s.feature_reply(0x52, data[1..].to_vec()), &p);
+        // The board shows the saved packet with the flash's 3 LEDs: the working configuration with 10 goes out again.
+        hand_back_steps(s, p, &data)
+    });
+    c.resize_zone(2, 10).expect("resize");
+    assert_eq!(c.working_config().0[41], 10);
+    assert_eq!(
+        c.persist_look(&PersistLook::Off, None),
+        Ok(PersistOutcome::Written {
+            fingerprint: p.to_vec()
+        })
+    );
+    assert_eq!(
+        c.working_config().0[41],
+        10,
+        "volatile updates keep the configured size"
+    );
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn led_counts_on_flash_stay_the_boards_on_a_board_without_direct_mode() {
+    // MS-7C83 (B460M PRO-VDH WIFI): no direct mode, so its JRAINBOW1 holds 1 LED in the description although the
+    // board stores 3; the working configuration carries 1, flash keeps 3.
+    let layout = protocol::Layout {
+        mixed_mode: false,
+        no_onboards: true,
+        onboard_leds: 6,
+    };
+    let red = Rgb::new(0xFF, 0, 0);
+    let mut data = clean();
+    data[41] = 1;
+    let mut p = protocol::ConfigPacket(clean());
+    for z in [MsiZone::JRgb1, MsiZone::JRainbow1] {
+        p.apply_mode(&layout, z, 1, 0, 10, false);
+        p.apply_zone_color(&layout, z, red, red);
+    }
+    let p = p.with_save(false);
+    assert_eq!(p[41], 3);
+    let fake = flash_steps(
+        open_steps_with(FakeTransport::builder(), clean()).feature_reply(0x52, data[1..].to_vec()),
+        &p,
+    );
+    let fake = hand_back_steps(fake, p, &data).build();
+    let mut c = MysticLight185::open(Box::new(fake.clone()), &candidate(0x7C83, None)).expect("opens");
+    assert_eq!(
+        c.description().zones.iter().map(|z| z.len).collect::<Vec<_>>(),
+        vec![1, 1]
+    );
+    assert_eq!(c.working_config().0[41], 1);
+    assert_eq!(
+        c.persist_look(&PersistLook::Zones(vec![Some(red), Some(red)]), None),
+        Ok(PersistOutcome::Written {
+            fingerprint: p.to_vec()
+        })
+    );
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn persist_reports_a_readback_mismatch_after_the_save() {
+    let p = saved_zones();
+    let (mut c, fake) = open_clean(|s| {
+        s.feature_reply(0x52, clean()[1..].to_vec())
+            .feature(with_save(p, 0))
+            .feature_reply(0x52, p[1..].to_vec())
+            .feature(with_save(p, 1))
+            .feature(with_save(p, 1))
+            .feature_reply(0x52, clean()[1..].to_vec())
+            // The output shown before goes out again (volatile).
+            .feature_reply(0x52, clean()[1..].to_vec())
+            .feature(clean().to_vec())
+            .feature(clean().to_vec())
+    });
+    let r = c.persist_look(&zones_look(), None);
+    assert!(matches!(r, Err(DeviceError::Protocol(_))), "{r:?}");
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn persist_refuses_effect_zero_and_per_led_in_any_record() {
+    for (record, effect) in [(164, 0x00), (164, 0x25), (11, 0x00)] {
+        let mut base = clean();
+        base[record] = effect;
+        let fake = open_steps_with(FakeTransport::builder(), base).build();
+        let mut c = MysticLight185::open(Box::new(fake.clone()), &candidate(0x7D75, None)).expect("opens");
+        // Such a readback is no valid backup, so there is no trusted base to build on.
+        let r = c.persist_look(&zones_look(), None);
+        assert!(
+            matches!(&r, Err(DeviceError::Refused(_))),
+            "record {record} effect {effect:#x}: {r:?}"
+        );
+        assert_eq!(c.saved_state_backup(), None, "no valid backup either");
+        fake.finish().expect("nothing sent");
+    }
+}
+
+#[test]
+fn persist_rejects_the_direct_mode_and_wrong_shapes_without_io() {
+    let (mut c, fake) = open_clean(|s| s);
+    let direct = ModeState {
+        mode: 100,
+        speed: None,
+        brightness: None,
+        direction: None,
+        colors: vec![Rgb::BLACK; 5],
+    };
+    assert!(matches!(
+        c.persist_look(&PersistLook::Mode(direct), None),
+        Err(DeviceError::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        c.persist_look(&PersistLook::Zones(vec![Some(C1)]), None),
+        Err(DeviceError::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        c.persist_look(&PersistLook::Zones(vec![None; 4]), None),
+        Err(DeviceError::InvalidArgument(_))
+    ));
+    fake.finish().expect("nothing sent");
+}
+
+#[test]
+fn persist_mode_writes_the_set_mode_bytes() {
+    // Rainbow wave (26) at speed HIGH, brightness 5: the packet set_mode would send (built with the same calls).
+    let state = ModeState {
+        mode: 26,
+        speed: Some(2),
+        brightness: Some(5),
+        direction: None,
+        colors: vec![],
+    };
+    let layout = protocol::Layout {
+        mixed_mode: true,
+        no_onboards: true,
+        onboard_leds: 0,
+    };
+    let mut p = protocol::ConfigPacket(clean());
+    for z in [MsiZone::JRgb1, MsiZone::JRgb2, MsiZone::JRainbow1] {
+        p.apply_mode(&layout, z, 26, 2, 5, true);
+        p.apply_zone_color(&layout, z, Rgb::BLACK, Rgb::BLACK);
+    }
+    let p = p.with_save(false);
+    // Spot checks against the layout: JRAINBOW1 effect 26, flags (5 << 2) | 2 = 0x16, custom colour cleared;
+    // mode > LIGHTNING sets bit 7 of byte 78 and 0x30 of byte 82.
+    assert_eq!((p[31], p[35], p[39] & 0x80), (26, 0x16, 0));
+    assert_eq!(p[78] & 0x80, 0x80);
+    assert_eq!(p[82] & 0x30, 0x30);
+    let (mut c, fake) = open_clean(|s| {
+        let s = flash_steps(s.feature_reply(0x52, clean()[1..].to_vec()), &p);
+        hand_back_steps(s, p, &clean())
+    });
+    assert_eq!(
+        c.persist_look(&PersistLook::Mode(state), None),
+        Ok(PersistOutcome::Written {
+            fingerprint: p.to_vec()
+        })
+    );
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn save_gates_are_pure_and_strict() {
+    let layout = protocol::Layout {
+        mixed_mode: true,
+        no_onboards: true,
+        onboard_leds: 0,
+    };
+    let base = protocol::ConfigPacket(clean());
+    let next = protocol::ConfigPacket(saved_zones());
+    let zones = [MsiZone::JRgb1, MsiZone::JRgb2, MsiZone::JRainbow1];
+    assert_eq!(protocol::check_save_diff(&base, &next, &layout, &zones), Ok(()));
+    // JRAINBOW1 not among the saved zones: its record must not change.
+    assert!(protocol::check_save_diff(&base, &next, &layout, &zones[..2]).is_err());
+    // A changed LED count byte is never allowed.
+    let mut counted = next.clone();
+    counted.0[41] = 4;
+    assert!(protocol::check_save_diff(&base, &counted, &layout, &zones).is_err());
+    // Byte 78: only bit 7 may change; byte 82: only 0x30 (no mirror for JRAINBOW alone).
+    let mask = protocol::save_change_mask(&layout, &[MsiZone::JRainbow1]);
+    assert_eq!((mask[78], mask[82]), (0x80, 0x30));
+    assert!(mask[31..=40].iter().all(|b| *b == 0xFF));
+    assert_eq!(mask[41], 0);
+    assert_eq!(mask[74], 0);
+    // JRGB on a board without on-board LEDs mirrors into the whole on-board record.
+    let mask = protocol::save_change_mask(&layout, &[MsiZone::JRgb1]);
+    assert!(mask[74..=83].iter().all(|b| *b == 0xFF));
+    assert_eq!(mask[184], 0, "the save byte is not compared");
+
+    assert_eq!(protocol::check_savable_effects(&base), Ok(()));
+    assert_eq!(protocol::check_saved_records(&base), Ok(()));
+    assert_eq!(protocol::check_saved_records(&next), Ok(()));
+    let record = |f: &dyn Fn(&mut [u8; CONFIG_LEN])| {
+        let mut b = clean();
+        f(&mut b);
+        protocol::check_saved_records(&protocol::ConfigPacket(b))
+    };
+    // Every record of the whole packet, also those of zones nobody saves (164: on-board LED 9).
+    assert!(record(&|b| b[164] = 0).is_err(), "effect 0");
+    assert!(record(&|b| b[164] = 0x25).is_err(), "per-LED effect");
+    assert!(record(&|b| b[164] = 40).is_err(), "effect above 39");
+    assert!(record(&|b| b[168] = 11 << 2).is_err(), "brightness 11");
+    assert!(record(&|b| b[168] = 0x2B).is_err(), "speed 3");
+    assert!(
+        record(&|b| b[172] = 0xC0).is_err(),
+        "undocumented colour flag 0x40"
+    );
+    assert_eq!(record(&|b| b[172] = 0xBF), Ok(()), "every documented colour flag");
+    assert_eq!(
+        record(&|b| b[168] = 0xAA),
+        Ok(()),
+        "sync bit, brightness 10, speed 2"
+    );
+    let mut counts = base.clone();
+    counts.0[41] = 201;
+    assert!(protocol::check_led_counts(&counts).is_err());
+    counts.0[41] = 200;
+    assert_eq!(protocol::check_led_counts(&counts), Ok(()));
+}
+
+#[test]
+fn backup_validation_follows_the_restore_rules() {
+    let ok = clean();
+    assert!(protocol::validate_backup(&ok).is_some());
+    // MSI software saves effects outside our mode table (25 on JRGB): accepted.
+    let mut msi = ok;
+    msi[1] = 25;
+    msi[31] = 26;
+    assert!(protocol::validate_backup(&msi).is_some());
+    let bad = |f: &dyn Fn(&mut [u8; CONFIG_LEN])| {
+        let mut b = ok;
+        f(&mut b);
+        protocol::validate_backup(&b).is_none()
+    };
+    assert!(bad(&|b| b[174] = 0), "effect 0");
+    assert!(bad(&|b| b[53] = 0x25), "per-LED effect");
+    assert!(bad(&|b| b[1] = 40), "effect above 39");
+    assert!(bad(&|b| b[5] = 11 << 2), "brightness 11");
+    assert!(bad(&|b| b[52] = 241), "JRAINBOW2 count above 240");
+    assert!(bad(&|b| b[5] = 0x2B), "speed 3");
+    assert!(bad(&|b| b[9] = 0xC0), "undocumented colour flag");
+    assert!(bad(&|b| b[184] = 1), "save byte set");
+    assert!(bad(&|b| b[0] = 0x53), "report id");
+    assert!(protocol::validate_backup(&ok[..184]).is_none(), "length");
+}
+
+#[test]
+fn restore_validates_then_writes_the_backup_onto_a_fresh_readback() {
+    let mut backup = clean();
+    backup[31] = 26;
+    backup[35] = 0x16;
+    // The board's readback: clean() (no per-LED effect); the backup's records replace its records.
+    let (mut c, fake) = open_clean(|s| flash_steps(s.feature_reply(0x52, clean()[1..].to_vec()), &backup));
+    let mut bad = backup;
+    bad[164] = 0x25;
+    assert!(matches!(
+        c.restore_saved_state(&bad),
+        Err(DeviceError::InvalidArgument(_))
+    ));
+    assert_eq!(
+        c.restore_saved_state(&backup),
+        Ok(PersistOutcome::Written {
+            fingerprint: backup.to_vec()
+        })
+    );
+    assert_eq!(
+        c.saved_state_backup(),
+        Some(clean().to_vec()),
+        "the backup stays the original"
+    );
+    assert_eq!(c.own_lighting(), Some(backup.to_vec()));
+    assert_eq!(c.trusted_base().map(|b| b.0), Some(backup));
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn restore_takes_led_counts_from_the_readback() {
+    // The backup says 5 LEDs on JRAINBOW1, the board stores 3: the count byte stays the board's.
+    let mut backup = clean();
+    backup[31] = 26;
+    backup[41] = 5;
+    let mut target = backup;
+    target[41] = 3;
+    let (mut c, fake) = open_clean(|s| flash_steps(s.feature_reply(0x52, clean()[1..].to_vec()), &target));
+    assert_eq!(
+        c.restore_saved_state(&backup),
+        Ok(PersistOutcome::Written {
+            fingerprint: target.to_vec()
+        })
+    );
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn restore_never_writes_the_configured_header_size() {
+    // JRAINBOW1 stores 3 LEDs, the user configured 10 and set_mode sent 10 (volatile). The restore first sends the
+    // backup with the trusted base's count (3), so the readback and the flash keep 3.
+    let mut shown = clean();
+    shown[41] = 10;
+    shown[82] = 0x81;
+    let mut backup = clean();
+    backup[1] = 26;
+    let (mut c, fake) = open_clean(|s| {
+        let s = s
+            .feature_reply(0x52, current()[1..].to_vec())
+            .feature(with_save(current(), 0))
+            .feature(shown.to_vec())
+            .feature(backup.to_vec())
+            .feature_reply(0x52, backup[1..].to_vec());
+        flash_steps(s, &backup)
+    });
+    c.resize_zone(2, 10).expect("resize");
+    let black = ModeState {
+        mode: 1,
+        speed: None,
+        brightness: Some(10),
+        direction: None,
+        colors: vec![Rgb::BLACK; 12],
+    };
+    c.set_mode(&black).expect("static black");
+    assert_eq!(
+        c.restore_saved_state(&backup),
+        Ok(PersistOutcome::Written {
+            fingerprint: backup.to_vec()
+        })
+    );
+    assert_eq!(
+        c.working_config().0[41],
+        10,
+        "volatile updates keep the configured size"
+    );
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn restore_skips_the_write_when_the_untouched_board_already_holds_the_backup() {
+    let (mut c, fake) = open_clean(|s| s.feature_reply(0x52, clean()[1..].to_vec()));
+    assert_eq!(c.restore_saved_state(&clean()), Ok(PersistOutcome::Unchanged));
+    fake.finish().expect("only the readback");
+
+    // Once something was sent, a readback says nothing about the flash: written although the board reads back the
+    // backup. (Static black sets the on-board sync bit 0x01 of byte 82 through the JRGB mirror.)
+    let mut shown = clean();
+    shown[82] = 0x81;
+    let (mut c, fake) = open_clean(|s| {
+        let s = s
+            .feature_reply(0x52, current()[1..].to_vec())
+            .feature(with_save(current(), 0))
+            .feature(shown.to_vec())
+            // The backup (volatile) first, so the readback carries the stored counts.
+            .feature(clean().to_vec())
+            .feature_reply(0x52, clean()[1..].to_vec());
+        flash_steps(s, &clean())
+    });
+    let white = ModeState {
+        mode: 1,
+        speed: None,
+        brightness: Some(10),
+        direction: None,
+        colors: vec![Rgb::BLACK; 5],
+    };
+    c.set_mode(&white).expect("static black");
+    assert!(matches!(
+        c.restore_saved_state(&clean()),
+        Ok(PersistOutcome::Written { .. })
+    ));
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn restore_in_direct_mode_leaves_it_with_the_backup_and_takes_it_again() {
+    let mut backup = clean();
+    backup[31] = 26;
+    let frame = per_led(0x06, 0x00, &[(0, C1), (1, C2), (2, A), (3, B), (4, C)]);
+    let (mut c, fake) = open_clean(|s| {
+        let s = s
+            .feature(expected_enable_sync())
+            .feature(frame.clone())
+            // Leave per-LED mode with the backup (volatile), read back, write.
+            .feature(with_save(backup, 0))
+            .feature_reply(0x52, backup[1..].to_vec());
+        flash_steps(s, &backup)
+            .feature(expected_enable_sync())
+            .feature(frame.clone())
+    });
+    c.set_direct(&[C1, C2, A, B, C]).expect("frame");
+    assert!(matches!(
+        c.restore_saved_state(&backup),
+        Ok(PersistOutcome::Written { .. })
+    ));
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn restore_refuses_a_board_still_in_per_led_mode() {
+    let (mut c, fake) = open_clean(|s| s.feature_reply(0x52, per_led_readback()[1..].to_vec()));
+    assert!(matches!(
+        c.restore_saved_state(&clean()),
+        Err(DeviceError::Refused(_))
+    ));
+    fake.finish().expect("nothing written");
+}
+
+#[test]
+fn marked_board_with_a_pending_setting_is_not_restored_at_open() {
+    let stored = stored_rainbow();
+    let id = DeviceId::hid(0x1462, 0x7D75, None);
+    let ctx = DetectContext {
+        own_lighting: [(id.clone(), stored.to_vec())].into(),
+        unreleased: [id.clone()].into(),
+        setting_pending: [id].into(),
+        ..Default::default()
+    };
+    // Open only (no restore at open); the first release sends the stored state although nothing else was sent.
+    let fake = open_steps_with(FakeTransport::builder(), per_led_readback());
+    let fake = hand_back_steps(fake, per_led_readback(), &stored).build();
+    let dev = std::cell::RefCell::new(Some(Box::new(fake.clone()) as Box<dyn HidTransport>));
+    let devices = [hid(0x1462, 0x7D75, 1, 0, None, PATH)];
+    let mut found = detect_with(&ctx, &devices, move |_| {
+        Ok(dev.borrow_mut().take().expect("opened once"))
+    });
+    let Detected::Device(mut c) = found.remove(0) else {
+        panic!("expected a device");
+    };
+    assert_eq!(fake.remaining(), 3, "nothing sent at open");
+    assert!(
+        !c.shows_own_lighting(),
+        "the board still shows CaseControl's state"
+    );
+    assert_eq!(c.hardware_mode(), Some(rainbow_state()));
+    c.release().expect("release restores the stored state");
+    assert!(c.shows_own_lighting());
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn backup_is_the_own_lighting_seen_before_the_first_write() {
+    // Not marked, readback not per-LED: the readback. Marked with a valid stored state: that state.
+    let (c, fake) = open_clean(|s| s);
+    assert_eq!(c.saved_state_backup(), Some(clean().to_vec()));
+    fake.finish().expect("script consumed");
+
+    let mut stored = clean();
+    stored[1] = 26;
+    let fake = hand_back_steps(
+        open_steps_with(FakeTransport::builder(), per_led_readback()),
+        per_led_readback(),
+        &stored,
+    )
+    .build();
+    let c = detect_stored(&fake, Some(&stored), true);
+    assert_eq!(c.saved_state_backup(), Some(stored.to_vec()));
+    fake.finish().expect("script consumed");
+
+    // Marked without a stored state, or another program's per-LED readback: unknown.
+    let fake = open_steps_with(FakeTransport::builder(), clean()).build();
+    assert_eq!(detect_stored(&fake, None, true).saved_state_backup(), None);
+    let fake = open_steps_with(FakeTransport::builder(), per_led_readback()).build();
+    assert_eq!(detect_stored(&fake, None, false).saved_state_backup(), None);
+}
+
+#[test]
+fn restore_on_a_marked_board_never_takes_the_readback_for_the_flash() {
+    // The flash (and the stored own lighting) hold 3 LEDs on JRAINBOW1; an earlier instance configured 10 and left
+    // that (volatile). The board is opened with the marker and a pending setting, and the pending restore comes first:
+    // the board is first sent the backup with the trusted base's counts, so the flash keeps 3.
+    let mut left = clean();
+    left[41] = 10;
+    let fake = open_steps_with(FakeTransport::builder(), left)
+        .feature(clean().to_vec())
+        .feature_reply(0x52, clean()[1..].to_vec());
+    let fake = flash_steps(fake, &clean()).build();
+    let mut c = MysticLight185::open_with_stored(
+        Box::new(fake.clone()),
+        &candidate(0x7D75, None),
+        Some(&clean()),
+        true,
+        true,
+    )
+    .expect("opens");
+    assert_eq!(fake.remaining(), 7, "nothing sent at open");
+    c.resize_zone(2, 10).expect("resize");
+    assert_eq!(
+        c.restore_saved_state(&clean()),
+        Ok(PersistOutcome::Written {
+            fingerprint: clean().to_vec()
+        }),
+        "never Unchanged on a readback an earlier instance left"
+    );
+    fake.finish().expect("script consumed");
+
+    // Marked without a stored state: the backup's own counts, never the readback's.
+    let fake = open_steps_with(FakeTransport::builder(), left)
+        .feature(clean().to_vec())
+        .feature_reply(0x52, clean()[1..].to_vec());
+    let fake = flash_steps(fake, &clean()).build();
+    let mut c = detect_stored(&fake, None, true);
+    assert!(matches!(
+        c.restore_saved_state(&clean()),
+        Ok(PersistOutcome::Written { .. })
+    ));
+    fake.finish().expect("script consumed");
+}
+
+#[test]
+fn save_in_a_hardware_mode_shows_the_configured_header_sizes_again() {
+    // JRAINBOW1 stores 3 LEDs, the user configured 10; Static red with the configured size is shown. The save writes
+    // the flash's 3, then the board is sent the shown configuration with 10 again (volatile).
+    let layout = protocol::Layout {
+        mixed_mode: true,
+        no_onboards: true,
+        onboard_leds: 0,
+    };
+    let red = Rgb::new(0xFF, 0, 0);
+    let mut p = protocol::ConfigPacket(clean());
+    for z in [MsiZone::JRgb1, MsiZone::JRgb2, MsiZone::JRainbow1] {
+        p.apply_mode(&layout, z, 1, 0, 10, false);
+        p.apply_zone_color(&layout, z, red, red);
+    }
+    let p = p.with_save(false);
+    let mut shown = p;
+    shown[41] = 10;
+    let (mut c, fake) = open_clean(|s| {
+        let s = hand_back_steps(s, clean(), &shown).feature_reply(0x52, shown[1..].to_vec());
+        hand_back_steps(flash_steps(s, &p), p, &shown)
+    });
+    c.resize_zone(2, 10).expect("resize");
+    let state = ModeState {
+        mode: 1,
+        speed: None,
+        brightness: Some(10),
+        direction: None,
+        colors: vec![red; 12],
+    };
+    c.set_mode(&state).expect("static red");
+    c.save_to_hardware().expect("saved");
+    assert_eq!(c.working_config().0, shown, "the working configuration keeps 10");
+    assert_eq!(c.trusted_base().map(|b| b.0), Some(p), "the flash keeps 3");
+    fake.finish().expect("script consumed");
+    // The board still shows the mode: a manual save is not refused as "no hardware mode".
+    assert!(!matches!(c.save_to_hardware(), Err(DeviceError::Unsupported)));
 }

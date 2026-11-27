@@ -1,6 +1,7 @@
 //! The only module of this crate that contains `unsafe` code: thin, safe wrappers around the Win32 calls for
 //! process enumeration (Toolhelp), the service control manager (enumeration, stop, start type), process
-//! termination and `ShellExecuteExW` (the one UAC prompt of the elevated helper).
+//! termination, `ShellExecuteExW` (the one UAC prompt of the elevated helper), the Startup known folders and the
+//! final-path check and delete of the helper's result file.
 //!
 //! Every function here is safe to call. Handles are owned by RAII guards and closed on drop. Buffers that the
 //! system fills with structs are allocated as `Vec<u64>` so they are 8-byte aligned.
@@ -13,6 +14,11 @@ use windows::Win32::Foundation::{
     ERROR_NO_MORE_FILES, ERROR_SERVICE_CANNOT_ACCEPT_CTRL, ERROR_SERVICE_NOT_ACTIVE, HANDLE, HWND,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows::Win32::Storage::FileSystem::{
+    FILE_DISPOSITION_INFO, FILE_NAME_NORMALIZED, FileDispositionInfo, GETFINALPATHNAMEBYHANDLE_FLAGS,
+    GetFinalPathNameByHandleW, SetFileInformationByHandle, VOLUME_NAME_DOS,
+};
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -31,7 +37,8 @@ use windows::Win32::System::Threading::{
     PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
-    SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    FOLDERID_CommonStartup, FOLDERID_Startup, KF_FLAG_DEFAULT, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC,
+    SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHGetKnownFolderPath, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
@@ -465,4 +472,76 @@ pub fn run_as_admin_and_wait(
     unsafe { GetExitCodeProcess(process.0, &mut code) }
         .map_err(|e| ElevationError::Failed(format!("GetExitCodeProcess failed: {}", e.message())))?;
     Ok(code)
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Known folders and the helper's result file
+// ---------------------------------------------------------------------------------------------------------------
+
+/// Which Startup folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupFolder {
+    /// `FOLDERID_Startup`: the current user's.
+    User,
+    /// `FOLDERID_CommonStartup`: all users'.
+    Common,
+}
+
+/// The path of a Startup folder from `SHGetKnownFolderPath` (never from environment variables, which the user
+/// controls also in an elevated process); `None` when it cannot be resolved.
+pub fn startup_folder(which: StartupFolder) -> Option<std::path::PathBuf> {
+    let id = match which {
+        StartupFolder::User => FOLDERID_Startup,
+        StartupFolder::Common => FOLDERID_CommonStartup,
+    };
+    // SAFETY: `id` is a valid known-folder GUID alive for the call; no token is passed (the current user); the
+    // returned string is CoTaskMemAlloc'd and freed below after it was copied.
+    let path = unsafe { SHGetKnownFolderPath(&id, KF_FLAG_DEFAULT, None) }.ok()?;
+    // SAFETY: on success `path` is a NUL-terminated UTF-16 string alive until it is freed below.
+    let text = unsafe { read_pwstr(path) };
+    // SAFETY: `path` was allocated by SHGetKnownFolderPath with CoTaskMemAlloc and is freed exactly once.
+    unsafe { CoTaskMemFree(Some(path.0.cast_const().cast())) };
+    text.map(std::path::PathBuf::from)
+}
+
+/// The final path of the open file `file` (`GetFinalPathNameByHandleW`, normalized, DOS volume name; it starts
+/// with `\?\`).
+pub fn final_path(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = HANDLE(file.as_raw_handle());
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // FILE_NAME_NORMALIZED | VOLUME_NAME_DOS, both 0.
+        let flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0);
+        // SAFETY: `handle` is the live handle of `file`, borrowed for the call; `buf` is writable for its length.
+        let len = unsafe { GetFinalPathNameByHandleW(handle, &mut buf, flags) } as usize;
+        if len == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if len < buf.len() {
+            return Ok(std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len])));
+        }
+        if buf.len() >= 1 << 16 {
+            return Err(std::io::Error::other("the final path is too long"));
+        }
+        buf.resize(len + 1, 0);
+    }
+}
+
+/// Marks the open file `file` for deletion when its last handle closes (`FileDispositionInfo`). The handle must
+/// have `DELETE` access.
+pub fn delete_on_close(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the handle is the live handle of `file`, borrowed for the call; `info` is a FILE_DISPOSITION_INFO of
+    // the size passed and lives for the call.
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileDispositionInfo,
+            (&raw const info).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    }
+    .map_err(|e| std::io::Error::other(format!("cannot delete the file: {}", e.message())))
 }

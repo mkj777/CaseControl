@@ -33,6 +33,8 @@ const COMMANDS: &[&str] = &[
     "close_program",
     "get_settings",
     "set_settings",
+    "set_apply_before_sign_in",
+    "set_save_to_devices",
     "set_default_color",
     "update_status",
     "check_for_updates",

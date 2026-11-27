@@ -5,16 +5,34 @@
 //! HID++ 2.0 controller that owns the G560 upstream): one LED per 0x8070 zone, Direct rides the Static effect per
 //! zone, hardware modes come from zone 0's effect list. Claiming is `SetSWControl(1, 1)`, releasing
 //! `SetSWControl(0, 0)` (`ClaimSWControlIfNeeded` / `Shutdown`); nothing else changes device state. Every effect write
-//! is volatile (persistence byte 0) except in [`Controller::save_to_hardware`].
+//! is volatile (persistence byte 0) except in [`Controller::save_to_hardware`], [`Controller::persist_look`] and
+//! [`Controller::restore_saved_state`].
+//!
+//! Own lighting (ADR 0001 #38, through the shared [`OwnLighting`] seam): opened without the engine's "unreleased"
+//! marker, the per-zone open-time readback (0x8070 GetEffect, taken before anything was claimed) is the device's own
+//! lighting; when every zone maps onto SetZoneEffect parameters ([`restore_params`]) it is reported
+//! ([`encode_backup`] bytes) for the engine to remember. Opened with the marker, the readback is CaseControl's state:
+//! a remembered own lighting that fits the zones ([`decode_backup`]) is what `release()` replays (even if nothing was
+//! sent) and what `hardware_mode()` reports, and [`Controller::shows_own_lighting`] stays `false` until that release,
+//! so the marker stays; without one, `release()` replays the readback and the marker stays for good.
+//!
+//! Save to the device (ADR 0001 #42): a look is persisted with the persistence byte set: direct colours as Static per
+//! zone (brightness baked into the colour), hardware modes as `set_mode` sends them, off as Static black. The
+//! persisted state cannot be read back, so the backup of the original is the own lighting found at open: the complete
+//! open-time readback of an unmarked device, or the remembered own lighting of a marked one. Otherwise the original
+//! state is unknown ("original state unknown"), and without a backup stored in an earlier session the engine never
+//! writes the device. After a save `release()` replays every zone: the saved parameters, and for zones the look left
+//! out (hidden zones) what they showed before, so a hidden zone does not stay dark.
 
 use cc_core::{
     Bus, ColorMode, Controller, DeviceDescription, DeviceError, DeviceId, DeviceInfo, DeviceKind, Direction,
-    Led, Mode, ModeCaps, ModeState, Rgb, Zone, ZoneKind,
+    Led, Mode, ModeCaps, ModeState, OwnLighting, OwnSource, PersistCaps, PersistLook, PersistOutcome, Rgb,
+    Zone, ZoneKind,
 };
 
 use super::hidpp::{
     DecodedEffect, EffectInfo, Link, PAGE_COLOR_LED_EFFECTS, PAGE_DEVICE_NAME_TYPE, PAGE_FEATURE_SET,
-    ZoneEffectState, ZoneInfo, effect,
+    ZoneEffectState, ZoneInfo, effect, restore_params,
 };
 
 /// G560 product id.
@@ -115,6 +133,58 @@ pub fn device_kind(device_type: u8) -> DeviceKind {
         16 => DeviceKind::Light,
         _ => DeviceKind::Unknown,
     }
+}
+
+/// Version byte of a G560 backup ([`encode_backup`]).
+pub const BACKUP_VERSION: u8 = 1;
+
+/// The backup of the device's original state for "save colours to the devices" (ADR 0001 #42): version
+/// [`BACKUP_VERSION`], the zone count, then each zone's open-time readback as SetZoneEffect parameters
+/// ([`restore_params`], persistence 0), in zone order. `None` unless every zone's readback maps.
+pub fn encode_backup(zones: &[ZoneInfo], initial: &[ZoneEffectState]) -> Option<Vec<u8>> {
+    let count = u8::try_from(zones.len()).ok()?;
+    let mut out = vec![BACKUP_VERSION, count];
+    for zone in zones {
+        let state = initial.iter().find(|s| s.zone == zone.index)?;
+        out.extend_from_slice(&restore_params(state, zone)?);
+    }
+    Some(out)
+}
+
+/// [`encode_backup`] for parameters already in SetZoneEffect shape (one per zone, in zone order, persistence 0), e.g.
+/// what a save wrote; `None` unless they cover every zone and decode again ([`decode_backup`]).
+pub fn encode_params(zones: &[ZoneInfo], params: &[[u8; 16]]) -> Option<Vec<u8>> {
+    let count = u8::try_from(zones.len()).ok()?;
+    let mut out = vec![BACKUP_VERSION, count];
+    for (zone, p) in zones.iter().zip(params) {
+        if p[0] != zone.index {
+            return None;
+        }
+        out.extend_from_slice(p);
+    }
+    (params.len() == zones.len() && decode_backup(&out, zones).is_some()).then_some(out)
+}
+
+/// The per-zone SetZoneEffect parameters (persistence 0) of a backup from [`encode_backup`], or `None` when the bytes
+/// do not fit `zones`: wrong version or length, a zone count other than `zones.len()`, or a record that does not
+/// name its zone and one of the zone's effects with a known parameter layout, or whose bytes 12..16 are not 0.
+pub fn decode_backup(bytes: &[u8], zones: &[ZoneInfo]) -> Option<Vec<[u8; 16]>> {
+    let (&[version, count], records) = bytes.split_first_chunk::<2>()?;
+    if version != BACKUP_VERSION || usize::from(count) != zones.len() || records.len() != 16 * zones.len() {
+        return None;
+    }
+    let (chunks, _) = records.as_chunks::<16>();
+    chunks
+        .iter()
+        .zip(zones)
+        .map(|(&params, zone)| {
+            let state = ZoneEffectState {
+                zone: zone.index,
+                raw: Some(params),
+            };
+            restore_params(&state, zone).filter(|p| *p == params)
+        })
+        .collect()
 }
 
 /// Builds the 16 SetZoneEffect parameter bytes (`SetZoneEffect` in the HID++ 2.0 controller): zone, effect index,
@@ -502,6 +572,16 @@ pub fn describe(
     }
 }
 
+/// What a G560 `release()` replays (volatile).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handback {
+    /// Each zone's open-time readback, where it maps ([`restore_params`]).
+    Readback,
+    /// These SetZoneEffect parameters (persistence 0), one per zone: a remembered own lighting, or what a save or
+    /// restore wrote.
+    Params(Vec<[u8; 16]>),
+}
+
 /// Controller for a G560 (zone-only HID++ 2.0, feature 0x8070).
 #[derive(Debug)]
 pub struct G560Controller {
@@ -516,12 +596,59 @@ pub struct G560Controller {
     touched: bool,
     sent: Vec<Option<Rgb>>,
     active: Option<ModeState>,
+    /// The original state's backup ([`encode_backup`] bytes): the own lighting found at open, if complete.
+    backup: Option<Vec<u8>>,
+    /// What `release()` replays and where it came from (ADR 0001 #38).
+    own: OwnLighting<Handback>,
 }
 
 impl G560Controller {
-    /// Wraps a probed device. Sends nothing.
-    pub fn new(link: Link, probe: G560Probe, desc: DeviceDescription) -> Self {
+    /// Wraps a probed device. Sends nothing. `opened_unreleased`: the engine's "unreleased" marker was set at open
+    /// (CaseControl wrote to the device and did not hand it back), so the open-time readback is CaseControl's state;
+    /// `stored` is the remembered own lighting ([`encode_backup`] bytes), used only then and only when it fits the
+    /// zones ([`decode_backup`]).
+    pub fn new(
+        link: Link,
+        probe: G560Probe,
+        desc: DeviceDescription,
+        opened_unreleased: bool,
+        stored: Option<&[u8]>,
+    ) -> Self {
         let n = probe.zones.len();
+        let remembered = if opened_unreleased {
+            let params = stored.and_then(|b| decode_backup(b, &probe.zones));
+            if params.is_none() && stored.is_some() {
+                tracing::warn!(
+                    target: "cc_drivers::logitech",
+                    id = %desc.info.id,
+                    "stored own lighting does not fit the device; ignoring it"
+                );
+            }
+            params.map(Handback::Params)
+        } else {
+            None
+        };
+        let own = OwnLighting::at_open(Handback::Readback, true, remembered, opened_unreleased);
+        let backup = match own.handback() {
+            _ if own.own().is_none() => None,
+            Handback::Readback => encode_backup(&probe.zones, &probe.initial),
+            Handback::Params(p) => encode_params(&probe.zones, p),
+        };
+        if own.source() == OwnSource::LeftByUs {
+            tracing::warn!(
+                target: "cc_drivers::logitech",
+                id = %desc.info.id,
+                "device shows a state CaseControl left and no own lighting is stored for it; release() replays that state"
+            );
+        }
+        if backup.is_none() {
+            tracing::info!(
+                target: "cc_drivers::logitech",
+                id = %desc.info.id,
+                opened_unreleased,
+                "original state unknown (open-time readback incomplete or left by CaseControl); no backup for saving to the device"
+            );
+        }
         Self {
             desc,
             link,
@@ -532,6 +659,38 @@ impl G560Controller {
             touched: false,
             sent: vec![None; n],
             active: None,
+            backup,
+            own,
+        }
+    }
+
+    /// What `release()` replays, as SetZoneEffect parameters (persistence 0) per zone; zones whose state cannot be
+    /// replayed are left out.
+    fn handback_params(&self) -> Vec<[u8; 16]> {
+        match self.own.handback() {
+            Handback::Params(p) => p.clone(),
+            Handback::Readback => self
+                .zones
+                .iter()
+                .filter_map(|zone| {
+                    let state = self.initial.iter().find(|s| s.zone == zone.index)?;
+                    restore_params(state, zone)
+                })
+                .collect(),
+        }
+    }
+
+    /// Each zone's state as a GetEffect readback would report the hand-back state (for `hardware_mode()`).
+    fn handback_states(&self) -> Vec<ZoneEffectState> {
+        match self.own.handback() {
+            Handback::Readback => self.initial.clone(),
+            Handback::Params(p) => p
+                .iter()
+                .map(|p| ZoneEffectState {
+                    zone: p[0],
+                    raw: Some(*p),
+                })
+                .collect(),
         }
     }
 
@@ -589,14 +748,11 @@ impl G560Controller {
         Ok(())
     }
 
-    fn apply_mode(&mut self, state: &ModeState, persist: bool) -> Result<(), DeviceError> {
-        self.claim()?;
-        self.sent.iter_mut().for_each(|s| *s = None);
+    /// The SetZoneEffect parameters `set_mode` sends for `state` (Off: Static black on every zone with a Static
+    /// effect; zones lacking the effect are skipped), with the persistence byte `persist`.
+    fn mode_params(&self, state: &ModeState, persist: bool) -> Result<Vec<[u8; 16]>, DeviceError> {
         if state.mode == OFF_MODE {
-            for i in 0..self.zones.len() {
-                self.paint_static(i, Rgb::BLACK, persist)?;
-            }
-            return Ok(());
+            return Ok(self.static_params(&vec![Some(Rgb::BLACK); self.zones.len()], persist));
         }
         let mode = self
             .desc
@@ -610,8 +766,8 @@ impl G560Controller {
         } else {
             100
         };
-        for i in 0..self.zones.len() {
-            let zone = &self.zones[i];
+        let mut out = Vec::with_capacity(self.zones.len());
+        for (i, zone) in self.zones.iter().enumerate() {
             let Some(fx) = zone.effect_by_index(effect_index) else {
                 tracing::debug!(target: "cc_drivers::logitech", zone = zone.index, effect_index, "zone lacks effect, skipped");
                 continue;
@@ -627,7 +783,7 @@ impl G560Controller {
             } else {
                 slider_to_period(speed, PERIOD_MIN_MS, PERIOD_MAX_MS)
             };
-            let params = effect_params(
+            out.push(effect_params(
                 zone.index,
                 effect_index,
                 fx.id,
@@ -636,9 +792,66 @@ impl G560Controller {
                 brightness,
                 wave_direction(state.direction),
                 persist,
-            );
-            self.link.set_zone_effect(self.feature, &params)?;
+            ));
         }
+        Ok(out)
+    }
+
+    /// Static per zone with `colors[i]` (zones with `None`, and zones without a Static effect, are skipped).
+    fn static_params(&self, colors: &[Option<Rgb>], persist: bool) -> Vec<[u8; 16]> {
+        self.zones
+            .iter()
+            .zip(colors)
+            .filter_map(|(zone, color)| {
+                let color = (*color)?;
+                let fx = zone.effect_by_id(effect::STATIC)?;
+                Some(effect_params(
+                    zone.index,
+                    fx.index,
+                    effect::STATIC,
+                    color,
+                    PERIOD_MAX_MS,
+                    100,
+                    0,
+                    persist,
+                ))
+            })
+            .collect()
+    }
+
+    fn apply_mode(&mut self, state: &ModeState, persist: bool) -> Result<(), DeviceError> {
+        let params = self.mode_params(state, persist)?;
+        self.claim()?;
+        self.sent.iter_mut().for_each(|s| *s = None);
+        for p in &params {
+            self.link.set_zone_effect(self.feature, p)?;
+        }
+        Ok(())
+    }
+
+    /// Sends `params` (persistence 1) under software control and remembers what `release()` replays from then on
+    /// (persistence 0): for every zone the parameters just sent, or for a zone the look left out what was replayed
+    /// for it before, so a hidden zone does not stay dark.
+    fn write_persisted(&mut self, params: &[[u8; 16]]) -> Result<(), DeviceError> {
+        self.claim()?;
+        self.sent.iter_mut().for_each(|s| *s = None);
+        for p in params {
+            self.link.set_zone_effect(self.feature, p)?;
+        }
+        let previous = self.handback_params();
+        let merged = self
+            .zones
+            .iter()
+            .filter_map(|zone| {
+                let sent = params.iter().find(|p| p[0] == zone.index).map(|p| {
+                    let mut v = *p;
+                    v[12] = 0;
+                    v
+                });
+                sent.or_else(|| previous.iter().find(|p| p[0] == zone.index).copied())
+            })
+            .collect();
+        self.own.saved(Handback::Params(merged));
         Ok(())
     }
 }
@@ -690,9 +903,10 @@ impl Controller for G560Controller {
     }
 
     fn save_to_hardware(&mut self) -> Result<(), DeviceError> {
-        // DeviceSaveMode: replay the active firmware-effect mode with the persistence byte set. Direct is not savable.
+        // DeviceSaveMode: the active firmware-effect mode with the persistence byte set, through persist_look (so
+        // release() hands it back). Direct is not savable.
         match self.active.clone() {
-            Some(state) => self.apply_mode(&state, true),
+            Some(state) => self.persist_look(&PersistLook::Mode(state), None).map(|_| ()),
             None => Err(DeviceError::Unsupported),
         }
     }
@@ -702,7 +916,8 @@ impl Controller for G560Controller {
         // feature, and this driver never touches one. Then each zone's open-time effect is replayed (volatile,
         // persistence 0) where its GetEffect readback maps onto SetZoneEffect (`hidpp::restore_params`), so our
         // volatile Static/effect writes do not linger.
-        if !self.touched {
+        // A remembered own lighting the device does not show yet is replayed even if nothing was sent.
+        if !self.touched && !self.own.handback_pending() {
             return Ok(());
         }
         self.link.set_sw_control(self.feature, false)?;
@@ -710,13 +925,129 @@ impl Controller for G560Controller {
         self.touched = false;
         self.sent.iter_mut().for_each(|s| *s = None);
         self.active = None;
-        self.link
-            .restore_effects(self.feature, &self.zones, &self.initial)
+        let r = match self.own.handback().clone() {
+            Handback::Params(params) => {
+                let mut first_err = Ok(());
+                for p in &params {
+                    if let Err(e) = self.link.set_zone_effect(self.feature, p)
+                        && first_err.is_ok()
+                    {
+                        first_err = Err(e);
+                    }
+                }
+                first_err
+            }
+            Handback::Readback => self
+                .link
+                .restore_effects(self.feature, &self.zones, &self.initial),
+        };
+        if r.is_ok() {
+            self.own.handed_back();
+        }
+        r
     }
 
-    /// The open-time readback, which is also what `release()` replays.
+    /// What `release()` replays: the open-time readback, the remembered own lighting of a marked device, or what was
+    /// saved.
     fn hardware_mode(&self) -> Option<ModeState> {
-        hardware_state(&self.desc, &self.zones, &self.initial)
+        hardware_state(&self.desc, &self.zones, &self.handback_states())
+    }
+
+    /// The hand-back state ([`encode_backup`] bytes) when it is the device's own lighting and every zone maps.
+    fn own_lighting(&self) -> Option<Vec<u8>> {
+        match self.own.own()? {
+            Handback::Readback => encode_backup(&self.zones, &self.initial),
+            Handback::Params(p) => encode_params(&self.zones, p),
+        }
+    }
+
+    /// `false` while opened with the "unreleased" marker until a release replayed the remembered own lighting, and
+    /// for good when none was remembered.
+    fn shows_own_lighting(&self) -> bool {
+        self.own.shows_own_lighting()
+    }
+
+    /// Zone colours (Static per zone; only when every zone has a Static effect) and every hardware mode.
+    fn persist_caps(&self) -> Option<PersistCaps> {
+        let statics = self
+            .zones
+            .iter()
+            .all(|z| z.effect_by_id(effect::STATIC).is_some());
+        Some(PersistCaps {
+            zone_colors: statics,
+            hardware_modes: true,
+        })
+    }
+
+    /// Persists `look` (ADR 0001 #42): zone colours as Static per zone, a mode as `set_mode` sends it, off as Static
+    /// black, each with the persistence byte set. The fingerprint is the parameter bytes sent. The engine calls it
+    /// only once it holds a backup of the original state (this session's `saved_state_backup()` or an earlier one's).
+    fn persist_look(
+        &mut self,
+        look: &PersistLook,
+        last: Option<&[u8]>,
+    ) -> Result<PersistOutcome, DeviceError> {
+        let params = match look {
+            PersistLook::Zones(colors) => {
+                if colors.len() != self.zones.len() {
+                    return Err(DeviceError::InvalidArgument(format!(
+                        "{} zone colours for {} zones",
+                        colors.len(),
+                        self.zones.len()
+                    )));
+                }
+                self.static_params(colors, true)
+            }
+            PersistLook::Mode(state) => {
+                self.desc
+                    .validate_state(state)
+                    .map_err(|e| DeviceError::InvalidArgument(e.to_string()))?;
+                if state.mode == DIRECT_MODE {
+                    return Err(DeviceError::InvalidArgument(
+                        "the direct mode cannot be saved; save its colours per zone".into(),
+                    ));
+                }
+                self.mode_params(state, true)?
+            }
+            PersistLook::Off => self.static_params(&vec![Some(Rgb::BLACK); self.zones.len()], true),
+        };
+        if params.is_empty() {
+            return Err(DeviceError::InvalidArgument("no zone to save".into()));
+        }
+        let fingerprint = params.concat();
+        if last == Some(fingerprint.as_slice()) {
+            return Ok(PersistOutcome::Unchanged);
+        }
+        self.write_persisted(&params)?;
+        tracing::info!(
+            target: "cc_drivers::logitech",
+            id = %self.desc.info.id,
+            params = %cc_hid::hex(&fingerprint),
+            "lighting saved to the device"
+        );
+        Ok(PersistOutcome::Written { fingerprint })
+    }
+
+    /// The own lighting found at open ([`encode_backup`] bytes): the complete open-time readback of an unmarked
+    /// device, or the remembered own lighting of a marked one; `None` ("original state unknown") otherwise.
+    fn saved_state_backup(&self) -> Option<Vec<u8>> {
+        self.backup.clone()
+    }
+
+    /// Validates `backup` ([`decode_backup`]) and replays each zone's original effect with the persistence byte set.
+    fn restore_saved_state(&mut self, backup: &[u8]) -> Result<PersistOutcome, DeviceError> {
+        let mut params = decode_backup(backup, &self.zones).ok_or_else(|| {
+            DeviceError::InvalidArgument("the backup does not fit this device; nothing sent".into())
+        })?;
+        for p in &mut params {
+            p[12] = 1;
+        }
+        self.write_persisted(&params)?;
+        self.backup = Some(backup.to_vec());
+        tracing::info!(target: "cc_drivers::logitech", id = %self.desc.info.id, "original lighting written back to the device");
+        Ok(PersistOutcome::Written {
+            fingerprint: params.concat(),
+        })
     }
 }
 
@@ -738,6 +1069,11 @@ pub(crate) mod tests {
     /// Detection script for a two-zone speaker: zone 0 (location 1) and zone 1 (location 2), each with
     /// effects [0] = Off (0x0000), [1] = Static (0x0001), [2] = Breathing (0x000A).
     pub(crate) fn probe_script() -> ScriptBuilder {
+        probe_script_with(None)
+    }
+
+    /// [`probe_script`] with zone 1's readback answered with `zone1` (SetZoneEffect shape) instead of rejected.
+    fn probe_script_with(zone1: Option<&[u8]>) -> ScriptBuilder {
         let mut b = FakeTransport::builder().read_timeout(); // flush: queue empty
         b = rr(b, 0x00, 0x00, &[0x00, 0x01], &[0x01]); // FeatureSet at 1
         b = rr(b, 0x00, 0x00, &[0x00, 0x05], &[0x02]); // DeviceNameType at 2
@@ -767,13 +1103,33 @@ pub(crate) mod tests {
             &[0],
             &[0, 2, 1, 2, 3, 0x13, 0x88, 0, 50, 0, 0, 0, 1],
         );
-        // Zone 1 readback rejected by the device: kept as None, not an error.
-        b.write(long_request(DEV, FEAT, fp8070::GET_EFFECT, &[1]).to_vec())
-            .read(vec![0x11, DEV, 0xFF, FEAT, 0xE7, 0x02])
+        match zone1 {
+            Some(reply) => rr(b, FEAT, fp8070::GET_EFFECT, &[1], reply),
+            // Zone 1 readback rejected by the device: kept as None, not an error.
+            None => b
+                .write(long_request(DEV, FEAT, fp8070::GET_EFFECT, &[1]).to_vec())
+                .read(vec![0x11, DEV, 0xFF, FEAT, 0xE7, 0x02]),
+        }
     }
 
     fn controller(extra: ScriptBuilder) -> (G560Controller, FakeTransport) {
-        let fake = FakeTransport::new(probe_script().steps(extra.into_steps()).into_steps());
+        controller_on(probe_script(), extra, false)
+    }
+
+    /// Zone 1's readback: Static (index 1), colour 09 09 09, marker 0x02.
+    const ZONE1_STATIC: [u8; 16] = [1, 1, 9, 9, 9, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    /// A controller whose zones both read back a mappable effect.
+    fn full_controller(extra: ScriptBuilder, unreleased: bool) -> (G560Controller, FakeTransport) {
+        controller_on(probe_script_with(Some(&ZONE1_STATIC)), extra, unreleased)
+    }
+
+    fn controller_on(
+        probe_steps: ScriptBuilder,
+        extra: ScriptBuilder,
+        unreleased: bool,
+    ) -> (G560Controller, FakeTransport) {
+        let fake = FakeTransport::new(probe_steps.steps(extra.into_steps()).into_steps());
         let mut link = Link::new(Box::new(fake.clone()), DEV);
         let p = probe(&mut link).expect("probe");
         let desc = describe(
@@ -783,7 +1139,7 @@ pub(crate) mod tests {
             None,
         );
         desc.validate().expect("valid description");
-        (G560Controller::new(link, p, desc), fake)
+        (G560Controller::new(link, p, desc, unreleased, None), fake)
     }
 
     /// `11 FF 04 37 <params>`: SetZoneEffect (fn 0x30 | SW_ID 7).
@@ -1068,6 +1424,284 @@ pub(crate) mod tests {
             .build();
         let mut link = Link::new(Box::new(fake.clone()), DEV);
         assert_eq!(probe(&mut link), Err(DeviceError::Timeout));
+        fake.finish().expect("script consumed");
+    }
+
+    /// The backup of the two-zone device: version 1, two zones, zone 0's Breathing readback and zone 1's Static
+    /// readback, each with the persistence byte (12) and bytes 13..16 zeroed.
+    fn full_backup() -> Vec<u8> {
+        let mut b = vec![1, 2];
+        b.extend([0, 2, 1, 2, 3, 0x13, 0x88, 0, 50, 0, 0, 0, 0, 0, 0, 0]);
+        b.extend(ZONE1_STATIC);
+        b
+    }
+
+    #[test]
+    fn backup_needs_every_zone_and_a_device_not_left_by_us() {
+        let (c, fake) = controller(ScriptBuilder::new());
+        assert_eq!(c.saved_state_backup(), None, "zone 1 readback rejected");
+        fake.finish().expect("script consumed");
+        let (c, fake) = full_controller(ScriptBuilder::new(), false);
+        assert_eq!(c.saved_state_backup(), Some(full_backup()));
+        fake.finish().expect("script consumed");
+        let (c, fake) = full_controller(ScriptBuilder::new(), true);
+        assert_eq!(
+            c.saved_state_backup(),
+            None,
+            "readback is CaseControl's, nothing stored"
+        );
+        fake.finish().expect("nothing sent");
+    }
+
+    #[test]
+    fn backup_encoding_round_trips_and_rejects_what_does_not_fit() {
+        let (c, fake) = full_controller(ScriptBuilder::new(), false);
+        let zones = c.zones().to_vec();
+        let records = decode_backup(&full_backup(), &zones).expect("fits");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1], ZONE1_STATIC);
+        let bad = |f: &dyn Fn(&mut Vec<u8>)| {
+            let mut b = full_backup();
+            f(&mut b);
+            decode_backup(&b, &zones).is_none()
+        };
+        assert!(bad(&|b| b[0] = 2), "version");
+        assert!(bad(&|b| b[1] = 3), "zone count");
+        assert!(bad(&|b| b.truncate(20)), "length");
+        assert!(bad(&|b| b[18] = 0), "record of zone 1 names zone 0");
+        assert!(bad(&|b| b[19] = 7), "effect index the zone does not have");
+        assert!(bad(&|b| b[2 + 12] = 1), "persistence byte set");
+        assert!(decode_backup(&[], &zones).is_none());
+        fake.finish().expect("script consumed");
+    }
+
+    #[test]
+    fn persist_zones_writes_static_with_persistence_and_release_replays_it() {
+        let red = Rgb::new(0x80, 0, 0);
+        let s = claim(ScriptBuilder::new(), true)
+            // Static (effect index 1) per zone, persistence byte 12 = 1; zone 1 left out (None).
+            .write(set_effect([0, 1, 0x80, 0, 0, 0x02, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]))
+            .read(ack(fp8070::SET_EFFECT));
+        // release: SetSWControl(0, 0), then the persisted parameters with persistence 0 (not the open-time look), and
+        // for zone 1, which the look left out (a hidden zone), what it showed before, so it does not stay dark.
+        let s = claim(s, false)
+            .write(set_effect([0, 1, 0x80, 0, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+            .read(ack(fp8070::SET_EFFECT))
+            .write(set_effect(ZONE1_STATIC))
+            .read(ack(fp8070::SET_EFFECT));
+        let (mut c, fake) = full_controller(s, false);
+        assert_eq!(
+            c.persist_caps(),
+            Some(PersistCaps {
+                zone_colors: true,
+                hardware_modes: true
+            })
+        );
+        let look = PersistLook::Zones(vec![Some(red), None]);
+        let fingerprint = vec![0, 1, 0x80, 0, 0, 0x02, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+        assert_eq!(
+            c.persist_look(&look, None),
+            Ok(PersistOutcome::Written {
+                fingerprint: fingerprint.clone()
+            })
+        );
+        assert_eq!(
+            c.persist_look(&look, Some(&fingerprint)),
+            Ok(PersistOutcome::Unchanged)
+        );
+        // The saved state is the own lighting from now on, and it still covers every zone.
+        let mut expected_own = vec![BACKUP_VERSION, 2];
+        expected_own.extend_from_slice(&[0, 1, 0x80, 0, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        expected_own.extend_from_slice(&ZONE1_STATIC);
+        assert_eq!(c.own_lighting(), Some(expected_own));
+        assert_eq!(
+            c.saved_state_backup(),
+            Some(full_backup()),
+            "the backup stays the original"
+        );
+        c.release().expect("release");
+        fake.finish().expect("script consumed");
+    }
+
+    #[test]
+    fn unmarked_open_reports_the_readback_as_own_lighting() {
+        let (c, fake) = full_controller(ScriptBuilder::new(), false);
+        assert_eq!(c.own_lighting(), Some(full_backup()));
+        assert!(c.shows_own_lighting());
+        fake.finish().expect("nothing sent");
+        // An incomplete readback cannot be remembered.
+        let (c, fake) = controller(ScriptBuilder::new());
+        assert_eq!(c.own_lighting(), None);
+        assert!(c.shows_own_lighting());
+        fake.finish().expect("nothing sent");
+    }
+
+    /// A G560 opened with the "unreleased" marker and `stored` as its remembered own lighting.
+    fn marked_controller(extra: ScriptBuilder, stored: Option<&[u8]>) -> (G560Controller, FakeTransport) {
+        let fake = FakeTransport::new(
+            probe_script_with(Some(&ZONE1_STATIC))
+                .steps(extra.into_steps())
+                .into_steps(),
+        );
+        let mut link = Link::new(Box::new(fake.clone()), DEV);
+        let p = probe(&mut link).expect("probe");
+        let desc = describe(&p, DeviceId::hid(0x046D, G560_PID, None), "path".into(), None);
+        (G560Controller::new(link, p, desc, true, stored), fake)
+    }
+
+    /// A remembered own lighting: zone 0 Static red, zone 1 Static green (persistence 0).
+    fn stored_static() -> Vec<u8> {
+        let mut b = vec![BACKUP_VERSION, 2];
+        b.extend_from_slice(&[0, 1, 0xFF, 0, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b.extend_from_slice(&[1, 1, 0, 0xFF, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        b
+    }
+
+    #[test]
+    fn marked_open_keeps_the_marker_and_release_replays_the_stored_own_lighting() {
+        let stored = stored_static();
+        // Nothing at open; the first release replays the stored state although nothing was sent.
+        let s = claim(ScriptBuilder::new(), false)
+            .write(set_effect(stored[2..18].try_into().expect("16")))
+            .read(ack(fp8070::SET_EFFECT))
+            .write(set_effect(stored[18..34].try_into().expect("16")))
+            .read(ack(fp8070::SET_EFFECT));
+        let (mut c, fake) = marked_controller(s, Some(&stored));
+        assert!(!c.shows_own_lighting(), "the marker stays until a release");
+        assert_eq!(c.own_lighting(), Some(stored.clone()));
+        assert_eq!(
+            c.saved_state_backup(),
+            Some(stored.clone()),
+            "the stored own lighting is the backup"
+        );
+        let shown = c.hardware_mode().expect("stored state decodes");
+        assert_eq!(shown.colors, vec![Rgb::new(0xFF, 0, 0), Rgb::new(0, 0xFF, 0)]);
+        c.release().expect("release");
+        assert!(c.shows_own_lighting());
+        fake.finish().expect("script consumed");
+    }
+
+    #[test]
+    fn marked_open_without_stored_state_replays_the_readback_and_keeps_the_marker() {
+        // A stored state that does not fit (wrong version) is ignored: original state unknown.
+        let mut bad = stored_static();
+        bad[0] = 9;
+        let (mut c, fake) = marked_controller(ScriptBuilder::new(), Some(&bad));
+        assert_eq!(c.saved_state_backup(), None, "original state unknown");
+        assert_eq!(c.own_lighting(), None);
+        assert!(!c.shows_own_lighting());
+        // Untouched: nothing to hand back.
+        c.release().expect("release");
+        assert!(!c.shows_own_lighting(), "still CaseControl's state");
+        fake.finish().expect("nothing sent");
+    }
+
+    #[test]
+    fn manual_save_goes_through_persist_look() {
+        let s = claim(ScriptBuilder::new(), true)
+            // set_mode Off (volatile), then the manual save of it (persisted).
+            .write(set_effect([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+            .read(ack(fp8070::SET_EFFECT))
+            .write(set_effect([1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+            .read(ack(fp8070::SET_EFFECT))
+            .write(set_effect([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]))
+            .read(ack(fp8070::SET_EFFECT))
+            .write(set_effect([1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]))
+            .read(ack(fp8070::SET_EFFECT));
+        let (mut c, fake) = full_controller(s, false);
+        let off = ModeState {
+            mode: OFF_MODE,
+            speed: None,
+            brightness: None,
+            direction: None,
+            colors: vec![],
+        };
+        c.set_mode(&off).expect("off");
+        c.save_to_hardware().expect("saved");
+        // The saved state is what a release hands back from now on.
+        let mut own = vec![BACKUP_VERSION, 2];
+        own.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        own.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(c.own_lighting(), Some(own));
+        fake.finish().expect("script consumed");
+    }
+
+    #[test]
+    fn persist_off_and_mode() {
+        let s = claim(ScriptBuilder::new(), true)
+            // Off: Static black on both zones, persisted.
+            .write(set_effect([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]))
+            .read(ack(fp8070::SET_EFFECT))
+            .write(set_effect([1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]))
+            .read(ack(fp8070::SET_EFFECT))
+            // Breathing at brightness 40, speed 80 (4839 ms = 0x12E7), persisted.
+            .write(set_effect([
+                0, 2, 1, 2, 3, 0x12, 0xE7, 0, 40, 0, 0, 0, 1, 0, 0, 0,
+            ]))
+            .read(ack(fp8070::SET_EFFECT))
+            .write(set_effect([
+                1, 2, 4, 5, 6, 0x12, 0xE7, 0, 40, 0, 0, 0, 1, 0, 0, 0,
+            ]))
+            .read(ack(fp8070::SET_EFFECT));
+        let (mut c, fake) = full_controller(s, false);
+        assert!(matches!(
+            c.persist_look(&PersistLook::Off, None),
+            Ok(PersistOutcome::Written { .. })
+        ));
+        let breathing = ModeState {
+            mode: 2,
+            speed: Some(80),
+            brightness: Some(40),
+            direction: None,
+            colors: vec![Rgb::new(1, 2, 3), Rgb::new(4, 5, 6)],
+        };
+        assert!(matches!(
+            c.persist_look(&PersistLook::Mode(breathing), None),
+            Ok(PersistOutcome::Written { .. })
+        ));
+        let direct = ModeState {
+            mode: DIRECT_MODE,
+            speed: None,
+            brightness: None,
+            direction: None,
+            colors: vec![Rgb::BLACK; 2],
+        };
+        assert!(matches!(
+            c.persist_look(&PersistLook::Mode(direct), None),
+            Err(DeviceError::InvalidArgument(_))
+        ));
+        fake.finish().expect("script consumed");
+    }
+
+    #[test]
+    fn restore_validates_and_writes_the_original_with_persistence() {
+        let s = claim(ScriptBuilder::new(), true)
+            .write(set_effect([
+                0, 2, 1, 2, 3, 0x13, 0x88, 0, 50, 0, 0, 0, 1, 0, 0, 0,
+            ]))
+            .read(ack(fp8070::SET_EFFECT))
+            .write(set_effect([1, 1, 9, 9, 9, 0x02, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]))
+            .read(ack(fp8070::SET_EFFECT));
+        let (mut c, fake) = full_controller(s, true);
+        let mut bad = full_backup();
+        bad[0] = 9;
+        assert!(matches!(
+            c.restore_saved_state(&bad),
+            Err(DeviceError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            c.restore_saved_state(&full_backup()),
+            Ok(PersistOutcome::Written { .. })
+        ));
+        assert_eq!(
+            c.saved_state_backup(),
+            Some(full_backup()),
+            "what was written back"
+        );
+        assert!(
+            c.shows_own_lighting(),
+            "a restore leaves the device's own lighting"
+        );
         fake.finish().expect("script consumed");
     }
 }

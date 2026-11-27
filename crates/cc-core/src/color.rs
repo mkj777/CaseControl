@@ -58,6 +58,57 @@ impl Rgb {
     }
 }
 
+/// An sRGB channel (0-255) as linear light (0.0-1.0), with the sRGB transfer function (IEC 61966-2-1).
+pub fn srgb_to_linear(channel: u8) -> f64 {
+    let c = f64::from(channel) / 255.0;
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear light (clamped to 0.0-1.0) as an sRGB channel, rounded; the inverse of [`srgb_to_linear`].
+pub fn linear_to_srgb(linear: f64) -> u8 {
+    let l = if linear.is_nan() {
+        0.0
+    } else {
+        linear.clamp(0.0, 1.0)
+    };
+    let c = if l <= 0.003_130_8 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    };
+    // In 0..=255 by construction (c in 0..=1); the cast only drops the fraction rounding removed.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let v = (c * 255.0).round().clamp(0.0, 255.0) as u8;
+    v
+}
+
+/// The average of `colors` in linear light, converted back to sRGB (ADR 0001 #42: the one colour a zone of mixed
+/// colours is saved as). Averaging in linear light keeps the perceived brightness of a mix: red and green average to
+/// a bright yellow (`#BCBC00`), not the muddy `#808000` a plain sRGB mean gives. `None` for no colours.
+pub fn average_linear(colors: &[Rgb]) -> Option<Rgb> {
+    if colors.is_empty() {
+        return None;
+    }
+    let mut sum = [0.0_f64; 3];
+    for c in colors {
+        sum[0] += srgb_to_linear(c.r);
+        sum[1] += srgb_to_linear(c.g);
+        sum[2] += srgb_to_linear(c.b);
+    }
+    // At most a few hundred LEDs per zone: exact in f64.
+    #[allow(clippy::cast_precision_loss)]
+    let n = colors.len() as f64;
+    Some(Rgb::new(
+        linear_to_srgb(sum[0] / n),
+        linear_to_srgb(sum[1] / n),
+        linear_to_srgb(sum[2] / n),
+    ))
+}
+
 impl From<[u8; 3]> for Rgb {
     fn from([r, g, b]: [u8; 3]) -> Self {
         Self::new(r, g, b)
@@ -160,6 +211,45 @@ mod tests {
         // A colour counts as its highest channel.
         assert_eq!(Rgb::new(255, 0, 0).level_percent(), 100);
         assert_eq!(Rgb::new(0, 0, 128).level_percent(), 50);
+    }
+
+    #[test]
+    fn srgb_linear_round_trips_every_channel() {
+        assert_eq!(srgb_to_linear(0), 0.0);
+        assert!((srgb_to_linear(255) - 1.0).abs() < 1e-12);
+        // 128 / 255 = 0.50196; ((0.50196 + 0.055) / 1.055)^2.4 = 0.21586.
+        assert!((srgb_to_linear(128) - 0.215_86).abs() < 1e-4);
+        // The linear segment: 10 / 255 / 12.92 = 0.0030353.
+        assert!((srgb_to_linear(10) - 0.003_035_3).abs() < 1e-6);
+        for v in 0..=255u8 {
+            assert_eq!(linear_to_srgb(srgb_to_linear(v)), v, "{v}");
+        }
+        assert_eq!(linear_to_srgb(-1.0), 0);
+        assert_eq!(linear_to_srgb(2.0), 255);
+        assert_eq!(linear_to_srgb(f64::NAN), 0);
+    }
+
+    #[test]
+    fn average_is_taken_in_linear_light() {
+        assert_eq!(average_linear(&[]), None);
+        assert_eq!(average_linear(&[Rgb::new(1, 2, 3)]), Some(Rgb::new(1, 2, 3)));
+        let same = [Rgb::new(200, 10, 99); 20];
+        assert_eq!(average_linear(&same), Some(Rgb::new(200, 10, 99)));
+        // Black and white: linear 0.5 -> 1.055 * 0.5^(1/2.4) - 0.055 = 0.73536 -> 187.5 -> 188 (sRGB mean: 128).
+        assert_eq!(
+            average_linear(&[Rgb::BLACK, Rgb::WHITE]),
+            Some(Rgb::new(188, 188, 188))
+        );
+        // Red and green: each channel averages 1.0 and 0.0 -> 188, blue stays 0.
+        assert_eq!(
+            average_linear(&[Rgb::new(255, 0, 0), Rgb::new(0, 255, 0)]),
+            Some(Rgb::new(188, 188, 0))
+        );
+        // Three primaries: linear 1/3 -> 0.61306 -> 156.3 -> 156.
+        assert_eq!(
+            average_linear(&[Rgb::new(255, 0, 0), Rgb::new(0, 255, 0), Rgb::new(0, 0, 255)]),
+            Some(Rgb::new(156, 156, 156))
+        );
     }
 
     fn parse(s: &str) -> Rgb {

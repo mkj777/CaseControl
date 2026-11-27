@@ -11,10 +11,13 @@
 //! Helper side ([`helper_main`], called from `main` before Tauri, the single-instance guard or the engine start, and
 //! without any logging setup): checks the request path ([`cc_conflicts::validate_helper_request`]: the request file
 //! shape, no links or reparse points, canonical path unchanged), reads the request through a bounded reader (at most
-//! [`MAX_REQUEST_BYTES`]), runs a fresh conflict scan, and lets [`cc_conflicts::run_elevated_request`] validate
+//! [`MAX_REQUEST_BYTES`]), runs a fresh conflict scan, and lets [`cc_conflicts::run_elevated_request_in`] validate
 //! every action against it (fixed action enum, catalogue-matched names only, HKCU writes refused, processes only in
-//! the requesting session) and run what passes through `WindowsOps`. No shell is started. The response is written to
-//! a new file next to the validated request (never over an existing one), then the helper exits.
+//! the requesting session, the request's session equal to the helper's) and run what passes through `WindowsOps`;
+//! the start-up task actions of ADR 0001 #42 (`RegisterBootTask` / `RemoveBootTask`) derive their user from the
+//! validated request file ([`cc_conflicts::HelperContext::for_request`]). No shell is started. The response is
+//! written to a new file next to the request after the request path was checked again
+//! ([`cc_conflicts::write_helper_result`], never over an existing file), then the helper exits.
 
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
@@ -77,6 +80,7 @@ pub fn parse_request(text: &str) -> Result<ElevatedRequest, String> {
 }
 
 /// Writes `response` to `path`, which must not exist yet.
+#[cfg(test)]
 fn write_new(path: &Path, response: &ElevatedResponse) -> std::io::Result<()> {
     let text = serde_json::to_vec(response).map_err(std::io::Error::other)?;
     let mut file = std::fs::OpenOptions::new()
@@ -92,21 +96,38 @@ pub fn run_helper(request: &Path) -> i32 {
     let Ok(parsed) = read_request(request) else {
         return EXIT_BAD_REQUEST;
     };
-    let response = execute_request(&parsed);
-    match write_new(&result_path(request), &response) {
+    let response = execute_request(&parsed, request);
+    let Ok(bytes) = serde_json::to_vec(&response) else {
+        return EXIT_WRITE_FAILED;
+    };
+    match cc_conflicts::write_helper_result(request, &bytes) {
         Ok(()) => EXIT_OK,
         Err(_) => EXIT_WRITE_FAILED,
     }
 }
 
+/// The helper's scanner: [`cc_conflicts::Scanner::windows_helper`], whose autostart source checks the owner of the
+/// common Startup folder before it reports (and so lets the helper act on) entries there. The unelevated
+/// `Scanner::windows` must not be used in this module outside tests (see the test
+/// `the_helper_scans_with_the_helper_scanner`).
 #[cfg(windows)]
-fn execute_request(request: &ElevatedRequest) -> ElevatedResponse {
-    let report = cc_conflicts::Scanner::windows().scan(&cc_conflicts::ScanOptions::default());
-    cc_conflicts::run_elevated_request(request, &report, &cc_conflicts::WindowsOps)
+fn helper_scanner() -> cc_conflicts::Scanner {
+    cc_conflicts::Scanner::windows_helper()
+}
+
+#[cfg(windows)]
+fn execute_request(request: &ElevatedRequest, request_file: &Path) -> ElevatedResponse {
+    let report = helper_scanner().scan(&cc_conflicts::ScanOptions::default());
+    cc_conflicts::run_elevated_request_in(
+        request,
+        &report,
+        &cc_conflicts::WindowsOps,
+        &cc_conflicts::HelperContext::for_request(request_file),
+    )
 }
 
 #[cfg(not(windows))]
-fn execute_request(request: &ElevatedRequest) -> ElevatedResponse {
+fn execute_request(request: &ElevatedRequest, _request_file: &Path) -> ElevatedResponse {
     ElevatedResponse {
         version: ELEVATED_PROTOCOL_VERSION,
         outcomes: request
@@ -304,6 +325,31 @@ mod tests {
     use cc_conflicts::{Action, AutostartLocation, StartType};
 
     use super::*;
+
+    /// Guard for the helper's scanner: the module's code (everything before this test module) scans only with
+    /// `Scanner::windows_helper`, so the owner check on the common Startup folder applies in the elevated helper.
+    #[test]
+    fn the_helper_scans_with_the_helper_scanner() {
+        let source = include_str!("elevated.rs");
+        let code = source
+            .split_once("mod tests {")
+            .map(|(code, _)| code)
+            .expect("test module");
+        assert!(
+            code.contains("cc_conflicts::Scanner::windows_helper()"),
+            "the helper builds its scanner with Scanner::windows_helper"
+        );
+        assert!(
+            !code.contains("Scanner::windows()"),
+            "the helper must not scan with the unelevated Scanner::windows"
+        );
+        let scans: Vec<_> = code.match_indices(".scan(").collect();
+        assert_eq!(scans.len(), 1, "one scan, through helper_scanner()");
+        assert!(
+            code[..scans[0].0].ends_with("helper_scanner()"),
+            "the scan uses helper_scanner()"
+        );
+    }
 
     fn actions() -> Vec<PlannedAction> {
         vec![

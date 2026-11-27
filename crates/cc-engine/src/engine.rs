@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use cc_config::{DeviceSetting, HardwareSnapshot, HardwareState};
 use cc_core::{
     Backend, Bus, Controller, DetectContext, Detected, DeviceDescription, DeviceError, DeviceId, EngineEvent,
-    HotplugEvent, ModeState, Rgb,
+    HotplugEvent, ModeState, PersistCaps, Rgb,
 };
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -21,7 +21,8 @@ use crate::hotplug::{HotplugRuntime, HotplugSource};
 use crate::lighting::{self, FULL, Levels, Output, Want, mask_hidden_zones};
 use crate::resume::ResumeRuntime;
 use crate::view::{
-    ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView, ReleaseReport, Takeover,
+    ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView, PersistEntry,
+    PersistReport, PersistResult, ReleaseReport, ShutdownMode, SkipReason, Takeover,
 };
 use crate::worker::{Command, FrameSlot, Reply, Timing, Worker};
 
@@ -37,6 +38,19 @@ const MAX_REMOVED: usize = 64;
 const RESUME_LOOKBACK: Duration = Duration::from_secs(10);
 /// Bounds of the frame rate.
 const FPS_RANGE: std::ops::RangeInclusive<u32> = 1..=60;
+/// Writes to one device's memory per day at most (ADR 0001 #42: guards flash wear).
+pub(crate) const DAILY_SAVE_CAP: u32 = 20;
+/// Attempts to write one device's backup back per day at most (ADR 0001 #42): a restore that keeps failing is not
+/// retried on every connect.
+pub(crate) const RESTORE_CAP: u32 = 3;
+
+/// Today as days since 1970-01-01 (UTC), the unit of the daily write count.
+pub(crate) fn today() -> u32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    u32::try_from(secs / 86_400).unwrap_or(u32::MAX)
+}
 
 /// Engine configuration. Not `Clone`: it owns the machine state, whose file only the engine writes.
 #[derive(Debug)]
@@ -70,7 +84,19 @@ pub struct EngineConfig {
     /// `DetectContext::unreleased`); what a newly opened controller reports through `Controller::own_lighting` is
     /// recorded in it; a worker sets the marker before its first write after a takeover and clears it after a
     /// successful release (when `Controller::shows_own_lighting`). The file is written only when a value changed.
+    /// It also holds the records of "save colours to the devices" (ADR 0001 #42; see
+    /// [`EngineHandle::persist_all`]).
     pub hardware_state: HardwareState,
+    /// The setting each device gets the moment it is found (ADR 0001 #42: the visible active profile's settings),
+    /// seeded as pending settings before the first detection. Pass the profile's device brightness in
+    /// [`brightness`](Self::brightness) so the first output already has it. A later
+    /// [`apply`](EngineHandle::apply) replaces what is still pending.
+    pub initial_settings: BTreeMap<DeviceId, DeviceSetting>,
+    /// Whether the engine may write devices' own memory at all (ADR 0001 #42): saves
+    /// ([`persist_all`](EngineHandle::persist_all), [`save_to_hardware`](EngineHandle::save_to_hardware)), restores
+    /// ([`restore_saved`](EngineHandle::restore_saved)) and the restores pending for devices that connect. `false`
+    /// refuses every one of them ([`SkipReason::WritesDisabled`]); pending restores stay pending. Default `true`.
+    pub device_memory_writes: bool,
 }
 
 impl Default for EngineConfig {
@@ -87,6 +113,8 @@ impl Default for EngineConfig {
             default_color: cc_config::DEFAULT_COLOR,
             dark_zones: BTreeMap::new(),
             hardware_state: HardwareState::in_memory(),
+            initial_settings: BTreeMap::new(),
+            device_memory_writes: true,
         }
     }
 }
@@ -103,6 +131,8 @@ struct Slot {
     hardware: Option<ModeState>,
     /// The driver's off mode (`Controller::off_mode`), used for brightness 0.
     off_mode: Option<u32>,
+    /// What the driver can save to the device's memory (`Controller::persist_caps`).
+    persist_caps: Option<PersistCaps>,
     /// What the engine drives the device with (unscaled), or `None` while it does not drive it (never set, or
     /// released). Brightness changes re-send only devices that have one.
     want: Option<Want>,
@@ -342,6 +372,8 @@ pub(crate) struct Shared {
     /// The remembered machine state (own lighting per device); see [`EngineConfig::hardware_state`].
     hardware_state: Mutex<HardwareState>,
     next_generation: AtomicU64,
+    /// See [`EngineConfig::device_memory_writes`].
+    device_memory_writes: bool,
     pub(crate) timing: Timing,
 }
 
@@ -356,6 +388,11 @@ impl Shared {
 
     fn next_seq(&self) -> u64 {
         self.next_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// See [`EngineConfig::device_memory_writes`].
+    pub(crate) fn device_memory_writes(&self) -> bool {
+        self.device_memory_writes
     }
 
     fn is_closed(&self) -> bool {
@@ -559,6 +596,7 @@ impl Shared {
         let ctx = {
             let st = this.state.lock();
             DetectContext {
+                setting_pending: st.pending.keys().cloned().collect(),
                 disabled_families: disabled.clone(),
                 skip: st
                     .devices
@@ -571,8 +609,8 @@ impl Shared {
                 unreleased,
             }
         };
-        let mut found = Vec::new();
-        let mut failures = Vec::new();
+        // Each backend's devices are added (and get their pending setting) as soon as that backend is done, so the
+        // first backends' devices are driven while the later ones are still probed (ADR 0001 #42).
         for backend in &this.backends {
             if this.is_closed() {
                 return;
@@ -580,9 +618,11 @@ impl Shared {
             if !in_pass(backend.as_ref()) {
                 continue;
             }
+            let mut found = Vec::new();
+            let mut failures = Vec::new();
             for d in backend.detect(&ctx) {
                 match d {
-                    Detected::Device(ctrl) => found.push((backend.name().to_string(), ctrl)),
+                    Detected::Device(ctrl) => found.push(ctrl),
                     Detected::Failed {
                         family,
                         location,
@@ -597,18 +637,18 @@ impl Shared {
                     }
                 }
             }
-        }
-        {
-            let mut st = this.state.lock();
-            st.failures.extend(failures);
-            let excess = st.failures.len().saturating_sub(MAX_FAILURES);
-            st.failures.drain(..excess);
-        }
-        for (family, ctrl) in found {
-            if this.is_closed() {
-                return;
+            if !failures.is_empty() {
+                let mut st = this.state.lock();
+                st.failures.extend(failures);
+                let excess = st.failures.len().saturating_sub(MAX_FAILURES);
+                st.failures.drain(..excess);
             }
-            Self::add_device(this, family, ctrl);
+            for ctrl in found {
+                if this.is_closed() {
+                    return;
+                }
+                Self::add_device(this, backend.name().to_string(), ctrl);
+            }
         }
     }
 
@@ -634,6 +674,7 @@ impl Shared {
                     let (reply, rx) = crossbeam_channel::bounded(1);
                     let sent = s.tx.try_send(Command::Stop {
                         release: true,
+                        flush: false,
                         reply: Some(reply),
                     });
                     // A full queue means a worker stuck in a driver call: no answer to wait for. A closed one means
@@ -686,6 +727,15 @@ impl Shared {
     /// Remembers what a newly opened controller reports as the device's own lighting (ADR 0001 #38), and clears the
     /// device's "unreleased" marker when the controller found (or restored) its own lighting.
     fn record_open(&self, id: &DeviceId, ctrl: &dyn Controller) {
+        self.record_own_lighting(id, ctrl);
+        if ctrl.shows_own_lighting() {
+            self.set_unreleased(id, false);
+        }
+    }
+
+    /// Remembers what `ctrl` reports as the device's own lighting, if anything (at open, and after a save to or a
+    /// restore of the device's memory, which changes it).
+    pub(crate) fn record_own_lighting(&self, id: &DeviceId, ctrl: &dyn Controller) {
         if let Some(bytes) = ctrl.own_lighting() {
             match self.hardware_state.lock().record_own_lighting(id, &bytes) {
                 Ok(true) => info!(%id, "own lighting remembered"),
@@ -693,9 +743,11 @@ impl Shared {
                 Err(e) => warn!(%id, error = %e, "cannot save the device's own lighting"),
             }
         }
-        if ctrl.shows_own_lighting() {
-            self.set_unreleased(id, false);
-        }
+    }
+
+    /// The remembered machine state, locked. Never held across device I/O.
+    pub(crate) fn hw(&self) -> parking_lot::MutexGuard<'_, HardwareState> {
+        self.hardware_state.lock()
     }
 
     /// Sets or clears the persisted "unreleased" marker of `id` (ADR 0001 #38): CaseControl wrote to the device and
@@ -749,6 +801,7 @@ impl Shared {
             .hardware_mode()
             .filter(|h| description.validate_state(h).is_ok());
         let off_mode = ctrl.off_mode();
+        let persist_caps = ctrl.persist_caps();
         // The colour buffer starts with what the device shows, where that is known per LED, so a first zone edit
         // keeps the other zones as they are.
         let colors = match &hardware {
@@ -787,22 +840,25 @@ impl Shared {
             setting: None,
             hardware,
             off_mode,
+            persist_caps,
             want: None,
             resuming: false,
             frame,
             tx,
             thread: Some(thread),
         };
-        let (pending, replaced) = {
+        let (pending, replaced, tx) = {
             let mut st = this.state.lock();
             if this.is_closed() {
                 // Shutdown started meanwhile; the new device was never driven, so it needs no release.
                 let _ = slot.tx.try_send(Command::Stop {
                     release: false,
+                    flush: false,
                     reply: None,
                 });
                 return;
             }
+            let tx = slot.tx.clone();
             let replaced = st.devices.insert(id.clone(), slot);
             st.removed.remove(&id);
             // A device that faulted after a resume comes back with what it was driven with, unless a profile wants
@@ -811,7 +867,7 @@ impl Shared {
                 .as_ref()
                 .filter(|_| this.resume_active())
                 .and_then(Slot::wanted_setting);
-            (st.pending.remove(&id).or(carried), replaced)
+            (st.pending.remove(&id).or(carried), replaced, tx)
         };
         if let Some(old) = replaced {
             info!(%id, "faulted device detected again; replacing it");
@@ -819,15 +875,60 @@ impl Shared {
             // could); let it end on its own.
             let _ = old.tx.try_send(Command::Stop {
                 release: false,
+                flush: false,
                 reply: None,
             });
         }
         info!(%id, name = %info.name, "device added");
         this.emit(EngineEvent::DeviceAdded(info));
+        this.restore_if_pending(&id, &tx);
         if let Some(setting) = pending
             && let Err(e) = this.queue_setting(&id, setting)
         {
-            warn!(%id, error = %e, "pending setting could not be applied");
+            // The driver was told a setting would drive the device (`DetectContext::setting_pending`) and may have
+            // skipped restoring its own lighting at open: hand it back now instead (a release of an untouched device
+            // that shows its own lighting sends nothing).
+            warn!(%id, error = %e, "pending setting could not be applied; handing the device back");
+            let seq = this.next_seq();
+            let (reply, _) = crossbeam_channel::bounded(1);
+            if tx.try_send(Command::Release { seq, reply }).is_err() {
+                warn!(%id, "could not queue the release");
+            }
+        }
+    }
+
+    /// A device whose saved-state backup is to be written back when it is next connected (ADR 0001 #42) gets that
+    /// restore queued now, before its pending setting. A pending restore without a backup is dropped.
+    fn restore_if_pending(&self, id: &DeviceId, tx: &Sender<Command>) {
+        if !self.device_memory_writes {
+            if self.hw().is_pending_restore(id) {
+                info!(%id, "device connected; its pending restore waits (device memory writes are off)");
+            }
+            return;
+        }
+        let restore = {
+            let mut hw = self.hw();
+            if !hw.is_pending_restore(id) {
+                return;
+            }
+            let has_backup = hw.saved_backup(id).is_some();
+            if !has_backup && let Err(e) = hw.set_pending_restore(id, false) {
+                warn!(%id, error = %e, "cannot clear the pending restore");
+            }
+            has_backup
+        };
+        if restore {
+            info!(%id, "device connected; writing its original saved state back");
+            if tx
+                .try_send(Command::Restore {
+                    day: today(),
+                    deadline: None,
+                    reply: None,
+                })
+                .is_err()
+            {
+                warn!(%id, "could not queue the pending restore; it stays pending");
+            }
         }
     }
 
@@ -947,6 +1048,7 @@ impl Shared {
         // The worker may be blocked on the dead device; do not wait for it. Dropping the sender ends it.
         let _ = slot.tx.try_send(Command::Stop {
             release: false,
+            flush: false,
             reply: None,
         });
         drop(slot);
@@ -1117,9 +1219,57 @@ impl Shared {
         })
     }
 
+    /// See [`EngineHandle::save_to_hardware`].
     fn save_to_hardware(&self, id: &DeviceId) -> Result<(), EngineError> {
         let tx = self.slot_tx(id)?;
-        self.acked(id, tx, Command::Save)
+        let look = {
+            let st = self.state.lock();
+            let slot = st
+                .devices
+                .get(id)
+                .ok_or_else(|| EngineError::UnknownDevice(id.clone()))?;
+            let caps = slot
+                .persist_caps
+                .ok_or(EngineError::Device(DeviceError::Unsupported))?;
+            let levels = st.levels(id);
+            let output = slot.output(levels).ok_or_else(|| {
+                EngineError::InvalidArgument("the device is not driven; there is nothing to save".into())
+            })?;
+            if !matches!(output.out, lighting::Out::Mode(_)) {
+                return Err(EngineError::InvalidArgument(
+                    "only a hardware mode can be saved by hand; the device shows direct colours".into(),
+                ));
+            }
+            lighting::persist_look(
+                &slot.description,
+                st.dark_zones.get(id),
+                &output.out,
+                levels.factor(),
+                caps,
+            )
+            .map_err(|reason| match reason {
+                SkipReason::NotCapable => EngineError::Device(DeviceError::Unsupported),
+                other => EngineError::NotSaved(format!("{other:?}")),
+            })?
+        };
+        let timeout = self.timing.ack_timeout;
+        let deadline = Instant::now() + timeout;
+        let result = self.ask(&tx, timeout, |reply| Command::Persist {
+            look,
+            day: today(),
+            deadline: Some(deadline),
+            reply,
+        });
+        info!(%id, ?result, "manual save to the device's memory");
+        match result {
+            PersistResult::Written | PersistResult::Unchanged => Ok(()),
+            PersistResult::Skipped {
+                reason: SkipReason::NotCapable,
+            } => Err(EngineError::Device(DeviceError::Unsupported)),
+            PersistResult::Skipped { reason } => Err(EngineError::NotSaved(format!("{reason:?}"))),
+            PersistResult::Failed { error } => Err(EngineError::NotSaved(error)),
+            PersistResult::Unconfirmed => Err(EngineError::Timeout),
+        }
     }
 
     fn release(&self, id: &DeviceId) -> Result<(), EngineError> {
@@ -1306,8 +1456,9 @@ impl Shared {
     }
 
     /// Stops a removed slot's worker within `timeout`; with `release`, the worker releases the device first if it
-    /// considers it Active (its own state, not the engine's copy). Joins the thread only if it
-    /// answered; a thread stuck in a driver call is left behind rather than blocking the caller.
+    /// considers it Active (its own state, not the engine's copy); without, it first sends a pending or paced output
+    /// once (`flush`). Joins the thread only if it answered; a thread stuck in a driver call is left behind rather
+    /// than blocking the caller.
     fn stop_slot(
         &self,
         id: &DeviceId,
@@ -1324,6 +1475,7 @@ impl Shared {
             slot.tx.clone(),
             |reply| Command::Stop {
                 release,
+                flush: !release,
                 reply: Some(reply),
             },
             timeout,
@@ -1501,7 +1653,7 @@ impl Shared {
         (missing, waiting)
     }
 
-    fn shutdown(&self, timeout: Duration) {
+    fn shutdown(&self, mode: ShutdownMode, timeout: Duration) {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -1513,13 +1665,18 @@ impl Shared {
         if let Some(r) = resume {
             r.stop();
         }
+        // Waiting for the hot-plug thread and an in-flight detection pass gets at most half the budget; the rest is
+        // the devices' (their release or flush). Without that reserve a backend stuck in `detect` (which also holds
+        // the hot-plug thread) used up the whole budget, and every device was stopped with a zero timeout: its
+        // release was sent but not waited for.
+        let wait_deadline = start + timeout / 2;
         let hotplug = self.hotplug.lock().take();
         if let Some(h) = hotplug {
-            h.stop_within(deadline.saturating_duration_since(Instant::now()));
+            h.stop_within(wait_deadline.saturating_duration_since(Instant::now()));
         }
-        // Wait for an in-flight detection pass to finish, but only within the budget: a backend stuck in `detect`
-        // must not block quitting. Detection checks `closed` before adding anything.
-        let guard = self.detect_lock.try_lock_until(deadline);
+        // Wait for an in-flight detection pass to finish, but only within its share of the budget: a backend stuck in
+        // `detect` must not block quitting. Detection checks `closed` before adding anything.
+        let guard = self.detect_lock.try_lock_until(wait_deadline);
         if guard.is_none() {
             warn!("detection still running at shutdown; not waiting for it");
         }
@@ -1530,13 +1687,230 @@ impl Shared {
         for (i, (id, slot)) in slots.into_iter().enumerate() {
             let left = u32::try_from(n - i).unwrap_or(u32::MAX);
             let budget = deadline.saturating_duration_since(Instant::now()) / left;
-            if let Err(e) = self.stop_slot(&id, slot, true, budget) {
-                warn!(%id, error = %e, "release on shutdown failed");
+            let release = mode == ShutdownMode::Release;
+            if let Err(e) = self.stop_slot(&id, slot, release, budget) {
+                warn!(%id, error = %e, ?mode, "stopping the device on shutdown failed");
             }
         }
         drop(guard);
         self.subscribers.lock().clear();
-        info!(devices = n, elapsed = ?start.elapsed(), "engine shut down");
+        info!(devices = n, ?mode, elapsed = ?start.elapsed(), "engine shut down");
+    }
+
+    /// Sends `make`'s command and waits for its result until `timeout` (see [`EngineHandle::persist_all`]). A command
+    /// that was queued but not answered in time may still run: [`PersistResult::Unconfirmed`].
+    fn ask(
+        &self,
+        tx: &Sender<Command>,
+        timeout: Duration,
+        make: impl FnOnce(Sender<PersistResult>) -> Command,
+    ) -> PersistResult {
+        let deadline = Instant::now() + timeout;
+        let (rtx, rrx) = crossbeam_channel::bounded(1);
+        let failed = |error: &str| PersistResult::Failed {
+            error: error.to_owned(),
+        };
+        if let Err(e) = tx.send_deadline(make(rtx), deadline) {
+            return match e {
+                crossbeam_channel::SendTimeoutError::Timeout(_) => failed("the device is busy"),
+                crossbeam_channel::SendTimeoutError::Disconnected(_) => failed("the device is gone"),
+            };
+        }
+        match rrx.recv_deadline(deadline) {
+            Ok(r) => r,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => PersistResult::Unconfirmed,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => failed("the device is gone"),
+        }
+    }
+
+    /// Runs `jobs` one after another within `deadline`, each with an equal share of what is left; adds each result
+    /// to `report` (logged). A device that wrote its restored state is sent its current output again.
+    fn run_persist_jobs(
+        &self,
+        jobs: Vec<(DeviceId, Sender<Command>, Command)>,
+        deadline: Instant,
+        refresh: bool,
+        report: &mut PersistReport,
+    ) {
+        let n = jobs.len();
+        for (i, (id, tx, cmd)) in jobs.into_iter().enumerate() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let result = if left.is_zero() {
+                PersistResult::Skipped {
+                    reason: SkipReason::TimeBudget,
+                }
+            } else {
+                let share = left / u32::try_from(n - i).unwrap_or(u32::MAX);
+                // The deadline travels with the command: a worker that takes it up later skips it.
+                let deadline = Some(Instant::now() + share);
+                self.ask(&tx, share, |reply| match cmd {
+                    Command::Persist { look, day, .. } => Command::Persist {
+                        look,
+                        day,
+                        deadline,
+                        reply,
+                    },
+                    Command::Restore { day, .. } => Command::Restore {
+                        day,
+                        deadline,
+                        reply: Some(reply),
+                    },
+                    other => other,
+                })
+            };
+            match &result {
+                PersistResult::Written | PersistResult::Unchanged => info!(%id, ?result, "device memory"),
+                PersistResult::Skipped { .. } => info!(%id, ?result, "device memory not written"),
+                PersistResult::Failed { error } => warn!(%id, %error, "device memory not written"),
+                PersistResult::Unconfirmed => {
+                    warn!(%id, "device did not answer in time; the write may still complete")
+                }
+            }
+            if refresh && result == PersistResult::Written {
+                let mut st = self.state.lock();
+                self.refresh_locked(&mut st, Some(&id));
+            }
+            report.devices.push(PersistEntry { id, result });
+        }
+    }
+
+    /// See [`EngineHandle::persist_all`].
+    fn persist_all(&self, timeout: Duration) -> PersistReport {
+        let deadline = Instant::now() + timeout;
+        let mut report = PersistReport::default();
+        if self.is_closed() {
+            return report;
+        }
+        let blocked = if !self.device_memory_writes {
+            Some(SkipReason::WritesDisabled)
+        } else if !self.hw().device_memory_writable() {
+            Some(SkipReason::StateUnavailable)
+        } else {
+            None
+        };
+        // Saving is on: a restore still waiting for an absent device is stale.
+        if blocked.is_none()
+            && let Err(e) = self.hw().clear_pending_restores()
+        {
+            warn!(error = %e, "cannot clear the pending restores");
+        }
+        let day = today();
+        let mut jobs = Vec::new();
+        {
+            let st = self.state.lock();
+            for (id, slot) in &st.devices {
+                let look = if let Some(reason) = blocked {
+                    Err(reason)
+                } else if slot.is_faulted() {
+                    Err(SkipReason::Faulted)
+                } else if st.excluded.contains(id) {
+                    Err(SkipReason::Hidden)
+                } else if let Some(caps) = slot.persist_caps {
+                    let levels = st.levels(id);
+                    match slot.output(levels) {
+                        Some(output) => lighting::persist_look(
+                            &slot.description,
+                            st.dark_zones.get(id),
+                            &output.out,
+                            levels.factor(),
+                            caps,
+                        ),
+                        None => Err(SkipReason::NotDriven),
+                    }
+                } else {
+                    Err(SkipReason::NotCapable)
+                };
+                match look {
+                    Ok(look) => {
+                        let (reply, _) = crossbeam_channel::bounded(1);
+                        let cmd = Command::Persist {
+                            look,
+                            day,
+                            deadline: None,
+                            reply,
+                        };
+                        jobs.push((id.clone(), slot.tx.clone(), cmd));
+                    }
+                    Err(reason) => report.devices.push(PersistEntry {
+                        id: id.clone(),
+                        result: PersistResult::Skipped { reason },
+                    }),
+                }
+            }
+        }
+        self.run_persist_jobs(jobs, deadline, false, &mut report);
+        report.devices.sort_by(|a, b| a.id.cmp(&b.id));
+        info!(
+            written = report
+                .devices
+                .iter()
+                .filter(|e| e.result == PersistResult::Written)
+                .count(),
+            devices = report.devices.len(),
+            "saved to the devices"
+        );
+        report
+    }
+
+    /// See [`EngineHandle::restore_saved`].
+    fn restore_saved(&self, timeout: Duration) -> PersistReport {
+        let deadline = Instant::now() + timeout;
+        let mut report = PersistReport::default();
+        if self.is_closed() {
+            return report;
+        }
+        let day = today();
+        let ids: Vec<DeviceId> = self.hw().saved_backups().keys().cloned().collect();
+        // Every backed-up device is pending until its restore succeeded (which clears it), so a restore cut short
+        // (time budget, crash, power loss, a device that is absent or faulted) is done when the device next connects.
+        let mut marked = HashSet::new();
+        {
+            let mut hw = self.hw();
+            for id in &ids {
+                match hw.set_pending_restore(id, true) {
+                    Ok(_) => {
+                        marked.insert(id.clone());
+                    }
+                    Err(e) => warn!(%id, error = %e, "cannot remember the pending restore; not restoring"),
+                }
+            }
+        }
+        let mut jobs = Vec::new();
+        for id in ids {
+            let present = {
+                let st = self.state.lock();
+                st.devices.get(&id).map(|s| (s.is_faulted(), s.tx.clone()))
+            };
+            let reason = if !marked.contains(&id) {
+                SkipReason::StateUnavailable
+            } else if !self.device_memory_writes {
+                SkipReason::WritesDisabled
+            } else {
+                match present {
+                    Some((false, tx)) => {
+                        let cmd = Command::Restore {
+                            day,
+                            deadline: None,
+                            reply: None,
+                        };
+                        jobs.push((id, tx, cmd));
+                        continue;
+                    }
+                    Some((true, _)) => SkipReason::Faulted,
+                    None => SkipReason::Absent,
+                }
+            };
+            if matches!(reason, SkipReason::Faulted | SkipReason::Absent) {
+                info!(%id, "device not usable now; its original saved state is written back when it connects");
+            }
+            report.devices.push(PersistEntry {
+                id,
+                result: PersistResult::Skipped { reason },
+            });
+        }
+        self.run_persist_jobs(jobs, deadline, true, &mut report);
+        report.devices.sort_by(|a, b| a.id.cmp(&b.id));
+        report
     }
 }
 
@@ -1584,7 +1958,8 @@ struct Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.shared.shutdown(Duration::from_secs(2));
+        self.shared
+            .shutdown(ShutdownMode::Release, Duration::from_secs(2));
     }
 }
 
@@ -1640,7 +2015,7 @@ pub(crate) fn start_with(
         state: Mutex::new(State {
             devices: BTreeMap::new(),
             failures: Vec::new(),
-            pending: BTreeMap::new(),
+            pending: cfg.initial_settings,
             removed: BTreeMap::new(),
             disabled_families: cfg.disabled_families,
             zone_sizes: cfg.zone_sizes,
@@ -1662,6 +2037,7 @@ pub(crate) fn start_with(
         last_reassert: Mutex::new(None),
         hardware_state: Mutex::new(cfg.hardware_state),
         next_generation: AtomicU64::new(0),
+        device_memory_writes: cfg.device_memory_writes,
         timing,
     });
     Shared::detect_new(&shared, None);
@@ -1725,7 +2101,14 @@ impl EngineHandle {
         self.shared().resize_zone(id, zone, len)
     }
 
-    /// Persists the current mode in the device's flash; waits for the device. Only on explicit user request.
+    /// Saves the hardware mode the device is driven with (at the current brightness) to its own memory; waits for
+    /// the device. Only on explicit user request. It goes through the same machinery as
+    /// [`persist_all`](Self::persist_all): the backup of the original saved state is stored first, the driver's
+    /// gates and verification apply, the daily cap counts it and the fingerprint is updated. Refused while the device
+    /// shows direct colours or is not driven ([`EngineError::InvalidArgument`]), for a driver that cannot save
+    /// ([`EngineError::Device`] with `Unsupported`), and when the save did not happen ([`EngineError::NotSaved`]: no
+    /// backup, daily cap, device-memory writes off, a refused gate). [`EngineError::Timeout`]: no answer in time; the
+    /// save may still complete.
     pub fn save_to_hardware(&self, id: &DeviceId) -> Result<(), EngineError> {
         self.shared().save_to_hardware(id)
     }
@@ -1920,8 +2303,47 @@ impl EngineHandle {
 
     /// Stops hot-plug, releases every Active device (each within its share of `timeout`), joins the device threads
     /// and closes the event stream. Idempotent; later calls return immediately and other methods fail with
-    /// [`EngineError::ShutDown`].
+    /// [`EngineError::ShutDown`]. Same as [`shutdown_with`](Self::shutdown_with) with [`ShutdownMode::Release`].
     pub fn shutdown(&self, timeout: Duration) {
-        self.shared().shutdown(timeout);
+        self.shutdown_with(ShutdownMode::Release, timeout);
+    }
+
+    /// [`shutdown`](Self::shutdown) that either releases every device ([`ShutdownMode::Release`]) or keeps
+    /// CaseControl's colours on them ([`ShutdownMode::Keep`], ADR 0001 #42: Windows shutdown, restart, sign-out). In
+    /// `Keep` each device is first sent its pending or paced output once, so it shows the latest one, then its thread
+    /// stops without `release()`; the "unreleased" markers stay set (the devices still show CaseControl's output) and
+    /// the remembered own lighting is untouched. Each device gets its share of `timeout`. Dropping the last handle
+    /// always releases.
+    pub fn shutdown_with(&self, mode: ShutdownMode, timeout: Duration) {
+        self.shared().shutdown(mode, timeout);
+    }
+
+    /// Saves the current look of every visible, capable, connected device to its own memory, so it shows it from
+    /// power-on (ADR 0001 #34, #42, "save colours to the devices"). Call it only on the setting's triggers (turning
+    /// it on, Quit, sign-out, shutdown), never on live edits. Returns within about `timeout` (each device gets an
+    /// equal share of what is left; the rest are skipped), so it fits Windows' session-end limit together with
+    /// [`shutdown_with`](Self::shutdown_with).
+    ///
+    /// The look is what the device is sent now, with device and master brightness baked in: direct colours as one
+    /// colour per zone (averaged in linear light; hidden and empty zones left as stored), a hardware mode exactly,
+    /// brightness 0 as the device's off state. Hidden, faulted, undriven and incapable devices are skipped. Before a
+    /// device's first save its driver's backup of the original saved state is stored in the machine state (written
+    /// once, never overwritten while it exists); a device without one, or whose backup cannot be stored, is never
+    /// written. A look equal to the one saved last is not written again, and at most 20 writes a day per device go
+    /// out (every write is logged). Pending restores (see [`restore_saved`](Self::restore_saved)) are dropped, since
+    /// saving is on again.
+    pub fn persist_all(&self, timeout: Duration) -> PersistReport {
+        self.shared().persist_all(timeout)
+    }
+
+    /// Writes the stored backup of every device CaseControl saved to back to its memory ("save colours to the
+    /// devices" turned off, ADR 0001 #42) and drops each backup once its device took it. Every backed-up device is
+    /// marked for a restore first; a successful restore clears the mark, so a device that is not connected (or
+    /// faulted), ran out of time or failed is restored when it is next connected; the backup stays until then. At
+    /// most 3 attempts a day per device ([`SkipReason::DailyCap`] after that; it stays pending). A driven device is
+    /// sent its current output again afterwards, so only its memory changes. Returns within about `timeout`, like
+    /// [`persist_all`](Self::persist_all).
+    pub fn restore_saved(&self, timeout: Duration) -> PersistReport {
+        self.shared().restore_saved(timeout)
     }
 }

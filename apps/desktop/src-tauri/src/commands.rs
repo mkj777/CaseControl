@@ -721,28 +721,38 @@ pub async fn close_program<R: Runtime>(
     .await
 }
 
+/// The Settings page's view of the current settings, with the line under "Save colours to the devices".
+pub fn settings_view(state: &AppState) -> SettingsView {
+    SettingsView {
+        save_to_devices_note: state.save_note(),
+        ..SettingsView::of(&state.settings(), state.settings_error())
+    }
+}
+
 /// The Settings page's data.
 #[tauri::command]
 pub async fn get_settings<R: Runtime>(app: AppHandle<R>) -> Result<SettingsView, String> {
-    blocking(app, |_, state| {
-        Ok(SettingsView::of(&state.settings(), state.settings_error()))
-    })
-    .await
+    blocking(app, |_, state| Ok(settings_view(state))).await
 }
 
 /// Applies a partial settings change, saves it, and carries it over to the running app: frame rate, detector switches
 /// and the takeover default colour go to the engine (the colour is used from the next takeover on; devices already
-/// driven keep what they show), autostart to the HKCU Run key (release builds only, see [`crate::autostart`]).
+/// driven keep what they show), autostart to the logon task (release builds only, see [`crate::autostart`]). "Keep
+/// colours when signing out" is read at exit. "Apply colours before sign-in" and "Save colours to the devices" have
+/// their own commands ([`set_apply_before_sign_in`], [`set_save_to_devices`]), because they ask for a UAC prompt or
+/// write to devices and must not hold the settings lock meanwhile.
 #[tauri::command]
 pub async fn set_settings<R: Runtime>(
     app: AppHandle<R>,
     patch: SettingsPatch,
 ) -> Result<SettingsView, String> {
-    blocking(app, move |app, state| {
+    blocking(app, move |_, state| {
+        // The start-up autostart check must not act on a setting this patch changes meanwhile.
+        let _autostart = patch.autostart.is_some().then(|| state.autostart_lock());
         let effects = state.update_settings(|s| {
             let effects = apply_patch(s, &patch)?;
             if let Some(on) = effects.autostart {
-                crate::autostart::apply(app, on)?;
+                crate::autostart::apply(on)?;
             }
             Ok(effects)
         })?;
@@ -760,7 +770,160 @@ pub async fn set_settings<R: Runtime>(
                 engine.set_default_color(color);
             }
         }
-        Ok(SettingsView::of(&state.settings(), state.settings_error()))
+        Ok(settings_view(state))
+    })
+    .await
+}
+
+/// Shown when "Apply colours before sign-in" is switched in a debug build.
+pub const BOOT_TASK_DEBUG_REFUSAL: &str =
+    "Apply colours before sign-in is only available in installed builds.";
+
+/// "Apply colours before sign-in" (ADR 0001 #42): creates (`on`) or removes the start-up task through the elevated
+/// helper (one UAC prompt, `RegisterBootTask` / `RemoveBootTask`). The setting changes only when the helper reports
+/// success; a declined prompt or a failure leaves it as it was and rejects with the reason ([`boot_task_error_text`]:
+/// the helper's complete sentences are shown as they are). When the outcome is unknown (the helper still ran at the
+/// timeout) or the setting could not be saved, the task is read again and the switch follows what is there
+/// ([`align_apply_before_sign_in`]). Refused in debug builds (no task for a debug executable) and while settings cannot
+/// be saved. Runs outside the settings lock, so lighting keeps working while the prompt is open; holds the start-up
+/// task lock, so the start-up check does not run meanwhile.
+#[tauri::command]
+pub async fn set_apply_before_sign_in<R: Runtime>(
+    app: AppHandle<R>,
+    on: bool,
+) -> Result<SettingsView, String> {
+    blocking(app, move |app, state| {
+        if cfg!(debug_assertions) {
+            tracing::info!(on, "debug build: start-up task not changed");
+            return Err(BOOT_TASK_DEBUG_REFUSAL.to_owned());
+        }
+        if let Some(err) = state.settings_error() {
+            return Err(err);
+        }
+        let _serial = state.boot_task_lock();
+        let action = if on {
+            cc_conflicts::Action::RegisterBootTask {}
+        } else {
+            cc_conflicts::Action::RemoveBootTask {}
+        };
+        tracing::info!(on, "apply colours before sign-in: asking the elevated helper");
+        let planned = cc_conflicts::PlannedAction {
+            entry_id: cc_conflicts::BOOT_TASK_ENTRY.to_owned(),
+            action,
+        };
+        let outcomes = crate::elevated::run_admin_batch(
+            &[planned],
+            cc_conflicts::current_session_id(),
+            crate::conflict_actions::owner_window(app),
+        );
+        match outcomes.into_iter().next() {
+            Some(outcome) if outcome.ok => {
+                tracing::info!(on, "start-up task changed");
+                if let Err(err) = state.update_settings(|s| {
+                    s.apply_before_sign_in = on;
+                    Ok(())
+                }) {
+                    tracing::warn!(%err, "the start-up task changed, but the setting could not be saved");
+                    align_apply_before_sign_in(state, read_boot_task_state());
+                    return Err(format!(
+                        "The start-up task was {}, but this could not be saved: {err}",
+                        if on { "created" } else { "removed" }
+                    ));
+                }
+                Ok(settings_view(state))
+            }
+            Some(outcome) => {
+                let reason = outcome
+                    .error
+                    .unwrap_or_else(|| "the elevated helper reported no reason".to_owned());
+                tracing::warn!(on, %reason, unknown = outcome.unknown, "start-up task not changed");
+                if outcome.unknown {
+                    align_apply_before_sign_in(state, read_boot_task_state());
+                }
+                Err(boot_task_error_text(on, &reason))
+            }
+            None => Err("The elevated helper returned no result.".to_owned()),
+        }
+    })
+    .await
+}
+
+/// The text the Settings page shows when the start-up task was not changed: the elevated helper's refusals are
+/// complete sentences meant to be shown as they are (a prompt approved with another account, a request owned by
+/// Administrators, a task under our name that is not ours) and name no direction, so they fit switching on and off
+/// alike; a short reason gets a lead that says what failed ("not created" / "not removed").
+pub fn boot_task_error_text(on: bool, reason: &str) -> String {
+    let reason = reason.trim();
+    let sentence = reason.starts_with(|c: char| c.is_uppercase()) && reason.ends_with('.');
+    if sentence {
+        reason.to_owned()
+    } else {
+        format!(
+            "The start-up task was not {}: {reason}",
+            if on { "created" } else { "removed" }
+        )
+    }
+}
+
+/// Whether "Apply colours before sign-in" should be on, from a read of the start-up task: off when there is none or
+/// it is not ours, on when it is ours (also when it differs or is disabled; turning the switch off removes it).
+/// `None` when the task could not be read (it may need administrator rights); the setting stays then.
+pub fn boot_flag_from(read: &Result<cc_system::TaskState, String>) -> Option<bool> {
+    use cc_system::TaskState;
+    match read {
+        Ok(TaskState::Missing | TaskState::Foreign(_)) => Some(false),
+        Ok(TaskState::Matches | TaskState::Differs(_) | TaskState::Disabled) => Some(true),
+        Err(_) => None,
+    }
+}
+
+/// Reads the start-up task of the current user for this executable.
+pub fn read_boot_task_state() -> Result<cc_system::TaskState, String> {
+    #[cfg(windows)]
+    {
+        let sid = cc_system::current_user_sid().map_err(|e| e.to_string())?;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let spec = cc_system::TaskSpec::boot(&sid, &exe).map_err(|e| e.to_string())?;
+        cc_system::task_state(&cc_system::WindowsTaskStore, &spec).map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("not supported on this platform".to_owned())
+    }
+}
+
+/// Sets "Apply colours before sign-in" from `read` (see [`boot_flag_from`]) when it differs, logged. The caller holds
+/// the start-up task lock. When the setting cannot be saved it still changes for this session, so Settings shows
+/// what is there.
+pub fn align_apply_before_sign_in(state: &AppState, read: Result<cc_system::TaskState, String>) {
+    let Some(exists) = boot_flag_from(&read) else {
+        if let Err(err) = read {
+            tracing::info!(%err, "cannot read the start-up task; apply colours before sign-in left as it is");
+        }
+        return;
+    };
+    if state.settings().apply_before_sign_in == exists {
+        return;
+    }
+    tracing::info!(task = ?read, setting = exists, "apply colours before sign-in follows the start-up task");
+    let saved = state.update_settings(|s| {
+        s.apply_before_sign_in = exists;
+        Ok(())
+    });
+    if let Err(err) = saved {
+        tracing::warn!(%err, "cannot save apply colours before sign-in; changed for this session only");
+        state.settings().apply_before_sign_in = exists;
+    }
+}
+
+/// "Save colours to the devices" (ADR 0001 #42): saves the switch, then saves the colours to every capable device
+/// (on) or writes their original saved state back (off). Resolves with the settings view, whose
+/// `save_to_devices_note` names the devices that were not saved or restored. Never called on live edits.
+#[tauri::command]
+pub async fn set_save_to_devices<R: Runtime>(app: AppHandle<R>, on: bool) -> Result<SettingsView, String> {
+    blocking(app, move |_, state| {
+        state.set_save_to_devices(on)?;
+        Ok(settings_view(state))
     })
     .await
 }
@@ -1004,6 +1167,54 @@ mod tests {
         assert_eq!(
             serde_json::to_value(r).expect("serializes"),
             serde_json::json!({ "released": 2, "failed": [{ "id": "hid:31e3:1310", "error": "busy" }] })
+        );
+    }
+
+    #[test]
+    fn helper_sentences_are_shown_as_given() {
+        let other =
+            cc_conflicts::boot_task::other_account_message("S-1-5-21-1-2-3-500", "S-1-5-21-1-2-3-1001");
+        let admin = cc_conflicts::boot_task::ADMIN_OWNED_REQUEST_MESSAGE;
+        // The helper refuses both directions with the same sentences: switching on and switching off show them as
+        // they are, and they never name the wrong action ("set up" when removing, "removed" when creating).
+        for on in [true, false] {
+            for sentence in [other.as_str(), admin] {
+                let text = boot_task_error_text(on, sentence);
+                assert_eq!(text, sentence, "on = {on}");
+                for wrong in ["not set up", "not created", "not removed"] {
+                    assert!(!text.contains(wrong), "on = {on}: {text}");
+                }
+            }
+        }
+        let not_ours =
+            cc_system::not_ours_message("CaseControl Start-up S-1-5-21-1-2-3-1001", "it runs as x");
+        assert_eq!(boot_task_error_text(false, &not_ours), not_ours);
+        // A short reason gets a lead.
+        assert_eq!(
+            boot_task_error_text(true, "the Windows permission prompt was declined"),
+            "The start-up task was not created: the Windows permission prompt was declined"
+        );
+        assert_eq!(
+            boot_task_error_text(false, "access denied"),
+            "The start-up task was not removed: access denied"
+        );
+    }
+
+    #[test]
+    fn apply_before_sign_in_follows_the_start_up_task() {
+        use cc_system::TaskState;
+        assert_eq!(boot_flag_from(&Ok(TaskState::Missing)), Some(false));
+        assert_eq!(boot_flag_from(&Ok(TaskState::Foreign("x".into()))), Some(false));
+        assert_eq!(boot_flag_from(&Ok(TaskState::Matches)), Some(true));
+        assert_eq!(
+            boot_flag_from(&Ok(TaskState::Differs(vec!["path".into()]))),
+            Some(true)
+        );
+        assert_eq!(boot_flag_from(&Ok(TaskState::Disabled)), Some(true));
+        assert_eq!(
+            boot_flag_from(&Err("access denied".into())),
+            None,
+            "unreadable: left as it is"
         );
     }
 }

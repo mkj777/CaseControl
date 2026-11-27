@@ -44,12 +44,30 @@
 //!   [`EngineHandle::reassert`]: debounced, it resets and re-sends every driven device's current output, retries
 //!   failed writes with back-off for a few seconds and re-opens devices that faulted or vanished during sleep.
 //! - [`EngineHandle::shutdown`] (or dropping the last handle) releases every active device and joins the threads.
+//!   [`EngineHandle::shutdown_with`] with [`ShutdownMode::Keep`] (ADR 0001 #42: Windows shutdown, restart, sign-out)
+//!   sends each device its pending or paced output once and stops without a release; the "unreleased" markers stay.
+//! - Early apply (ADR 0001 #42): [`EngineConfig::initial_settings`] are pending before the first detection, and each
+//!   backend's devices are added (and get their setting) as soon as that backend is done, so the first devices are
+//!   driven while later backends are still probed. Drivers learn which devices are about to be driven
+//!   (`DetectContext::setting_pending`) and skip restoring an old look at open for them.
+//! - Save to devices (ADR 0001 #34, #42): [`EngineHandle::persist_all`] writes the current look of every visible,
+//!   capable, driven device to its own memory (one colour per zone averaged in linear light, a mode exactly,
+//!   brightness baked in, off at brightness 0) within a time budget; the driver's backup of the original saved state
+//!   is stored first and a device without one is never written; unchanged looks are skipped and at most 20 writes a
+//!   day go out per device. [`EngineHandle::restore_saved`] writes the backups back (absent devices when they next
+//!   connect; at most 3 attempts a day each). A manual [`EngineHandle::save_to_hardware`] goes through the same
+//!   machinery. Every such request carries a deadline (a worker that takes it up late skips it), and a request whose
+//!   answer does not come in time is reported as [`PersistResult::Unconfirmed`]. [`EngineConfig::device_memory_writes`]
+//!   switches all of it off. The records live in `device-memory.toml` (`cc_config::HardwareState`), written durably
+//!   before a device is touched.
 //!
 //! What this crate deliberately does not do: no device protocols (that is `cc-drivers`), no file I/O or profile
 //! storage of its own (that is `cc-config`; the engine only takes and returns settings, and records the drivers'
-//! own lighting and the "unreleased" markers through `cc_config::HardwareState`, the one file it causes to be
-//! written), no Tauri or UI code, no effects engine (colour frames come from the caller), and it never writes device flash unless [`EngineHandle::save_to_hardware`] is
-//! called.
+//! own lighting, the "unreleased" markers and the device-memory records through `cc_config::HardwareState`, the only
+//! files it causes to be written), no Tauri or UI code, no effects engine (colour frames come from the caller), and it
+//! never writes device flash unless [`EngineHandle::save_to_hardware`],
+//! [`EngineHandle::persist_all`] or [`EngineHandle::restore_saved`] is called (or a restore is pending for a device
+//! that connects), never on live edits.
 
 mod engine;
 mod error;
@@ -67,5 +85,6 @@ pub use engine::{EngineConfig, EngineHandle, start};
 pub use error::EngineError;
 pub use lighting::mask_hidden_zones;
 pub use view::{
-    ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView, ReleaseReport, Takeover,
+    ApplyFailure, ApplyReport, DetectFailure, DeviceStatus, DeviceView, LightingView, PersistEntry,
+    PersistReport, PersistResult, ReleaseReport, ShutdownMode, SkipReason, Takeover,
 };

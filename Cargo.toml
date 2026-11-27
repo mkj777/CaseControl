@@ -6,13 +6,14 @@ members = [
     "crates/cc-nvapi",
     "crates/cc-drivers",
     "crates/cc-conflicts",
+    "crates/cc-system",
     "crates/cc-config",
     "crates/cc-engine",
     "apps/desktop/src-tauri",
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.90"
 license = "GPL-2.0-or-later"
@@ -26,6 +27,7 @@ cc-hid = { path = "crates/cc-hid" }
 cc-nvapi = { path = "crates/cc-nvapi" }
 cc-drivers = { path = "crates/cc-drivers" }
 cc-conflicts = { path = "crates/cc-conflicts" }
+cc-system = { path = "crates/cc-system" }
 cc-config = { path = "crates/cc-config" }
 cc-engine = { path = "crates/cc-engine" }
 
@@ -56,7 +58,6 @@ directories = "6"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-build = { version = "2", features = [] }
 tauri-plugin-single-instance = "2"
-tauri-plugin-autostart = "2"
 # The only network access (ADR 0001 #39). native-tls = SChannel and the Windows certificate store, no rustls/ring.
 tauri-plugin-updater = { version = "2.14", default-features = false, features = ["native-tls", "system-proxy"] }
 

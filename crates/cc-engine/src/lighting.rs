@@ -25,7 +25,11 @@ use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
 
 use cc_config::DeviceSetting;
-use cc_core::{ColorMode, DeviceDescription, Mode, ModeCaps, ModeState, Rgb};
+use cc_core::{
+    ColorMode, DeviceDescription, Mode, ModeCaps, ModeState, PersistCaps, PersistLook, Rgb, average_linear,
+};
+
+use crate::view::SkipReason;
 
 /// Full brightness in percent.
 pub(crate) const FULL: u8 = 100;
@@ -248,6 +252,54 @@ pub fn mask_hidden_zones(desc: &DeviceDescription, zones: &BTreeSet<String>, col
         let range = zone.range();
         let (start, end) = (range.start.min(len), range.end.min(len));
         colors[start..end].fill(Rgb::BLACK);
+    }
+}
+
+/// The look "save colours to the devices" writes for output `out` at brightness factor `factor` (ADR 0001 #42):
+/// the device's off state at a factor of 0; direct colours as one colour per zone, the zone's LEDs averaged in
+/// linear light (brightness is already baked into `out`), with zones that are empty or named in `dark` left as stored
+/// (`None`); a hardware mode exactly as sent. A look the driver's `caps` cannot save is skipped.
+pub(crate) fn persist_look(
+    desc: &DeviceDescription,
+    dark: Option<&BTreeSet<String>>,
+    out: &Out,
+    factor: f64,
+    caps: PersistCaps,
+) -> Result<PersistLook, SkipReason> {
+    if factor <= 0.0 {
+        return if caps.zone_colors || caps.hardware_modes {
+            Ok(PersistLook::Off)
+        } else {
+            Err(SkipReason::NotCapable)
+        };
+    }
+    match out {
+        Out::Direct(colors) => {
+            if !caps.zone_colors {
+                return Err(SkipReason::NotCapable);
+            }
+            let zones: Vec<Option<Rgb>> = desc
+                .zones
+                .iter()
+                .map(|z| {
+                    if z.len == 0 || dark.is_some_and(|d| d.contains(&z.name)) {
+                        None
+                    } else {
+                        colors.get(z.range()).and_then(average_linear)
+                    }
+                })
+                .collect();
+            if zones.iter().all(Option::is_none) {
+                return Err(SkipReason::NothingToSave);
+            }
+            Ok(PersistLook::Zones(zones))
+        }
+        Out::Mode(state) => {
+            if !caps.hardware_modes {
+                return Err(SkipReason::NotCapable);
+            }
+            Ok(PersistLook::Mode(state.clone()))
+        }
     }
 }
 
