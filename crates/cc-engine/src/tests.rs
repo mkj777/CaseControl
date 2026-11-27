@@ -3591,13 +3591,14 @@ fn a_late_request_is_unconfirmed_and_skipped_by_the_worker() {
     };
     let b = FakeBackend::new("f", vec![s.clone()], &log);
     let e = start_with(config, vec![Box::new(b)], None, timing).unwrap();
-    // The worker is busy with a slow mode change when the save arrives.
-    s.behavior.lock().mode_delay = Duration::from_millis(500);
+    // The worker is busy with a slow mode change when the save arrives. The budget is generous so a slow CI runner
+    // still sends the request before it runs out; the worker stays busy well past it.
+    s.behavior.lock().mode_delay = Duration::from_millis(3000);
     assert_eq!(e.set_mode(&id(1), static_red()), Err(EngineError::Timeout));
-    let report = e.persist_all(Duration::from_millis(100));
+    let report = e.persist_all(SECOND);
     assert_eq!(report.result(&id(1)), Some(&PersistResult::Unconfirmed));
     // The worker takes it up after its deadline and skips it.
-    std::thread::sleep(SECOND);
+    std::thread::sleep(Duration::from_millis(3000));
     assert!(entries(&log, "mode 1").len() == 1);
     assert!(entries(&log, "persist").is_empty());
     assert_eq!(e.hardware_state().saved_backup(&id(1)), None);
